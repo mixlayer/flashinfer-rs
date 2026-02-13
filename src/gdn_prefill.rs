@@ -63,17 +63,40 @@ pub struct Tensor4DF32Desc {
 
 #[derive(Debug, Clone, Copy)]
 pub struct GdnPrefillSm90Params {
+    /// Output tensor, rank-3: `[packed_seq, num_sab_heads, head_size]`.
+    ///
+    /// `num_sab_heads = max(num_q_heads, num_v_heads)`.
     pub output: Tensor3DDesc,
+    /// Output state tensor, rank-4:
+    /// `[num_seqs, num_sab_heads, head_size, head_size]`.
+    ///
+    /// `num_seqs = cu_seqlens.len - 1`.
+    ///
+    /// Cross-reference:
+    /// `flashinfer/csrc/gdn_prefill_launcher.cu::gdn_prefill`.
     pub output_state: Tensor4DF32Desc,
+    /// Query tensor, rank-3: `[packed_seq, num_q_heads, head_size]`.
     pub q: Tensor3DDesc,
+    /// Key tensor, rank-3: `[packed_seq, num_k_heads, head_size]`.
     pub k: Tensor3DDesc,
+    /// Value tensor, rank-3: `[packed_seq, num_v_heads, head_size]`.
     pub v: Tensor3DDesc,
+    /// Prefix sums over sequence lengths, rank-1 int64: `[num_seqs + 1]`.
     pub cu_seqlens: Tensor1DI64Desc,
+    /// Optional prior state, rank-4:
+    /// `[num_seqs, num_sab_heads, head_size, head_size]`.
+    ///
+    /// Must match `output_state` shape when provided.
     pub input_state: Option<Tensor4DF32Desc>,
+    /// Optional alpha factors, rank-2 f32: `[packed_seq, num_sab_heads]`.
     pub alpha: Option<Tensor2DF32Desc>,
+    /// Optional beta factors, rank-2 f32: `[packed_seq, num_sab_heads]`.
     pub beta: Option<Tensor2DF32Desc>,
+    /// Scale applied in kernel; `0.0` means use kernel default (`1/sqrt(head_size)`).
     pub scale: f64,
+    /// Scratch/workspace buffer, rank-1 u8: `[workspace_bytes]`.
     pub workspace_buffer: Tensor1DU8Desc,
+    /// CUDA stream (`cudaStream_t`) used for async launch.
     pub stream: *mut c_void,
 }
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
@@ -109,13 +110,20 @@ impl RuntimeConfig {
 
 #[derive(Debug)]
 struct ExtractedArtifacts {
+    artifact_dir: PathBuf,
     norm_so_path: PathBuf,
     gdn_prefill_sm90_so_path: PathBuf,
     tvmffi_so_path: PathBuf,
 }
 
+struct LoadedKernel {
+    _lib: Library,
+    run: TVMFFISafeCallFn,
+}
+
 pub struct FlashInferRuntime {
     resolved: ResolvedRuntimeConfig,
+    artifact_dir: PathBuf,
     _tvmffi_lib: Library,
     _norm_lib: Library,
     _gdn_prefill_sm90_lib: Library,
@@ -125,6 +133,7 @@ pub struct FlashInferRuntime {
     tvmffi_object_dec_ref: TVMFFIObjectDecRefFn,
     tvm_ffi_gemma_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gdn_prefill: TVMFFISafeCallFn,
+    single_prefill_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
 }
 
 static GLOBAL_RUNTIME: OnceLock<FlashInferRuntime> = OnceLock::new();
@@ -216,6 +225,67 @@ impl FlashInferRuntime {
             return Ok(());
         }
         Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_single_prefill(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let run = unsafe { self.resolve_single_prefill_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { run(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    unsafe fn resolve_single_prefill_kernel(
+        &self,
+        kernel_uri: &str,
+    ) -> Result<TVMFFISafeCallFn, FlashInferError> {
+        let mut cache = self.single_prefill_kernel_cache.lock().map_err(|_| {
+            FlashInferError::invalid_argument("single prefill cache lock is poisoned")
+        })?;
+
+        if let Some(kernel) = cache.get(kernel_uri) {
+            return Ok(kernel.run);
+        }
+
+        let kernel_path = extract_jit_kernel(
+            &self.resolved.jit_cache_wheel,
+            &self.artifact_dir,
+            kernel_uri,
+        )?;
+
+        let kernel_lib =
+            unsafe { Library::open(Some(&kernel_path), libc::RTLD_NOW | libc::RTLD_LOCAL) }
+                .map_err(|e| FlashInferError::LibraryLoad {
+                    library: kernel_path.clone(),
+                    message: e.to_string(),
+                })?;
+
+        let run: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_run\0",
+                "__tvm_ffi_run",
+            )?
+        };
+
+        cache.insert(
+            kernel_uri.to_string(),
+            LoadedKernel {
+                _lib: kernel_lib,
+                run,
+            },
+        );
+        Ok(run)
     }
 
     unsafe fn load(resolved: ResolvedRuntimeConfig) -> Result<Self, FlashInferError> {
@@ -326,6 +396,7 @@ impl FlashInferRuntime {
 
         Ok(Self {
             resolved,
+            artifact_dir: artifacts.artifact_dir,
             _tvmffi_lib: tvmffi_lib,
             _norm_lib: norm_lib,
             _gdn_prefill_sm90_lib: gdn_prefill_sm90_lib,
@@ -335,6 +406,7 @@ impl FlashInferRuntime {
             tvmffi_object_dec_ref,
             tvm_ffi_gemma_rmsnorm,
             tvm_ffi_gdn_prefill,
+            single_prefill_kernel_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -388,17 +460,7 @@ unsafe fn resolve_symbol<T: Copy>(
 fn extract_artifacts(
     resolved: &ResolvedRuntimeConfig,
 ) -> Result<ExtractedArtifacts, FlashInferError> {
-    fs::create_dir_all(&resolved.cache_dir).map_err(|e| FlashInferError::CreateCacheDir {
-        path: resolved.cache_dir.clone(),
-        source: e,
-    })?;
-
-    let artifact_hash = artifact_hash(&resolved.jit_cache_wheel, &resolved.tvmffi_wheel)?;
-    let artifact_dir = resolved.cache_dir.join(artifact_hash);
-    fs::create_dir_all(&artifact_dir).map_err(|e| FlashInferError::CreateCacheDir {
-        path: artifact_dir.clone(),
-        source: e,
-    })?;
+    let artifact_dir = artifact_dir_for(resolved)?;
 
     let lock_path = artifact_dir.join(".extract.lock");
     let lock_file = OpenOptions::new()
@@ -444,10 +506,72 @@ fn extract_artifacts(
     let _ = lock_file.unlock();
 
     Ok(ExtractedArtifacts {
+        artifact_dir,
         norm_so_path,
         gdn_prefill_sm90_so_path,
         tvmffi_so_path,
     })
+}
+
+fn extract_jit_kernel(
+    jit_cache_wheel: &Path,
+    artifact_dir: &Path,
+    kernel_uri: &str,
+) -> Result<PathBuf, FlashInferError> {
+    let member_suffix = format!("flashinfer_jit_cache/jit_cache/{kernel_uri}/{kernel_uri}.so");
+    let output_path = artifact_dir
+        .join("jit_cache")
+        .join(kernel_uri)
+        .join(format!("{kernel_uri}.so"));
+
+    if output_path.exists() {
+        return Ok(output_path);
+    }
+
+    fs::create_dir_all(artifact_dir).map_err(|e| FlashInferError::CreateCacheDir {
+        path: artifact_dir.to_path_buf(),
+        source: e,
+    })?;
+
+    let lock_path = artifact_dir.join(".extract.lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| FlashInferError::CacheLock {
+            path: lock_path.clone(),
+            source: e,
+        })?;
+    lock_file
+        .lock_exclusive()
+        .map_err(|e| FlashInferError::CacheLock {
+            path: lock_path.clone(),
+            source: e,
+        })?;
+
+    if !output_path.exists() {
+        extract_member_from_wheel_by_suffix(jit_cache_wheel, &member_suffix, &output_path)?;
+    }
+
+    let _ = lock_file.unlock();
+    Ok(output_path)
+}
+
+fn artifact_dir_for(resolved: &ResolvedRuntimeConfig) -> Result<PathBuf, FlashInferError> {
+    fs::create_dir_all(&resolved.cache_dir).map_err(|e| FlashInferError::CreateCacheDir {
+        path: resolved.cache_dir.clone(),
+        source: e,
+    })?;
+
+    let artifact_hash = artifact_hash(&resolved.jit_cache_wheel, &resolved.tvmffi_wheel)?;
+    let artifact_dir = resolved.cache_dir.join(artifact_hash);
+    fs::create_dir_all(&artifact_dir).map_err(|e| FlashInferError::CreateCacheDir {
+        path: artifact_dir.clone(),
+        source: e,
+    })?;
+    Ok(artifact_dir)
 }
 
 fn artifact_hash(jit_cache_wheel: &Path, tvmffi_wheel: &Path) -> Result<String, FlashInferError> {

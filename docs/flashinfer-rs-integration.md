@@ -5,6 +5,7 @@ A Python wheel (`*.whl`) is a zip archive that carries prebuilt artifacts. For t
 
 - `flashinfer_jit_cache/.../jit_cache/norm/norm.so`
 - `flashinfer_jit_cache/.../jit_cache/gdn_prefill_sm90/gdn_prefill_sm90.so`
+- `flashinfer_jit_cache/.../jit_cache/single_prefill_with_kv_cache_.../single_prefill_with_kv_cache_....so`
 - `tvm_ffi/lib/libtvm_ffi.so`
 
 No Python runtime is required for calling `gemma_rmsnorm` once the `.so` files are extracted.
@@ -39,6 +40,7 @@ The Rust integration calls the exported TVM-FFI host wrapper:
 
 - `__tvm_ffi_gemma_rmsnorm`
 - `__tvm_ffi_gdn_prefill`
+- `__tvm_ffi_run` (for `single_prefill_with_kv_cache` JIT-cache modules)
 
 This wrapper handles argument decoding, validation, stream lookup, and dispatch to the correct kernel implementation.
 
@@ -53,6 +55,7 @@ Runtime loading order:
 1. Load `libtvm_ffi.so` with `RTLD_NOW | RTLD_GLOBAL`
 2. Load `norm.so` with `RTLD_NOW | RTLD_LOCAL`
 3. Load `gdn_prefill_sm90.so` with `RTLD_NOW | RTLD_LOCAL`
+4. Load `single_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
 
 Required CUDA runtime dependency from `norm.so`:
 
@@ -77,7 +80,7 @@ Implementation behavior:
 
 1. Set stream and capture `old_stream`.
 2. Create `StreamRestoreGuard`.
-3. Launch wrapper (`__tvm_ffi_gemma_rmsnorm` / `__tvm_ffi_gdn_prefill`).
+3. Launch wrapper (`__tvm_ffi_gemma_rmsnorm` / `__tvm_ffi_gdn_prefill` / `__tvm_ffi_run`).
 4. Call `restore_now()` to surface stream-restore errors explicitly.
 5. If control exits early, `Drop` performs a best-effort restore.
 
@@ -93,12 +96,26 @@ Packaging model:
 Runtime behavior in this Rust integration:
 
 1. Rust calls exported host wrappers such as `__tvm_ffi_gemma_rmsnorm` and `__tvm_ffi_gdn_prefill`.
-2. The wrapper checks tensor contracts and device properties, then selects an architecture-specific kernel path.
-3. If the loaded artifact does not include a compatible kernel for the active GPU, the wrapper raises an error (decoded as `FlashInferError::TvmFfiCall`).
+2. The TVM host wrapper dispatches by kernel variant ABI (dtype, head dims, mask/layout options, etc.) and validates tensor contracts.
+3. GPU architecture selection is usually handled by CUDA loading the matching cubin from the module fatbin (`sm_90a`, `sm_100a`, `sm_120`, etc.).
+4. If the loaded artifact does not contain compatible device code for the active GPU, launch fails and the error is surfaced as `FlashInferError::TvmFfiCall`.
+
+What dispatches what:
+
+1. Host wrapper dispatch (TVM-FFI): exported `run`/named functions, argument decoding, validation, and variant selection.
+2. Architecture dispatch (CUDA): pick the best embedded cubin for the current device at module load/launch time.
+3. Explicit-arch launchers (exception): some kernels perform manual compute-capability checks and reject unsupported devices directly in host code.
+
+For MHA single prefill, Rust constructs the exact wheel URI from runtime params:
+
+- `single_prefill_with_kv_cache_dtype_q_{...}_dtype_kv_{...}_dtype_o_{...}_head_dim_qk_{...}_head_dim_vo_{...}_posenc_{...}_use_swa_{...}_use_logits_cap_{...}_f16qk_{...}`
+
+That module is extracted lazily from the wheel and cached per-process by URI.
 
 Concrete example:
 
 - `gdn_prefill` checks device major capability and only dispatches the SM90A implementation in the current launcher (`flashinfer/csrc/gdn_prefill_launcher.cu`).
+- `single_prefill_with_kv_cache` exports a generic `run` symbol and dispatches variant parameters in host code (`flashinfer/csrc/single_prefill_jit_binding.cu`, `flashinfer/csrc/single_prefill.cu`), while architecture is selected from embedded cubins by CUDA.
 
 Build-from-source note:
 

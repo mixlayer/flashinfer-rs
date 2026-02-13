@@ -33,6 +33,12 @@ This file documents the expected process for adding new FlashInfer kernel bindin
 
 4. Implement Rust API + validation
 - Add typed parameter structs and enums.
+- Add field-level doc comments on every `*Params` struct:
+  - expected tensor shapes (with layout variants where relevant),
+  - units/semantics for scalar knobs,
+  - stream semantics.
+- Cross-reference the shape contract source in FlashInfer submodule comments (typically
+  `flashinfer/csrc/*` and/or `flashinfer/flashinfer/*.py`).
 - Validate:
   - pointer non-null
   - shape/layout constraints
@@ -109,6 +115,7 @@ Primary files to inspect:
 - [ ] Wheel artifact path(s) identified and verified.
 - [ ] Exported host symbol(s) verified from target `.so`.
 - [ ] ABI/order confirmed from submodule source and wrapper calls.
+- [ ] Field-level shape docs added/updated for all `*Params` struct fields.
 - [ ] Rust typed API + validation implemented.
 - [ ] Runtime loading strategy implemented (fixed vs lazy URI).
 - [ ] `cudarc` wrapper added.

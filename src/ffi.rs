@@ -5,6 +5,7 @@ use std::slice;
 pub const KDL_CUDA: i32 = 2;
 
 pub const KTVM_FFI_NONE: i32 = 0;
+pub const KTVM_FFI_INT: i32 = 1;
 pub const KTVM_FFI_BOOL: i32 = 2;
 pub const KTVM_FFI_FLOAT: i32 = 3;
 pub const KTVM_FFI_DL_TENSOR_PTR: i32 = 7;
@@ -131,6 +132,14 @@ pub fn any_bool(value: bool) -> TVMFFIAny {
     }
 }
 
+pub fn any_i64(value: i64) -> TVMFFIAny {
+    TVMFFIAny {
+        type_index: KTVM_FFI_INT,
+        tag: TVMFFIAnyTag { zero_padding: 0 },
+        value: TVMFFIAnyValue { v_int64: value },
+    }
+}
+
 pub fn any_f64(value: f64) -> TVMFFIAny {
     TVMFFIAny {
         type_index: KTVM_FFI_FLOAT,
@@ -196,6 +205,14 @@ mod tests {
         assert_eq!(packed.type_index, KTVM_FFI_BOOL);
         // SAFETY: field matches the value constructor.
         assert_eq!(unsafe { packed.value.v_int64 }, 1);
+    }
+
+    #[test]
+    fn pack_i64_sets_expected_type_and_value() {
+        let packed = any_i64(123);
+        assert_eq!(packed.type_index, KTVM_FFI_INT);
+        // SAFETY: field matches the value constructor.
+        assert_eq!(unsafe { packed.value.v_int64 }, 123);
     }
 
     #[test]

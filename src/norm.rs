@@ -52,11 +52,23 @@ pub struct Tensor2DDesc {
 
 #[derive(Debug, Clone, Copy)]
 pub struct GemmaRmsNormParams {
+    /// Input activations, rank-2: `[batch_size, hidden_size]`.
+    ///
+    /// Cross-reference:
+    /// `flashinfer/csrc/norm.cu::gemma_rmsnorm` (`CHECK_DIM(2, input)`).
     pub input: Tensor2DDesc,
+    /// RMSNorm weights, rank-1: `[hidden_size]`.
+    ///
+    /// Cross-reference:
+    /// `flashinfer/csrc/norm.cu::gemma_rmsnorm` (`CHECK_DIM(1, weight)`).
     pub weight: Tensor1DDesc,
+    /// Output activations, rank-2: `[batch_size, hidden_size]`, same shape as `input`.
     pub out: Tensor2DDesc,
+    /// Numerical stability epsilon used in `rsqrt(mean(x^2) + eps)`.
     pub eps: f64,
+    /// Whether to enable PDL mode in the FlashInfer kernel.
     pub enable_pdl: bool,
+    /// CUDA stream (`cudaStream_t`) used for async launch.
     pub stream: *mut c_void,
 }
 
