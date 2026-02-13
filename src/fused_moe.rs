@@ -9,6 +9,7 @@ use crate::norm::DType;
 use crate::runtime::FlashInferRuntime;
 
 const MODULE_GET_FUNCTION_GLOBAL: &str = "ffi.ModuleGetFunction";
+const ARRAY_GLOBAL: &str = "ffi.Array";
 const RUN_MOE_METHOD_NAME: &str = "run_moe";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +150,10 @@ pub struct FusedMoeParams {
     pub ep_rank: i64,
     /// Whether to enable alltoall in expert-parallel flow.
     pub enable_alltoall: bool,
+    /// Optional CUTLASS profile ids as `[gemm1_profile_id, gemm2_profile_id]`.
+    ///
+    /// If omitted, FlashInfer host code selects defaults.
+    pub profile_ids: Option<[i64; 2]>,
     /// CUDA stream (`cudaStream_t`) used for async launch.
     pub stream: *mut c_void,
 }
@@ -180,6 +185,7 @@ impl FusedMoeParams {
             ep_size: 1,
             ep_rank: 0,
             enable_alltoall: false,
+            profile_ids: None,
             stream,
         }
     }
@@ -223,6 +229,11 @@ impl FusedMoeParams {
 
     pub fn with_enable_alltoall(mut self, enable_alltoall: bool) -> Self {
         self.enable_alltoall = enable_alltoall;
+        self
+    }
+
+    pub fn with_profile_ids(mut self, gemm1_profile_id: i64, gemm2_profile_id: i64) -> Self {
+        self.profile_ids = Some([gemm1_profile_id, gemm2_profile_id]);
         self
     }
 
@@ -418,6 +429,37 @@ unsafe fn fused_moe_with_runtime(
                 )
             })?;
 
+        let profile_ids_owned =
+            if let Some([gemm1_profile_id, gemm2_profile_id]) = params.profile_ids {
+                // SAFETY: function is resolved from global table; caller owns reference and must decref.
+                let array_ctor_handle = unsafe { runtime.get_global_function(ARRAY_GLOBAL)? };
+                let mut array_ctor_guard = RawObjectDecRefGuard::new(runtime, array_ctor_handle);
+
+                let mut profile_id_args = [any_i64(gemm1_profile_id), any_i64(gemm2_profile_id)];
+                let mut profile_ids_view = any_none();
+
+                // SAFETY: invoking TVM Function object with ABI-packed args.
+                unsafe {
+                    runtime.call_function(
+                        array_ctor_handle,
+                        profile_id_args.as_mut_ptr(),
+                        profile_id_args.len() as i32,
+                        &mut profile_ids_view as *mut _,
+                    )?;
+                }
+
+                // SAFETY: result view is produced by TVM-FFI and copied to owned Any.
+                let profile_ids_owned = unsafe { runtime.any_view_to_owned(&profile_ids_view)? };
+                array_ctor_guard.release_now();
+                Some(profile_ids_owned)
+            } else {
+                None
+            };
+        let mut profile_ids_guard = profile_ids_owned
+            .as_ref()
+            .map(|any| AnyObjectDecRefGuard::new(runtime, any));
+        let profile_ids_any = profile_ids_owned.as_ref().copied().unwrap_or_else(any_none);
+
         let mut run_args: [TVMFFIAny; 24] = [
             any_dltensor_ptr(&out_tensor),
             any_dltensor_ptr(&input_tensor),
@@ -440,7 +482,7 @@ unsafe fn fused_moe_with_runtime(
             any_i64(0), // cluster_rank
             any_bool(params.enable_alltoall),
             any_bool(false), // min_latency_mode
-            any_none(),      // profile_ids
+            profile_ids_any,
             any_bool(params.enable_pdl),
             any_i64(params.activation.as_i64()),
         ];
@@ -456,6 +498,9 @@ unsafe fn fused_moe_with_runtime(
             )?;
         }
 
+        if let Some(profile_ids_guard) = profile_ids_guard.as_mut() {
+            profile_ids_guard.release_now();
+        }
         run_moe_function_guard.release_now();
         run_moe_name_guard.release_now();
         module_get_function_guard.release_now();
@@ -971,6 +1016,7 @@ pub struct FusedMoeCudarcOptions {
     pub ep_size: i64,
     pub ep_rank: i64,
     pub enable_alltoall: bool,
+    pub profile_ids: Option<[i64; 2]>,
 }
 
 #[cfg(feature = "cudarc")]
@@ -984,6 +1030,7 @@ impl Default for FusedMoeCudarcOptions {
             ep_size: 1,
             ep_rank: 0,
             enable_alltoall: false,
+            profile_ids: None,
         }
     }
 }
@@ -1164,6 +1211,12 @@ where
     .with_expert_parallel(options.ep_size, options.ep_rank)
     .with_enable_alltoall(options.enable_alltoall);
 
+    let params = if let Some([gemm1_profile_id, gemm2_profile_id]) = options.profile_ids {
+        params.with_profile_ids(gemm1_profile_id, gemm2_profile_id)
+    } else {
+        params
+    };
+
     fused_moe(&params)
 }
 
@@ -1259,5 +1312,11 @@ mod tests {
         params.fc2_expert_weights.device_id = 1;
         let err = params.validate().expect_err("expected device mismatch");
         assert!(err.to_string().contains("device mismatch"));
+    }
+
+    #[test]
+    fn with_profile_ids_sets_profile_ids() {
+        let params = valid_params().with_profile_ids(7, 11);
+        assert_eq!(params.profile_ids, Some([7, 11]));
     }
 }

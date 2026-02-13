@@ -150,6 +150,19 @@ Build-from-source note:
 
 - FlashInfer uses `FLASHINFER_CUDA_ARCH_LIST` to control which architectures are compiled into generated artifacts.
 
+## CUTLASS Fused MoE Profile IDs
+For CUTLASS fused MoE, the host `run_moe` entry accepts optional profile IDs (`profile_ids`) that select GEMM tactics:
+
+- `profile_ids[0]`: GEMM1 profile id
+- `profile_ids[1]`: GEMM2 profile id
+
+In `flashinfer-rs`, this is exposed as:
+
+- `FusedMoeParams::with_profile_ids(gemm1_profile_id, gemm2_profile_id)`
+- `FusedMoeCudarcOptions { profile_ids: Some([gemm1, gemm2]), .. }`
+
+If `profile_ids` is omitted, Rust passes `None` and FlashInfer host code uses its default tactic selection path.
+
 ## Runtime configuration knobs
 Environment variables accepted by `flashinfer-rs`:
 
