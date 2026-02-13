@@ -60,6 +60,27 @@ Required CUDA runtime dependency from `norm.so`:
 
 `gdn_prefill_sm90` dispatch is `sm_90a`-only in the shipped kernel launcher. On non-SM90 GPUs the call will fail with a decoded TVM-FFI error.
 
+## Why `StreamRestoreGuard` Is Needed
+The TVM-FFI CUDA stream context is mutable runtime state. For each kernel call, Rust sets the active stream with:
+
+- `TVMFFIEnvSetStream(kDLCUDA, device_id, stream, &old_stream)`
+
+and receives the previous stream (`old_stream`) back.
+
+`StreamRestoreGuard` is necessary so this temporary override is always reverted, including error paths:
+
+1. It prevents stream-context leakage into later kernel calls.
+2. It prevents accidental cross-library interference when other code also uses TVM-FFI stream state.
+3. It preserves async correctness by restoring the prior context without adding a synchronization.
+
+Implementation behavior:
+
+1. Set stream and capture `old_stream`.
+2. Create `StreamRestoreGuard`.
+3. Launch wrapper (`__tvm_ffi_gemma_rmsnorm` / `__tvm_ffi_gdn_prefill`).
+4. Call `restore_now()` to surface stream-restore errors explicitly.
+5. If control exits early, `Drop` performs a best-effort restore.
+
 ## Architecture-Dependent Kernel Handling
 FlashInfer ships architecture-dependent device code and host wrappers that dispatch at runtime.
 
