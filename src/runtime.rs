@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::ffi::c_char;
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -14,8 +15,8 @@ use zip::ZipArchive;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    KDL_CUDA, TVMFFIAny, TVMFFIObjectHandle, TVMFFIVersion, any_none, byte_array_to_string,
-    error_cell_ptr,
+    KDL_CUDA, TVMFFIAny, TVMFFIByteArray, TVMFFIObjectHandle, TVMFFIVersion, any_none,
+    byte_array_to_string, error_cell_ptr,
 };
 
 const ENV_JIT_CACHE_WHEEL: &str = "FLASHINFER_RS_JIT_CACHE_WHEEL";
@@ -35,6 +36,12 @@ type TVMFFIEnvSetStreamFn = unsafe extern "C" fn(i32, i32, *mut c_void, *mut *mu
 type TVMFFIErrorMoveFromRaisedFn = unsafe extern "C" fn(*mut TVMFFIObjectHandle);
 type TVMFFIObjectDecRefFn = unsafe extern "C" fn(TVMFFIObjectHandle) -> i32;
 type TVMFFIAnyViewToOwnedAnyFn = unsafe extern "C" fn(*const TVMFFIAny, *mut TVMFFIAny) -> i32;
+type TVMFFIFunctionGetGlobalFn =
+    unsafe extern "C" fn(*const TVMFFIByteArray, *mut TVMFFIObjectHandle) -> i32;
+type TVMFFIFunctionCallFn =
+    unsafe extern "C" fn(TVMFFIObjectHandle, *mut TVMFFIAny, i32, *mut TVMFFIAny) -> i32;
+type TVMFFIStringFromByteArrayFn =
+    unsafe extern "C" fn(*const TVMFFIByteArray, *mut TVMFFIAny) -> i32;
 type TVMFFISafeCallFn =
     unsafe extern "C" fn(*mut c_void, *const TVMFFIAny, i32, *mut TVMFFIAny) -> i32;
 
@@ -123,6 +130,11 @@ struct LoadedKernel {
     run: TVMFFISafeCallFn,
 }
 
+struct LoadedFusedMoeKernel {
+    _lib: Library,
+    init: TVMFFISafeCallFn,
+}
+
 #[derive(Clone, Copy)]
 struct BatchPrefillKernelFns {
     plan: TVMFFISafeCallFn,
@@ -157,6 +169,9 @@ pub struct FlashInferRuntime {
     tvmffi_error_move_from_raised: TVMFFIErrorMoveFromRaisedFn,
     tvmffi_object_dec_ref: TVMFFIObjectDecRefFn,
     tvmffi_any_view_to_owned_any: TVMFFIAnyViewToOwnedAnyFn,
+    tvmffi_function_get_global: TVMFFIFunctionGetGlobalFn,
+    tvmffi_function_call: TVMFFIFunctionCallFn,
+    tvmffi_string_from_byte_array: TVMFFIStringFromByteArrayFn,
     tvm_ffi_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gemma_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gdn_prefill: TVMFFISafeCallFn,
@@ -164,6 +179,7 @@ pub struct FlashInferRuntime {
     batch_prefill_kernel_cache: Mutex<HashMap<String, LoadedBatchPrefillKernel>>,
     single_decode_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
     batch_decode_kernel_cache: Mutex<HashMap<String, LoadedBatchDecodeKernel>>,
+    fused_moe_kernel_cache: Mutex<HashMap<String, LoadedFusedMoeKernel>>,
 }
 
 static GLOBAL_RUNTIME: OnceLock<FlashInferRuntime> = OnceLock::new();
@@ -356,6 +372,23 @@ impl FlashInferRuntime {
         Err(self.decode_raised_error(code))
     }
 
+    pub(crate) unsafe fn call_fused_moe_init(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let init = unsafe { self.resolve_fused_moe_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { init(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
     pub(crate) unsafe fn call_batch_decode_plan(
         &self,
         kernel_uri: &str,
@@ -401,6 +434,59 @@ impl FlashInferRuntime {
         };
         if code == 0 {
             return Ok(owned);
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn get_global_function(
+        &self,
+        name: &str,
+    ) -> Result<TVMFFIObjectHandle, FlashInferError> {
+        let name_bytes = TVMFFIByteArray {
+            data: name.as_ptr().cast::<c_char>(),
+            size: name.len(),
+        };
+        let mut handle: TVMFFIObjectHandle = std::ptr::null_mut();
+        // SAFETY: symbol pointer and argument layout match C API.
+        let code =
+            unsafe { (self.tvmffi_function_get_global)(&name_bytes as *const _, &mut handle) };
+        if code != 0 {
+            return Err(self.decode_raised_error(code));
+        }
+        if handle.is_null() {
+            return Err(FlashInferError::invalid_argument(format!(
+                "TVM-FFI global function `{name}` is not available"
+            )));
+        }
+        Ok(handle)
+    }
+
+    pub(crate) unsafe fn call_function(
+        &self,
+        func: TVMFFIObjectHandle,
+        args: *mut TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol pointer and argument layout match C API.
+        let code = unsafe { (self.tvmffi_function_call)(func, args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn string_to_any(&self, value: &str) -> Result<TVMFFIAny, FlashInferError> {
+        let value_bytes = TVMFFIByteArray {
+            data: value.as_ptr().cast::<c_char>(),
+            size: value.len(),
+        };
+        let mut out = any_none();
+        // SAFETY: symbol pointer and argument layout match C API.
+        let code =
+            unsafe { (self.tvmffi_string_from_byte_array)(&value_bytes as *const _, &mut out) };
+        if code == 0 {
+            return Ok(out);
         }
         Err(self.decode_raised_error(code))
     }
@@ -499,6 +585,51 @@ impl FlashInferRuntime {
             },
         );
         Ok(run)
+    }
+
+    unsafe fn resolve_fused_moe_kernel(
+        &self,
+        kernel_uri: &str,
+    ) -> Result<TVMFFISafeCallFn, FlashInferError> {
+        let mut cache = self
+            .fused_moe_kernel_cache
+            .lock()
+            .map_err(|_| FlashInferError::invalid_argument("fused moe cache lock is poisoned"))?;
+
+        if let Some(kernel) = cache.get(kernel_uri) {
+            return Ok(kernel.init);
+        }
+
+        let kernel_path = extract_jit_kernel(
+            &self.resolved.jit_cache_wheel,
+            &self.artifact_dir,
+            kernel_uri,
+        )?;
+
+        let kernel_lib =
+            unsafe { Library::open(Some(&kernel_path), libc::RTLD_NOW | libc::RTLD_LOCAL) }
+                .map_err(|e| FlashInferError::LibraryLoad {
+                    library: kernel_path.clone(),
+                    message: e.to_string(),
+                })?;
+
+        let init: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_init\0",
+                "__tvm_ffi_init",
+            )?
+        };
+
+        cache.insert(
+            kernel_uri.to_string(),
+            LoadedFusedMoeKernel {
+                _lib: kernel_lib,
+                init,
+            },
+        );
+        Ok(init)
     }
 
     unsafe fn resolve_batch_prefill_kernel(
@@ -700,6 +831,33 @@ impl FlashInferRuntime {
             )?
         };
 
+        let tvmffi_function_get_global: TVMFFIFunctionGetGlobalFn = unsafe {
+            resolve_symbol(
+                &tvmffi_lib,
+                &artifacts.tvmffi_so_path,
+                b"TVMFFIFunctionGetGlobal\0",
+                "TVMFFIFunctionGetGlobal",
+            )?
+        };
+
+        let tvmffi_function_call: TVMFFIFunctionCallFn = unsafe {
+            resolve_symbol(
+                &tvmffi_lib,
+                &artifacts.tvmffi_so_path,
+                b"TVMFFIFunctionCall\0",
+                "TVMFFIFunctionCall",
+            )?
+        };
+
+        let tvmffi_string_from_byte_array: TVMFFIStringFromByteArrayFn = unsafe {
+            resolve_symbol(
+                &tvmffi_lib,
+                &artifacts.tvmffi_so_path,
+                b"TVMFFIStringFromByteArray\0",
+                "TVMFFIStringFromByteArray",
+            )?
+        };
+
         let tvm_ffi_gemma_rmsnorm: TVMFFISafeCallFn = unsafe {
             resolve_symbol(
                 &norm_lib,
@@ -754,6 +912,9 @@ impl FlashInferRuntime {
             tvmffi_error_move_from_raised,
             tvmffi_object_dec_ref,
             tvmffi_any_view_to_owned_any,
+            tvmffi_function_get_global,
+            tvmffi_function_call,
+            tvmffi_string_from_byte_array,
             tvm_ffi_rmsnorm,
             tvm_ffi_gemma_rmsnorm,
             tvm_ffi_gdn_prefill,
@@ -761,6 +922,7 @@ impl FlashInferRuntime {
             batch_prefill_kernel_cache: Mutex::new(HashMap::new()),
             single_decode_kernel_cache: Mutex::new(HashMap::new()),
             batch_decode_kernel_cache: Mutex::new(HashMap::new()),
+            fused_moe_kernel_cache: Mutex::new(HashMap::new()),
         })
     }
 

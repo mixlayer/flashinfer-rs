@@ -1,5 +1,6 @@
 pub mod error;
 mod ffi;
+pub mod fused_moe;
 pub mod gdn_prefill;
 pub mod mha_batch_prefill;
 pub mod mha_batch_prefill_paged;
@@ -9,6 +10,12 @@ pub mod norm;
 pub mod runtime;
 
 pub use error::FlashInferError;
+pub use fused_moe::{
+    FusedMoeActivationType, FusedMoeBackend, FusedMoeParams, FusedMoeTensor2DDesc,
+    FusedMoeTensor2DF32Desc, FusedMoeTensor2DI32Desc, FusedMoeTensor3DDesc, fused_moe,
+};
+#[cfg(feature = "cudarc")]
+pub use fused_moe::{FusedMoeCudarcOptions, fused_moe_cudarc};
 pub use gdn_prefill::{
     GdnPrefillSm90Params, Tensor1DI64Desc, Tensor1DU8Desc, Tensor2DF32Desc, Tensor3DDesc,
     Tensor4DF32Desc, gdn_prefill_sm90,

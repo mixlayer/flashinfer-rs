@@ -9,6 +9,7 @@ pub const KTVM_FFI_NONE: i32 = 0;
 pub const KTVM_FFI_INT: i32 = 1;
 pub const KTVM_FFI_BOOL: i32 = 2;
 pub const KTVM_FFI_FLOAT: i32 = 3;
+pub const KTVM_FFI_DATA_TYPE: i32 = 5;
 pub const KTVM_FFI_DL_TENSOR_PTR: i32 = 7;
 pub const KTVM_FFI_OBJECT_RVALUE_REF: i32 = 10;
 pub const KTVM_FFI_STATIC_OBJECT_BEGIN: i32 = 64;
@@ -151,6 +152,14 @@ pub fn any_f64(value: f64) -> TVMFFIAny {
     }
 }
 
+pub fn any_dtype(dtype: DLDataType) -> TVMFFIAny {
+    TVMFFIAny {
+        type_index: KTVM_FFI_DATA_TYPE,
+        tag: TVMFFIAnyTag { zero_padding: 0 },
+        value: TVMFFIAnyValue { v_dtype: dtype },
+    }
+}
+
 pub fn any_dltensor_ptr(tensor: *const DLTensor) -> TVMFFIAny {
     TVMFFIAny {
         type_index: KTVM_FFI_DL_TENSOR_PTR,
@@ -268,5 +277,21 @@ mod tests {
             unsafe { packed.value.v_ptr },
             (&tensor as *const DLTensor).cast_mut().cast()
         );
+    }
+
+    #[test]
+    fn pack_dtype_sets_expected_type_and_value() {
+        let dtype = DLDataType {
+            code: KDL_FLOAT,
+            bits: 16,
+            lanes: 1,
+        };
+        let packed = any_dtype(dtype);
+        assert_eq!(packed.type_index, KTVM_FFI_DATA_TYPE);
+        // SAFETY: field matches the value constructor.
+        let actual = unsafe { packed.value.v_dtype };
+        assert_eq!(actual.code, dtype.code);
+        assert_eq!(actual.bits, dtype.bits);
+        assert_eq!(actual.lanes, dtype.lanes);
     }
 }
