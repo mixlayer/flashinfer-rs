@@ -6,6 +6,8 @@ Rust-first integration for calling precompiled FlashInfer kernels through TVM-FF
 
 - `gemma_rmsnorm` from `norm.so`
 - `gdn_prefill` from `gdn_prefill_sm90.so` (SM90A path)
+- MHA single prefill (`single_prefill_with_kv_cache`) via on-demand JIT-cache module loading
+- MHA batched ragged/paged prefill (`batch_prefill_with_kv_cache`) via on-demand JIT-cache module loading
 - Pure Rust TVM-FFI ABI packing and dynamic loading
 - Optional `cudarc` convenience wrappers
 
@@ -133,6 +135,148 @@ gdn_prefill_sm90_cudarc_with_options(
 )?;
 ```
 
+## API Example: MHA Single Prefill
+
+```rust
+use flashinfer_rs::{
+    DType, MhaMaskMode, MhaQkvLayout, MhaSinglePrefillParams, MhaTensor1DU8Desc, MhaTensor3DDesc,
+    mha_single_prefill,
+};
+use std::ffi::c_void;
+
+let params = MhaSinglePrefillParams::new(
+    MhaTensor3DDesc {
+        ptr: q_ptr as *const c_void,
+        dim0: qo_len,
+        dim1: num_qo_heads,
+        dim2: head_dim_qk,
+        stride0: num_qo_heads * head_dim_qk,
+        stride1: head_dim_qk,
+        stride2: 1,
+        dtype: DType::F16,
+        device_id: 0,
+    },
+    MhaTensor3DDesc {
+        ptr: k_ptr as *const c_void,
+        dim0: kv_len,             // NHD layout
+        dim1: num_kv_heads,
+        dim2: head_dim_qk,
+        stride0: num_kv_heads * head_dim_qk,
+        stride1: head_dim_qk,
+        stride2: 1,
+        dtype: DType::F16,
+        device_id: 0,
+    },
+    MhaTensor3DDesc {
+        ptr: v_ptr as *const c_void,
+        dim0: kv_len,             // NHD layout
+        dim1: num_kv_heads,
+        dim2: head_dim_vo,
+        stride0: num_kv_heads * head_dim_vo,
+        stride1: head_dim_vo,
+        stride2: 1,
+        dtype: DType::F16,
+        device_id: 0,
+    },
+    MhaTensor1DU8Desc {
+        ptr: tmp_ptr as *const c_void, // workspace buffer
+        len: tmp_len,
+        stride: 1,
+        device_id: 0,
+    },
+    MhaTensor3DDesc {
+        ptr: out_ptr as *const c_void,
+        dim0: qo_len,
+        dim1: num_qo_heads,
+        dim2: head_dim_vo,
+        stride0: num_qo_heads * head_dim_vo,
+        stride1: head_dim_vo,
+        stride2: 1,
+        dtype: DType::F16,
+        device_id: 0,
+    },
+    stream_ptr,
+)
+.with_mask_mode(MhaMaskMode::Causal)
+.with_kv_layout(MhaQkvLayout::Nhd);
+
+mha_single_prefill(&params)?;
+```
+
+## API Example: MHA Batched Ragged Prefill (`cudarc`)
+
+```rust
+use flashinfer_rs::{
+    DType, MhaBatchPrefillCudarcOptions, MhaQkvLayout, mha_batch_prefill_cudarc,
+};
+
+let options = MhaBatchPrefillCudarcOptions {
+    causal: true,
+    ..Default::default()
+};
+
+mha_batch_prefill_cudarc(
+    stream.as_ref(),
+    &q,
+    &k,
+    &v,
+    &qo_indptr_dev,
+    &kv_indptr_dev,
+    &qo_indptr_host, // host indptr used by plan()
+    &kv_indptr_host, // host indptr used by plan()
+    &mut float_workspace,
+    &mut int_workspace,
+    &mut page_locked_int_workspace,
+    &mut out,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    MhaQkvLayout::Nhd,
+    DType::F16,
+    options,
+)?;
+```
+
+## API Example: MHA Batched Paged Prefill (`cudarc`)
+
+```rust
+use flashinfer_rs::{
+    DType, MhaBatchPrefillCudarcOptions, MhaQkvLayout, mha_batch_prefill_paged_cudarc,
+};
+
+let options = MhaBatchPrefillCudarcOptions {
+    causal: true,
+    ..Default::default()
+};
+
+mha_batch_prefill_paged_cudarc(
+    stream.as_ref(),
+    &q,
+    &paged_k_cache,
+    &paged_v_cache,
+    &qo_indptr_dev,
+    &paged_kv_indptr_dev,
+    &paged_kv_indices_dev,
+    &paged_kv_last_page_len_dev,
+    &qo_indptr_host,
+    &paged_kv_indptr_host,
+    &kv_len_arr_host,
+    &mut float_workspace,
+    &mut int_workspace,
+    &mut page_locked_int_workspace,
+    &mut out,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    page_size,
+    MhaQkvLayout::Nhd,
+    DType::F16,
+    options,
+)?;
+```
+
 ## Architecture Handling
 
 FlashInfer host wrappers dispatch to architecture-specific kernels at runtime.
@@ -147,10 +291,12 @@ FlashInfer host wrappers dispatch to architecture-specific kernels at runtime.
 cargo test
 cargo test --features cudarc
 FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test gemma_rmsnorm_gpu
+FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test mha_batch_prefill_gpu
+FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test mha_batch_prefill_paged_gpu
 ```
 
 ## Additional Notes
 
 - Calls are asynchronous with respect to host execution (no implicit stream synchronize).
-- Dynamic loading order is: `libtvm_ffi.so` -> `norm.so` -> `gdn_prefill_sm90.so`.
+- Dynamic loading order is: `libtvm_ffi.so` -> `norm.so` -> `gdn_prefill_sm90.so` -> on-demand MHA prefill modules.
 - Integration details: `docs/flashinfer-rs-integration.md`.

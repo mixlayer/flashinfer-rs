@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
@@ -13,7 +14,8 @@ use zip::ZipArchive;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    KDL_CUDA, TVMFFIAny, TVMFFIObjectHandle, TVMFFIVersion, byte_array_to_string, error_cell_ptr,
+    KDL_CUDA, TVMFFIAny, TVMFFIObjectHandle, TVMFFIVersion, any_none, byte_array_to_string,
+    error_cell_ptr,
 };
 
 const ENV_JIT_CACHE_WHEEL: &str = "FLASHINFER_RS_JIT_CACHE_WHEEL";
@@ -32,6 +34,7 @@ type TVMFFIGetVersionFn = unsafe extern "C" fn(*mut TVMFFIVersion);
 type TVMFFIEnvSetStreamFn = unsafe extern "C" fn(i32, i32, *mut c_void, *mut *mut c_void) -> i32;
 type TVMFFIErrorMoveFromRaisedFn = unsafe extern "C" fn(*mut TVMFFIObjectHandle);
 type TVMFFIObjectDecRefFn = unsafe extern "C" fn(TVMFFIObjectHandle) -> i32;
+type TVMFFIAnyViewToOwnedAnyFn = unsafe extern "C" fn(*const TVMFFIAny, *mut TVMFFIAny) -> i32;
 type TVMFFISafeCallFn =
     unsafe extern "C" fn(*mut c_void, *const TVMFFIAny, i32, *mut TVMFFIAny) -> i32;
 
@@ -109,13 +112,32 @@ impl RuntimeConfig {
 
 #[derive(Debug)]
 struct ExtractedArtifacts {
+    artifact_dir: PathBuf,
     norm_so_path: PathBuf,
     gdn_prefill_sm90_so_path: PathBuf,
     tvmffi_so_path: PathBuf,
 }
 
+struct LoadedKernel {
+    _lib: Library,
+    run: TVMFFISafeCallFn,
+}
+
+#[derive(Clone, Copy)]
+struct BatchPrefillKernelFns {
+    plan: TVMFFISafeCallFn,
+    ragged_run: TVMFFISafeCallFn,
+    paged_run: TVMFFISafeCallFn,
+}
+
+struct LoadedBatchPrefillKernel {
+    _lib: Library,
+    fns: BatchPrefillKernelFns,
+}
+
 pub struct FlashInferRuntime {
     resolved: ResolvedRuntimeConfig,
+    artifact_dir: PathBuf,
     _tvmffi_lib: Library,
     _norm_lib: Library,
     _gdn_prefill_sm90_lib: Library,
@@ -123,8 +145,11 @@ pub struct FlashInferRuntime {
     tvmffi_env_set_stream: TVMFFIEnvSetStreamFn,
     tvmffi_error_move_from_raised: TVMFFIErrorMoveFromRaisedFn,
     tvmffi_object_dec_ref: TVMFFIObjectDecRefFn,
+    tvmffi_any_view_to_owned_any: TVMFFIAnyViewToOwnedAnyFn,
     tvm_ffi_gemma_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gdn_prefill: TVMFFISafeCallFn,
+    single_prefill_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
+    batch_prefill_kernel_cache: Mutex<HashMap<String, LoadedBatchPrefillKernel>>,
 }
 
 static GLOBAL_RUNTIME: OnceLock<FlashInferRuntime> = OnceLock::new();
@@ -218,6 +243,206 @@ impl FlashInferRuntime {
         Err(self.decode_raised_error(code))
     }
 
+    pub(crate) unsafe fn call_single_prefill(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let run = unsafe { self.resolve_single_prefill_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { run(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_batch_prefill_plan(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_batch_prefill_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.plan)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_batch_prefill_ragged(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_batch_prefill_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.ragged_run)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_batch_prefill_paged(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_batch_prefill_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.paged_run)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn any_view_to_owned(
+        &self,
+        any_view: &TVMFFIAny,
+    ) -> Result<TVMFFIAny, FlashInferError> {
+        let mut owned = any_none();
+        // SAFETY: symbol pointer and arguments follow TVM-FFI C ABI.
+        let code = unsafe {
+            (self.tvmffi_any_view_to_owned_any)(any_view as *const _, &mut owned as *mut _)
+        };
+        if code == 0 {
+            return Ok(owned);
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn object_dec_ref(&self, obj: TVMFFIObjectHandle) {
+        if obj.is_null() {
+            return;
+        }
+        // SAFETY: object handle was created by TVM-FFI APIs and may be decref'd here.
+        let _ = unsafe { (self.tvmffi_object_dec_ref)(obj) };
+    }
+
+    unsafe fn resolve_single_prefill_kernel(
+        &self,
+        kernel_uri: &str,
+    ) -> Result<TVMFFISafeCallFn, FlashInferError> {
+        let mut cache = self.single_prefill_kernel_cache.lock().map_err(|_| {
+            FlashInferError::invalid_argument("single prefill cache lock is poisoned")
+        })?;
+
+        if let Some(kernel) = cache.get(kernel_uri) {
+            return Ok(kernel.run);
+        }
+
+        let kernel_path = extract_jit_kernel(
+            &self.resolved.jit_cache_wheel,
+            &self.artifact_dir,
+            kernel_uri,
+        )?;
+
+        let kernel_lib =
+            unsafe { Library::open(Some(&kernel_path), libc::RTLD_NOW | libc::RTLD_LOCAL) }
+                .map_err(|e| FlashInferError::LibraryLoad {
+                    library: kernel_path.clone(),
+                    message: e.to_string(),
+                })?;
+
+        let run: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_run\0",
+                "__tvm_ffi_run",
+            )?
+        };
+
+        cache.insert(
+            kernel_uri.to_string(),
+            LoadedKernel {
+                _lib: kernel_lib,
+                run,
+            },
+        );
+        Ok(run)
+    }
+
+    unsafe fn resolve_batch_prefill_kernel(
+        &self,
+        kernel_uri: &str,
+    ) -> Result<BatchPrefillKernelFns, FlashInferError> {
+        let mut cache = self.batch_prefill_kernel_cache.lock().map_err(|_| {
+            FlashInferError::invalid_argument("batch prefill cache lock is poisoned")
+        })?;
+
+        if let Some(kernel) = cache.get(kernel_uri) {
+            return Ok(kernel.fns);
+        }
+
+        let kernel_path = extract_jit_kernel(
+            &self.resolved.jit_cache_wheel,
+            &self.artifact_dir,
+            kernel_uri,
+        )?;
+
+        let kernel_lib =
+            unsafe { Library::open(Some(&kernel_path), libc::RTLD_NOW | libc::RTLD_LOCAL) }
+                .map_err(|e| FlashInferError::LibraryLoad {
+                    library: kernel_path.clone(),
+                    message: e.to_string(),
+                })?;
+
+        let plan: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_plan\0",
+                "__tvm_ffi_plan",
+            )?
+        };
+        let ragged_run: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_ragged_run\0",
+                "__tvm_ffi_ragged_run",
+            )?
+        };
+        let paged_run: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_paged_run\0",
+                "__tvm_ffi_paged_run",
+            )?
+        };
+        let fns = BatchPrefillKernelFns {
+            plan,
+            ragged_run,
+            paged_run,
+        };
+
+        cache.insert(
+            kernel_uri.to_string(),
+            LoadedBatchPrefillKernel {
+                _lib: kernel_lib,
+                fns,
+            },
+        );
+        Ok(fns)
+    }
+
     unsafe fn load(resolved: ResolvedRuntimeConfig) -> Result<Self, FlashInferError> {
         let artifacts = extract_artifacts(&resolved)?;
 
@@ -290,6 +515,15 @@ impl FlashInferRuntime {
             )?
         };
 
+        let tvmffi_any_view_to_owned_any: TVMFFIAnyViewToOwnedAnyFn = unsafe {
+            resolve_symbol(
+                &tvmffi_lib,
+                &artifacts.tvmffi_so_path,
+                b"TVMFFIAnyViewToOwnedAny\0",
+                "TVMFFIAnyViewToOwnedAny",
+            )?
+        };
+
         let tvm_ffi_gemma_rmsnorm: TVMFFISafeCallFn = unsafe {
             resolve_symbol(
                 &norm_lib,
@@ -326,6 +560,7 @@ impl FlashInferRuntime {
 
         Ok(Self {
             resolved,
+            artifact_dir: artifacts.artifact_dir,
             _tvmffi_lib: tvmffi_lib,
             _norm_lib: norm_lib,
             _gdn_prefill_sm90_lib: gdn_prefill_sm90_lib,
@@ -333,8 +568,11 @@ impl FlashInferRuntime {
             tvmffi_env_set_stream,
             tvmffi_error_move_from_raised,
             tvmffi_object_dec_ref,
+            tvmffi_any_view_to_owned_any,
             tvm_ffi_gemma_rmsnorm,
             tvm_ffi_gdn_prefill,
+            single_prefill_kernel_cache: Mutex::new(HashMap::new()),
+            batch_prefill_kernel_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -388,17 +626,7 @@ unsafe fn resolve_symbol<T: Copy>(
 fn extract_artifacts(
     resolved: &ResolvedRuntimeConfig,
 ) -> Result<ExtractedArtifacts, FlashInferError> {
-    fs::create_dir_all(&resolved.cache_dir).map_err(|e| FlashInferError::CreateCacheDir {
-        path: resolved.cache_dir.clone(),
-        source: e,
-    })?;
-
-    let artifact_hash = artifact_hash(&resolved.jit_cache_wheel, &resolved.tvmffi_wheel)?;
-    let artifact_dir = resolved.cache_dir.join(artifact_hash);
-    fs::create_dir_all(&artifact_dir).map_err(|e| FlashInferError::CreateCacheDir {
-        path: artifact_dir.clone(),
-        source: e,
-    })?;
+    let artifact_dir = artifact_dir_for(resolved)?;
 
     let lock_path = artifact_dir.join(".extract.lock");
     let lock_file = OpenOptions::new()
@@ -444,10 +672,72 @@ fn extract_artifacts(
     let _ = lock_file.unlock();
 
     Ok(ExtractedArtifacts {
+        artifact_dir,
         norm_so_path,
         gdn_prefill_sm90_so_path,
         tvmffi_so_path,
     })
+}
+
+fn extract_jit_kernel(
+    jit_cache_wheel: &Path,
+    artifact_dir: &Path,
+    kernel_uri: &str,
+) -> Result<PathBuf, FlashInferError> {
+    let member_suffix = format!("flashinfer_jit_cache/jit_cache/{kernel_uri}/{kernel_uri}.so");
+    let output_path = artifact_dir
+        .join("jit_cache")
+        .join(kernel_uri)
+        .join(format!("{kernel_uri}.so"));
+
+    if output_path.exists() {
+        return Ok(output_path);
+    }
+
+    fs::create_dir_all(artifact_dir).map_err(|e| FlashInferError::CreateCacheDir {
+        path: artifact_dir.to_path_buf(),
+        source: e,
+    })?;
+
+    let lock_path = artifact_dir.join(".extract.lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| FlashInferError::CacheLock {
+            path: lock_path.clone(),
+            source: e,
+        })?;
+    lock_file
+        .lock_exclusive()
+        .map_err(|e| FlashInferError::CacheLock {
+            path: lock_path.clone(),
+            source: e,
+        })?;
+
+    if !output_path.exists() {
+        extract_member_from_wheel_by_suffix(jit_cache_wheel, &member_suffix, &output_path)?;
+    }
+
+    let _ = lock_file.unlock();
+    Ok(output_path)
+}
+
+fn artifact_dir_for(resolved: &ResolvedRuntimeConfig) -> Result<PathBuf, FlashInferError> {
+    fs::create_dir_all(&resolved.cache_dir).map_err(|e| FlashInferError::CreateCacheDir {
+        path: resolved.cache_dir.clone(),
+        source: e,
+    })?;
+
+    let artifact_hash = artifact_hash(&resolved.jit_cache_wheel, &resolved.tvmffi_wheel)?;
+    let artifact_dir = resolved.cache_dir.join(artifact_hash);
+    fs::create_dir_all(&artifact_dir).map_err(|e| FlashInferError::CreateCacheDir {
+        path: artifact_dir.clone(),
+        source: e,
+    })?;
+    Ok(artifact_dir)
 }
 
 fn artifact_hash(jit_cache_wheel: &Path, tvmffi_wheel: &Path) -> Result<String, FlashInferError> {

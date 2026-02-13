@@ -1,6 +1,9 @@
 pub mod error;
 mod ffi;
 pub mod gdn_prefill;
+pub mod mha_batch_prefill;
+pub mod mha_batch_prefill_paged;
+pub mod mha_prefill;
 pub mod norm;
 pub mod runtime;
 
@@ -14,6 +17,23 @@ pub use gdn_prefill::{
     gdn_prefill_sm90_cudarc, gdn_prefill_sm90_cudarc_with_options,
     gdn_prefill_sm90_cudarc_with_scale,
 };
+#[cfg(feature = "cudarc")]
+pub use mha_batch_prefill::{MhaBatchPrefillCudarcOptions, mha_batch_prefill_cudarc};
+pub use mha_batch_prefill::{
+    MhaBatchPrefillParams, MhaHostTensor1DI32Desc, MhaHostTensor1DU8Desc, MhaTensor1DI32Desc,
+    MhaTensor1DU16Desc, MhaTensor1DU32Desc, mha_batch_prefill,
+};
+#[cfg(feature = "cudarc")]
+pub use mha_batch_prefill_paged::mha_batch_prefill_paged_cudarc;
+pub use mha_batch_prefill_paged::{
+    MhaBatchPagedPrefillParams, MhaTensor4DDesc, mha_batch_prefill_paged,
+};
+pub use mha_prefill::{
+    MhaMaskMode, MhaPosEncodingMode, MhaQkvLayout, MhaSinglePrefillParams, MhaTensor1DF32Desc,
+    MhaTensor1DU8Desc, MhaTensor2DF32Desc, MhaTensor3DDesc, mha_single_prefill,
+};
+#[cfg(feature = "cudarc")]
+pub use mha_prefill::{MhaSinglePrefillCudarcOptions, mha_single_prefill_cudarc};
 pub use norm::{DType, GemmaRmsNormParams, Tensor1DDesc, Tensor2DDesc, gemma_rmsnorm};
 #[cfg(feature = "cudarc")]
 pub use norm::{gemma_rmsnorm_cudarc, gemma_rmsnorm_cudarc_with_options};

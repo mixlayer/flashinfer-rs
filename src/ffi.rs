@@ -2,12 +2,16 @@ use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::slice;
 
+pub const KDL_CPU: i32 = 1;
 pub const KDL_CUDA: i32 = 2;
 
 pub const KTVM_FFI_NONE: i32 = 0;
+pub const KTVM_FFI_INT: i32 = 1;
 pub const KTVM_FFI_BOOL: i32 = 2;
 pub const KTVM_FFI_FLOAT: i32 = 3;
 pub const KTVM_FFI_DL_TENSOR_PTR: i32 = 7;
+pub const KTVM_FFI_OBJECT_RVALUE_REF: i32 = 10;
+pub const KTVM_FFI_STATIC_OBJECT_BEGIN: i32 = 64;
 
 pub const KDL_INT: u8 = 0;
 pub const KDL_UINT: u8 = 1;
@@ -131,6 +135,14 @@ pub fn any_bool(value: bool) -> TVMFFIAny {
     }
 }
 
+pub fn any_i64(value: i64) -> TVMFFIAny {
+    TVMFFIAny {
+        type_index: KTVM_FFI_INT,
+        tag: TVMFFIAnyTag { zero_padding: 0 },
+        value: TVMFFIAnyValue { v_int64: value },
+    }
+}
+
 pub fn any_f64(value: f64) -> TVMFFIAny {
     TVMFFIAny {
         type_index: KTVM_FFI_FLOAT,
@@ -146,6 +158,21 @@ pub fn any_dltensor_ptr(tensor: *const DLTensor) -> TVMFFIAny {
         value: TVMFFIAnyValue {
             v_ptr: tensor.cast_mut().cast(),
         },
+    }
+}
+
+pub fn any_object_handle(value: &TVMFFIAny) -> Option<TVMFFIObjectHandle> {
+    if value.type_index < KTVM_FFI_STATIC_OBJECT_BEGIN
+        && value.type_index != KTVM_FFI_OBJECT_RVALUE_REF
+    {
+        return None;
+    }
+    // SAFETY: callers use this helper only for object-like `type_index` values.
+    let obj = unsafe { value.value.v_obj };
+    if obj.is_null() {
+        None
+    } else {
+        Some(obj.cast())
     }
 }
 
@@ -196,6 +223,14 @@ mod tests {
         assert_eq!(packed.type_index, KTVM_FFI_BOOL);
         // SAFETY: field matches the value constructor.
         assert_eq!(unsafe { packed.value.v_int64 }, 1);
+    }
+
+    #[test]
+    fn pack_i64_sets_expected_type_and_value() {
+        let packed = any_i64(123);
+        assert_eq!(packed.type_index, KTVM_FFI_INT);
+        // SAFETY: field matches the value constructor.
+        assert_eq!(unsafe { packed.value.v_int64 }, 123);
     }
 
     #[test]
