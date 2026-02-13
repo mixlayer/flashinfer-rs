@@ -5,6 +5,7 @@ Rust-first integration for calling precompiled FlashInfer kernels through TVM-FF
 ## Current Scope
 
 - `gemma_rmsnorm` from `norm.so`
+- `rmsnorm` (2D) and fused QK RMSNorm (3D) from `norm.so`
 - `gdn_prefill` from `gdn_prefill_sm90.so` (SM90A path)
 - MHA single prefill (`single_prefill_with_kv_cache`) via on-demand JIT-cache module loading
 - MHA batched ragged/paged prefill (`batch_prefill_with_kv_cache`) via on-demand JIT-cache module loading
@@ -340,6 +341,7 @@ FlashInfer host wrappers dispatch to architecture-specific kernels at runtime.
 cargo test
 cargo test --features cudarc
 FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test gemma_rmsnorm_gpu
+FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test rmsnorm_gpu
 FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test mha_batch_prefill_gpu
 FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test mha_batch_prefill_paged_gpu
 FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test mha_decode_gpu

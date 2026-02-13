@@ -157,6 +157,7 @@ pub struct FlashInferRuntime {
     tvmffi_error_move_from_raised: TVMFFIErrorMoveFromRaisedFn,
     tvmffi_object_dec_ref: TVMFFIObjectDecRefFn,
     tvmffi_any_view_to_owned_any: TVMFFIAnyViewToOwnedAnyFn,
+    tvm_ffi_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gemma_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gdn_prefill: TVMFFISafeCallFn,
     single_prefill_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
@@ -235,6 +236,20 @@ impl FlashInferRuntime {
         // SAFETY: symbol signature follows TVMFFISafeCallType.
         let code =
             unsafe { (self.tvm_ffi_gemma_rmsnorm)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_rmsnorm(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (self.tvm_ffi_rmsnorm)(std::ptr::null_mut(), args, num_args, result) };
         if code == 0 {
             return Ok(());
         }
@@ -694,6 +709,15 @@ impl FlashInferRuntime {
             )?
         };
 
+        let tvm_ffi_rmsnorm: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &norm_lib,
+                &artifacts.norm_so_path,
+                b"__tvm_ffi_rmsnorm\0",
+                "__tvm_ffi_rmsnorm",
+            )?
+        };
+
         let tvm_ffi_gdn_prefill: TVMFFISafeCallFn = unsafe {
             resolve_symbol(
                 &gdn_prefill_sm90_lib,
@@ -730,6 +754,7 @@ impl FlashInferRuntime {
             tvmffi_error_move_from_raised,
             tvmffi_object_dec_ref,
             tvmffi_any_view_to_owned_any,
+            tvm_ffi_rmsnorm,
             tvm_ffi_gemma_rmsnorm,
             tvm_ffi_gdn_prefill,
             single_prefill_kernel_cache: Mutex::new(HashMap::new()),
