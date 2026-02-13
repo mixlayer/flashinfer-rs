@@ -1,0 +1,21 @@
+[package]
+name = "flashinfer-rs"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+cudarc = ["dep:cudarc"]
+
+[dependencies]
+cudarc = { version = "0.19.2", optional = true, features = ["cuda-13000"] }
+fs2 = "0.4.3"
+libc = "0.2.170"
+libloading = "0.8.6"
+sha2 = "0.10.8"
+thiserror = "2.0.12"
+zip = { version = "2.2.3", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+half = "2.4.1"
+tempfile = "3.17.1"
