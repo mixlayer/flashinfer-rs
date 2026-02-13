@@ -7,6 +7,8 @@ A Python wheel (`*.whl`) is a zip archive that carries prebuilt artifacts. For t
 - `flashinfer_jit_cache/.../jit_cache/gdn_prefill_sm90/gdn_prefill_sm90.so`
 - `flashinfer_jit_cache/.../jit_cache/single_prefill_with_kv_cache_.../single_prefill_with_kv_cache_....so`
 - `flashinfer_jit_cache/.../jit_cache/batch_prefill_with_kv_cache_.../batch_prefill_with_kv_cache_....so`
+- `flashinfer_jit_cache/.../jit_cache/single_decode_with_kv_cache_.../single_decode_with_kv_cache_....so`
+- `flashinfer_jit_cache/.../jit_cache/batch_decode_with_kv_cache_.../batch_decode_with_kv_cache_....so`
 - `tvm_ffi/lib/libtvm_ffi.so`
 
 No Python runtime is required for calling `gemma_rmsnorm` once the `.so` files are extracted.
@@ -43,6 +45,8 @@ The Rust integration calls the exported TVM-FFI host wrapper:
 - `__tvm_ffi_gdn_prefill`
 - `__tvm_ffi_run` (for `single_prefill_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_plan`, `__tvm_ffi_ragged_run`, and `__tvm_ffi_paged_run` (for `batch_prefill_with_kv_cache` JIT-cache modules)
+- `__tvm_ffi_run` (for `single_decode_with_kv_cache` JIT-cache modules)
+- `__tvm_ffi_plan` and `__tvm_ffi_run` (for `batch_decode_with_kv_cache` JIT-cache modules)
 
 This wrapper handles argument decoding, validation, stream lookup, and dispatch to the correct kernel implementation.
 
@@ -59,6 +63,8 @@ Runtime loading order:
 3. Load `gdn_prefill_sm90.so` with `RTLD_NOW | RTLD_LOCAL`
 4. Load `single_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
 5. Load `batch_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+6. Load `single_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+7. Load `batch_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
 
 Required CUDA runtime dependency from `norm.so`:
 
@@ -120,6 +126,19 @@ For MHA batched ragged prefill (FA2 path), Rust similarly constructs:
 - `batch_prefill_with_kv_cache_dtype_q_{...}_dtype_kv_{...}_dtype_o_{...}_dtype_idx_i32_head_dim_qk_{...}_head_dim_vo_{...}_posenc_{...}_use_swa_{...}_use_logits_cap_{...}_f16qk_{...}`
 
 It calls `plan` first, converts returned `AnyView` into an owned TVM object, passes that plan object to `ragged_run` or `paged_run`, and decref's it after launch.
+
+For MHA single decode, Rust constructs:
+
+- `single_decode_with_kv_cache_dtype_q_{...}_dtype_kv_{...}_dtype_o_{...}_head_dim_qk_{...}_head_dim_vo_{...}_posenc_{...}_use_swa_{...}_use_logits_cap_{...}`
+
+For MHA batched paged decode, Rust constructs:
+
+- `batch_decode_with_kv_cache_dtype_q_{...}_dtype_kv_{...}_dtype_o_{...}_dtype_idx_i32_head_dim_qk_{...}_head_dim_vo_{...}_posenc_{...}_use_swa_{...}_use_logits_cap_{...}`
+
+Batched decode also uses a two-step host ABI:
+
+1. `plan` (`__tvm_ffi_plan`) to produce opaque plan info.
+2. `run` (`__tvm_ffi_run`) with that plan object and runtime tensors.
 
 Concrete example:
 

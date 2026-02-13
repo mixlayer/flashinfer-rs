@@ -3,6 +3,7 @@ mod ffi;
 pub mod gdn_prefill;
 pub mod mha_batch_prefill;
 pub mod mha_batch_prefill_paged;
+pub mod mha_decode;
 pub mod mha_prefill;
 pub mod norm;
 pub mod runtime;
@@ -27,6 +28,15 @@ pub use mha_batch_prefill::{
 pub use mha_batch_prefill_paged::mha_batch_prefill_paged_cudarc;
 pub use mha_batch_prefill_paged::{
     MhaBatchPagedPrefillParams, MhaTensor4DDesc, mha_batch_prefill_paged,
+};
+#[cfg(feature = "cudarc")]
+pub use mha_decode::{
+    MhaBatchDecodeCudarcOptions, MhaSingleDecodeCudarcOptions, mha_batch_decode_paged_cudarc,
+    mha_single_decode_cudarc,
+};
+pub use mha_decode::{
+    MhaBatchPagedDecodeParams, MhaSingleDecodeParams, MhaTensor2DDesc, mha_batch_decode_paged,
+    mha_single_decode,
 };
 pub use mha_prefill::{
     MhaMaskMode, MhaPosEncodingMode, MhaQkvLayout, MhaSinglePrefillParams, MhaTensor1DF32Desc,

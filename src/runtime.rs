@@ -135,6 +135,17 @@ struct LoadedBatchPrefillKernel {
     fns: BatchPrefillKernelFns,
 }
 
+#[derive(Clone, Copy)]
+struct BatchDecodeKernelFns {
+    plan: TVMFFISafeCallFn,
+    run: TVMFFISafeCallFn,
+}
+
+struct LoadedBatchDecodeKernel {
+    _lib: Library,
+    fns: BatchDecodeKernelFns,
+}
+
 pub struct FlashInferRuntime {
     resolved: ResolvedRuntimeConfig,
     artifact_dir: PathBuf,
@@ -150,6 +161,8 @@ pub struct FlashInferRuntime {
     tvm_ffi_gdn_prefill: TVMFFISafeCallFn,
     single_prefill_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
     batch_prefill_kernel_cache: Mutex<HashMap<String, LoadedBatchPrefillKernel>>,
+    single_decode_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
+    batch_decode_kernel_cache: Mutex<HashMap<String, LoadedBatchDecodeKernel>>,
 }
 
 static GLOBAL_RUNTIME: OnceLock<FlashInferRuntime> = OnceLock::new();
@@ -311,6 +324,57 @@ impl FlashInferRuntime {
         Err(self.decode_raised_error(code))
     }
 
+    pub(crate) unsafe fn call_single_decode(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let run = unsafe { self.resolve_single_decode_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { run(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_batch_decode_plan(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_batch_decode_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.plan)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_batch_decode_run(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_batch_decode_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.run)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
     pub(crate) unsafe fn any_view_to_owned(
         &self,
         any_view: &TVMFFIAny,
@@ -340,6 +404,50 @@ impl FlashInferRuntime {
     ) -> Result<TVMFFISafeCallFn, FlashInferError> {
         let mut cache = self.single_prefill_kernel_cache.lock().map_err(|_| {
             FlashInferError::invalid_argument("single prefill cache lock is poisoned")
+        })?;
+
+        if let Some(kernel) = cache.get(kernel_uri) {
+            return Ok(kernel.run);
+        }
+
+        let kernel_path = extract_jit_kernel(
+            &self.resolved.jit_cache_wheel,
+            &self.artifact_dir,
+            kernel_uri,
+        )?;
+
+        let kernel_lib =
+            unsafe { Library::open(Some(&kernel_path), libc::RTLD_NOW | libc::RTLD_LOCAL) }
+                .map_err(|e| FlashInferError::LibraryLoad {
+                    library: kernel_path.clone(),
+                    message: e.to_string(),
+                })?;
+
+        let run: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_run\0",
+                "__tvm_ffi_run",
+            )?
+        };
+
+        cache.insert(
+            kernel_uri.to_string(),
+            LoadedKernel {
+                _lib: kernel_lib,
+                run,
+            },
+        );
+        Ok(run)
+    }
+
+    unsafe fn resolve_single_decode_kernel(
+        &self,
+        kernel_uri: &str,
+    ) -> Result<TVMFFISafeCallFn, FlashInferError> {
+        let mut cache = self.single_decode_kernel_cache.lock().map_err(|_| {
+            FlashInferError::invalid_argument("single decode cache lock is poisoned")
         })?;
 
         if let Some(kernel) = cache.get(kernel_uri) {
@@ -436,6 +544,59 @@ impl FlashInferRuntime {
         cache.insert(
             kernel_uri.to_string(),
             LoadedBatchPrefillKernel {
+                _lib: kernel_lib,
+                fns,
+            },
+        );
+        Ok(fns)
+    }
+
+    unsafe fn resolve_batch_decode_kernel(
+        &self,
+        kernel_uri: &str,
+    ) -> Result<BatchDecodeKernelFns, FlashInferError> {
+        let mut cache = self.batch_decode_kernel_cache.lock().map_err(|_| {
+            FlashInferError::invalid_argument("batch decode cache lock is poisoned")
+        })?;
+
+        if let Some(kernel) = cache.get(kernel_uri) {
+            return Ok(kernel.fns);
+        }
+
+        let kernel_path = extract_jit_kernel(
+            &self.resolved.jit_cache_wheel,
+            &self.artifact_dir,
+            kernel_uri,
+        )?;
+
+        let kernel_lib =
+            unsafe { Library::open(Some(&kernel_path), libc::RTLD_NOW | libc::RTLD_LOCAL) }
+                .map_err(|e| FlashInferError::LibraryLoad {
+                    library: kernel_path.clone(),
+                    message: e.to_string(),
+                })?;
+
+        let plan: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_plan\0",
+                "__tvm_ffi_plan",
+            )?
+        };
+        let run: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_run\0",
+                "__tvm_ffi_run",
+            )?
+        };
+        let fns = BatchDecodeKernelFns { plan, run };
+
+        cache.insert(
+            kernel_uri.to_string(),
+            LoadedBatchDecodeKernel {
                 _lib: kernel_lib,
                 fns,
             },
@@ -573,6 +734,8 @@ impl FlashInferRuntime {
             tvm_ffi_gdn_prefill,
             single_prefill_kernel_cache: Mutex::new(HashMap::new()),
             batch_prefill_kernel_cache: Mutex::new(HashMap::new()),
+            single_decode_kernel_cache: Mutex::new(HashMap::new()),
+            batch_decode_kernel_cache: Mutex::new(HashMap::new()),
         })
     }
 
