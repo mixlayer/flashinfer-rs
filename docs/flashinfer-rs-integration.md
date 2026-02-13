@@ -42,7 +42,7 @@ The Rust integration calls the exported TVM-FFI host wrapper:
 - `__tvm_ffi_gemma_rmsnorm`
 - `__tvm_ffi_gdn_prefill`
 - `__tvm_ffi_run` (for `single_prefill_with_kv_cache` JIT-cache modules)
-- `__tvm_ffi_plan` and `__tvm_ffi_ragged_run` (for `batch_prefill_with_kv_cache` JIT-cache modules)
+- `__tvm_ffi_plan`, `__tvm_ffi_ragged_run`, and `__tvm_ffi_paged_run` (for `batch_prefill_with_kv_cache` JIT-cache modules)
 
 This wrapper handles argument decoding, validation, stream lookup, and dispatch to the correct kernel implementation.
 
@@ -119,7 +119,7 @@ For MHA batched ragged prefill (FA2 path), Rust similarly constructs:
 
 - `batch_prefill_with_kv_cache_dtype_q_{...}_dtype_kv_{...}_dtype_o_{...}_dtype_idx_i32_head_dim_qk_{...}_head_dim_vo_{...}_posenc_{...}_use_swa_{...}_use_logits_cap_{...}_f16qk_{...}`
 
-It calls `plan` first, converts returned `AnyView` into an owned TVM object, passes that plan object to `ragged_run`, and decref's it after launch.
+It calls `plan` first, converts returned `AnyView` into an owned TVM object, passes that plan object to `ragged_run` or `paged_run`, and decref's it after launch.
 
 Concrete example:
 

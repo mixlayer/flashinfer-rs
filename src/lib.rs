@@ -2,6 +2,7 @@ pub mod error;
 mod ffi;
 pub mod gdn_prefill;
 pub mod mha_batch_prefill;
+pub mod mha_batch_prefill_paged;
 pub mod mha_prefill;
 pub mod norm;
 pub mod runtime;
@@ -21,6 +22,11 @@ pub use mha_batch_prefill::{MhaBatchPrefillCudarcOptions, mha_batch_prefill_cuda
 pub use mha_batch_prefill::{
     MhaBatchPrefillParams, MhaHostTensor1DI32Desc, MhaHostTensor1DU8Desc, MhaTensor1DI32Desc,
     MhaTensor1DU16Desc, MhaTensor1DU32Desc, mha_batch_prefill,
+};
+#[cfg(feature = "cudarc")]
+pub use mha_batch_prefill_paged::mha_batch_prefill_paged_cudarc;
+pub use mha_batch_prefill_paged::{
+    MhaBatchPagedPrefillParams, MhaTensor4DDesc, mha_batch_prefill_paged,
 };
 pub use mha_prefill::{
     MhaMaskMode, MhaPosEncodingMode, MhaQkvLayout, MhaSinglePrefillParams, MhaTensor1DF32Desc,

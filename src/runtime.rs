@@ -127,6 +127,7 @@ struct LoadedKernel {
 struct BatchPrefillKernelFns {
     plan: TVMFFISafeCallFn,
     ragged_run: TVMFFISafeCallFn,
+    paged_run: TVMFFISafeCallFn,
 }
 
 struct LoadedBatchPrefillKernel {
@@ -293,6 +294,23 @@ impl FlashInferRuntime {
         Err(self.decode_raised_error(code))
     }
 
+    pub(crate) unsafe fn call_batch_prefill_paged(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_batch_prefill_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.paged_run)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
     pub(crate) unsafe fn any_view_to_owned(
         &self,
         any_view: &TVMFFIAny,
@@ -401,7 +419,19 @@ impl FlashInferRuntime {
                 "__tvm_ffi_ragged_run",
             )?
         };
-        let fns = BatchPrefillKernelFns { plan, ragged_run };
+        let paged_run: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_paged_run\0",
+                "__tvm_ffi_paged_run",
+            )?
+        };
+        let fns = BatchPrefillKernelFns {
+            plan,
+            ragged_run,
+            paged_run,
+        };
 
         cache.insert(
             kernel_uri.to_string(),
