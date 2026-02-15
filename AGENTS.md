@@ -114,6 +114,31 @@ Primary files to inspect:
 - Ad-hoc CuTeDSL exports may target a single architecture (for example `sm_120a`) rather than wheel-style multi-arch packaging.
 - Version skew is a real risk when compiling outside pinned wheel artifacts (`apache-tvm-ffi`, `nvidia-cutlass-dsl`, CUDA stack).
 
+## CuTeDSL Kernel Inventory (JIT-first / no direct wheel `.so` export by API name)
+
+- `flashinfer/flashinfer/gdn_decode.py`
+  - APIs: GDN decode CuTeDSL path (`cute.compile(..., options="--enable-tvm-ffi")`).
+  - Notes: No matching prebuilt wheel `.so` name like `gdn_decode*.so` in current `flashinfer_jit_cache` wheel.
+- `flashinfer/flashinfer/cute_dsl/rmsnorm_fp4quant.py`
+  - API: `rmsnorm_fp4quant` (`cute.compile(..., options="--enable-tvm-ffi")`).
+  - Notes: No matching prebuilt wheel `.so` name like `rmsnorm_fp4quant*.so`.
+- `flashinfer/flashinfer/cute_dsl/add_rmsnorm_fp4quant.py`
+  - API: `add_rmsnorm_fp4quant` (`cute.compile(..., options="--enable-tvm-ffi")`).
+  - Notes: No matching prebuilt wheel `.so` name like `add_rmsnorm_fp4quant*.so`.
+- `flashinfer/flashinfer/gemm/kernels/grouped_gemm_masked_blackwell.py`
+  - API: `grouped_gemm_nt_masked` CuTeDSL GEMM path (`cute.compile(...)`).
+  - Notes: No matching prebuilt wheel `.so` name like `grouped_gemm_nt_masked*.so`.
+- `flashinfer/flashinfer/fused_moe/cute_dsl/fused_moe.py`
+  - APIs: `cute_dsl_fused_moe_nvfp4`, `CuteDslMoEWrapper`.
+  - Underlying CuTeDSL compile sites:
+    - `flashinfer/flashinfer/fused_moe/cute_dsl/blockscaled_contiguous_grouped_gemm.py`
+    - `flashinfer/flashinfer/fused_moe/cute_dsl/blockscaled_contiguous_grouped_gemm_swiglu_fusion.py`
+    - `flashinfer/flashinfer/fused_moe/cute_dsl/blockscaled_contiguous_grouped_gemm_finalize_fusion.py`
+    - `flashinfer/flashinfer/fused_moe/cute_dsl/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py`
+  - Notes: No matching prebuilt wheel `.so` name like `cute_dsl_fused_moe_nvfp4*.so`.
+- `flashinfer/flashinfer/cute_dsl/gemm_allreduce_two_shot.py`
+  - Notes: CuTeDSL kernel source exists; currently appears unexposed in high-level public API and has no matching prebuilt wheel `.so` name.
+
 ## CuTeDSL Venv Requirements (`scripts/compile_gdn_decode_tvmffi.py`)
 
 - The script must run inside a Python venv with CUDA-capable PyTorch and CuTeDSL deps.
