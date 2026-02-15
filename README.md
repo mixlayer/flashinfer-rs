@@ -284,8 +284,8 @@ mha_batch_prefill_paged_cudarc(
 
 ```rust
 use flashinfer_rs::{
-    DType, MhaBatchDecodeCudarcOptions, MhaSingleDecodeCudarcOptions, mha_batch_decode_paged_cudarc,
-    mha_single_decode_cudarc,
+    DType, MhaBatchDecodeCudarcOptions, MhaSingleDecodeCudarcOptions,
+    mha_batch_decode_paged_cudarc_plan, mha_batch_decode_paged_cudarc_run, mha_single_decode_cudarc,
 };
 
 mha_single_decode_cudarc(
@@ -304,18 +304,33 @@ mha_single_decode_cudarc(
     MhaSingleDecodeCudarcOptions::default(),
 )?;
 
-mha_batch_decode_paged_cudarc(
+let decode_plan = mha_batch_decode_paged_cudarc_plan(
     stream.as_ref(),
+    &paged_kv_indptr_host,
+    &mut float_workspace,
+    &mut int_workspace,
+    &mut page_locked_int_workspace,
+    batch_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    head_dim,
+    page_size,
+    DType::F16,
+    MhaBatchDecodeCudarcOptions::default(),
+)?;
+
+mha_batch_decode_paged_cudarc_run(
+    stream.as_ref(),
+    &decode_plan,
     &q_batch,
     &paged_k_cache,
     &paged_v_cache,
     &paged_kv_indptr_dev,
     &paged_kv_indices_dev,
     &paged_kv_last_page_len_dev,
-    &paged_kv_indptr_host,
     &mut float_workspace,
     &mut int_workspace,
-    &mut page_locked_int_workspace,
     &mut out_batch,
     num_qo_heads,
     num_kv_heads,
