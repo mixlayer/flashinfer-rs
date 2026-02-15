@@ -5,6 +5,7 @@ A Python wheel (`*.whl`) is a zip archive that carries prebuilt artifacts. For t
 
 - `flashinfer_jit_cache/.../jit_cache/norm/norm.so`
 - `flashinfer_jit_cache/.../jit_cache/gdn_prefill_sm90/gdn_prefill_sm90.so`
+- `flashinfer_jit_cache/.../jit_cache/page/page.so`
 - `flashinfer_jit_cache/.../jit_cache/single_prefill_with_kv_cache_.../single_prefill_with_kv_cache_....so`
 - `flashinfer_jit_cache/.../jit_cache/batch_prefill_with_kv_cache_.../batch_prefill_with_kv_cache_....so`
 - `flashinfer_jit_cache/.../jit_cache/single_decode_with_kv_cache_.../single_decode_with_kv_cache_....so`
@@ -44,6 +45,8 @@ The Rust integration calls the exported TVM-FFI host wrapper:
 - `__tvm_ffi_gemma_rmsnorm`
 - `__tvm_ffi_rmsnorm` (dispatches plain 2D RMSNorm vs fused QK 3D RMSNorm by input rank)
 - `__tvm_ffi_gdn_prefill`
+- `__tvm_ffi_append_paged_kv_cache` (from fixed `page.so`)
+- `__tvm_ffi_append_paged_mla_kv_cache` (from fixed `page.so`)
 - `__tvm_ffi_run` (for `single_prefill_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_plan`, `__tvm_ffi_ragged_run`, and `__tvm_ffi_paged_run` (for `batch_prefill_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_run` (for `single_decode_with_kv_cache` JIT-cache modules)
@@ -62,10 +65,11 @@ Runtime loading order:
 1. Load `libtvm_ffi.so` with `RTLD_NOW | RTLD_GLOBAL`
 2. Load `norm.so` with `RTLD_NOW | RTLD_LOCAL`
 3. Load `gdn_prefill_sm90.so` with `RTLD_NOW | RTLD_LOCAL`
-4. Load `single_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
-5. Load `batch_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
-6. Load `single_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
-7. Load `batch_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+4. Load `page.so` with `RTLD_NOW | RTLD_LOCAL`
+5. Load `single_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+6. Load `batch_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+7. Load `single_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+8. Load `batch_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
 
 Required CUDA runtime dependency from `norm.so`:
 
@@ -90,7 +94,7 @@ Implementation behavior:
 
 1. Set stream and capture `old_stream`.
 2. Create `StreamRestoreGuard`.
-3. Launch wrapper (`__tvm_ffi_gemma_rmsnorm` / `__tvm_ffi_gdn_prefill` / `__tvm_ffi_run`).
+3. Launch wrapper (`__tvm_ffi_gemma_rmsnorm` / `__tvm_ffi_gdn_prefill` / `__tvm_ffi_append_paged_kv_cache` / `__tvm_ffi_run`).
 4. Call `restore_now()` to surface stream-restore errors explicitly.
 5. If control exits early, `Drop` performs a best-effort restore.
 
@@ -105,7 +109,7 @@ Packaging model:
 
 Runtime behavior in this Rust integration:
 
-1. Rust calls exported host wrappers such as `__tvm_ffi_gemma_rmsnorm` and `__tvm_ffi_gdn_prefill`.
+1. Rust calls exported host wrappers such as `__tvm_ffi_gemma_rmsnorm`, `__tvm_ffi_gdn_prefill`, and `__tvm_ffi_append_paged_kv_cache`.
 2. The TVM host wrapper dispatches by kernel variant ABI (dtype, head dims, mask/layout options, etc.) and validates tensor contracts.
 3. GPU architecture selection is usually handled by CUDA loading the matching cubin from the module fatbin (`sm_90a`, `sm_100a`, `sm_120`, etc.).
 4. If the loaded artifact does not contain compatible device code for the active GPU, launch fails and the error is surfaced as `FlashInferError::TvmFfiCall`.
@@ -121,6 +125,11 @@ For MHA single prefill, Rust constructs the exact wheel URI from runtime params:
 - `single_prefill_with_kv_cache_dtype_q_{...}_dtype_kv_{...}_dtype_o_{...}_head_dim_qk_{...}_head_dim_vo_{...}_posenc_{...}_use_swa_{...}_use_logits_cap_{...}_f16qk_{...}`
 
 That module is extracted lazily from the wheel and cached per-process by URI.
+
+For paged KV append kernels, Rust resolves fixed symbols from the fixed `page.so` artifact at runtime initialization:
+
+- `__tvm_ffi_append_paged_kv_cache`
+- `__tvm_ffi_append_paged_mla_kv_cache`
 
 For MHA batched ragged prefill (FA2 path), Rust similarly constructs:
 

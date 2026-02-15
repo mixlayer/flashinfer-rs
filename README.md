@@ -11,6 +11,7 @@ Rust-first integration for calling precompiled FlashInfer kernels through TVM-FF
 - MHA batched ragged/paged prefill (`batch_prefill_with_kv_cache`) via on-demand JIT-cache module loading
 - MHA single decode (`single_decode_with_kv_cache`) via on-demand JIT-cache module loading
 - MHA batched paged decode (`batch_decode_with_kv_cache`) via on-demand JIT-cache module loading
+- Paged KV append (`append_paged_kv_cache`) and paged MLA KV append (`append_paged_mla_kv_cache`) from `page.so`
 - Pure Rust TVM-FFI ABI packing and dynamic loading
 - Optional `cudarc` convenience wrappers
 

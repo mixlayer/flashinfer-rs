@@ -15,8 +15,8 @@ use zip::ZipArchive;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    any_none, byte_array_to_string, error_cell_ptr, TVMFFIAny, TVMFFIByteArray, TVMFFIObjectHandle,
-    TVMFFIVersion, KDL_CUDA,
+    KDL_CUDA, TVMFFIAny, TVMFFIByteArray, TVMFFIObjectHandle, TVMFFIVersion, any_none,
+    byte_array_to_string, error_cell_ptr,
 };
 
 const ENV_JIT_CACHE_WHEEL: &str = "FLASHINFER_RS_JIT_CACHE_WHEEL";
@@ -26,6 +26,7 @@ const ENV_CACHE_DIR: &str = "FLASHINFER_RS_CACHE_DIR";
 const FLASHINFER_NORM_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/norm/norm.so";
 const FLASHINFER_GDN_PREFILL_SM90_SO_SUFFIX: &str =
     "flashinfer_jit_cache/jit_cache/gdn_prefill_sm90/gdn_prefill_sm90.so";
+const FLASHINFER_PAGE_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/page/page.so";
 const TVMFFI_SO_MEMBER: &str = "tvm_ffi/lib/libtvm_ffi.so";
 
 const EXPECTED_TVMFFI_MAJOR: u32 = 0;
@@ -122,6 +123,7 @@ struct ExtractedArtifacts {
     artifact_dir: PathBuf,
     norm_so_path: PathBuf,
     gdn_prefill_sm90_so_path: PathBuf,
+    page_so_path: PathBuf,
     tvmffi_so_path: PathBuf,
 }
 
@@ -164,6 +166,7 @@ pub struct FlashInferRuntime {
     _tvmffi_lib: Library,
     _norm_lib: Library,
     _gdn_prefill_sm90_lib: Library,
+    _page_lib: Library,
     _tvmffi_get_version: TVMFFIGetVersionFn,
     tvmffi_env_set_stream: TVMFFIEnvSetStreamFn,
     tvmffi_error_move_from_raised: TVMFFIErrorMoveFromRaisedFn,
@@ -175,6 +178,8 @@ pub struct FlashInferRuntime {
     tvm_ffi_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gemma_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gdn_prefill: TVMFFISafeCallFn,
+    tvm_ffi_append_paged_kv_cache: TVMFFISafeCallFn,
+    tvm_ffi_append_paged_mla_kv_cache: TVMFFISafeCallFn,
     single_prefill_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
     batch_prefill_kernel_cache: Mutex<HashMap<String, LoadedBatchPrefillKernel>>,
     single_decode_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
@@ -281,6 +286,38 @@ impl FlashInferRuntime {
         // SAFETY: symbol signature follows TVMFFISafeCallType.
         let code =
             unsafe { (self.tvm_ffi_gdn_prefill)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_append_paged_kv_cache(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe {
+            (self.tvm_ffi_append_paged_kv_cache)(std::ptr::null_mut(), args, num_args, result)
+        };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_append_paged_mla_kv_cache(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe {
+            (self.tvm_ffi_append_paged_mla_kv_cache)(std::ptr::null_mut(), args, num_args, result)
+        };
         if code == 0 {
             return Ok(());
         }
@@ -786,6 +823,17 @@ impl FlashInferRuntime {
             message: e.to_string(),
         })?;
 
+        let page_lib = unsafe {
+            Library::open(
+                Some(&artifacts.page_so_path),
+                libc::RTLD_NOW | libc::RTLD_LOCAL,
+            )
+        }
+        .map_err(|e| FlashInferError::LibraryLoad {
+            library: artifacts.page_so_path.clone(),
+            message: e.to_string(),
+        })?;
+
         let tvmffi_get_version: TVMFFIGetVersionFn = unsafe {
             resolve_symbol(
                 &tvmffi_lib,
@@ -885,6 +933,24 @@ impl FlashInferRuntime {
             )?
         };
 
+        let tvm_ffi_append_paged_kv_cache: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &page_lib,
+                &artifacts.page_so_path,
+                b"__tvm_ffi_append_paged_kv_cache\0",
+                "__tvm_ffi_append_paged_kv_cache",
+            )?
+        };
+
+        let tvm_ffi_append_paged_mla_kv_cache: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &page_lib,
+                &artifacts.page_so_path,
+                b"__tvm_ffi_append_paged_mla_kv_cache\0",
+                "__tvm_ffi_append_paged_mla_kv_cache",
+            )?
+        };
+
         let mut version = TVMFFIVersion {
             major: 0,
             minor: 0,
@@ -907,6 +973,7 @@ impl FlashInferRuntime {
             _tvmffi_lib: tvmffi_lib,
             _norm_lib: norm_lib,
             _gdn_prefill_sm90_lib: gdn_prefill_sm90_lib,
+            _page_lib: page_lib,
             _tvmffi_get_version: tvmffi_get_version,
             tvmffi_env_set_stream,
             tvmffi_error_move_from_raised,
@@ -918,6 +985,8 @@ impl FlashInferRuntime {
             tvm_ffi_rmsnorm,
             tvm_ffi_gemma_rmsnorm,
             tvm_ffi_gdn_prefill,
+            tvm_ffi_append_paged_kv_cache,
+            tvm_ffi_append_paged_mla_kv_cache,
             single_prefill_kernel_cache: Mutex::new(HashMap::new()),
             batch_prefill_kernel_cache: Mutex::new(HashMap::new()),
             single_decode_kernel_cache: Mutex::new(HashMap::new()),
@@ -1014,6 +1083,15 @@ fn extract_artifacts(
         )?;
     }
 
+    let page_so_path = artifact_dir.join("page.so");
+    if !page_so_path.exists() {
+        extract_member_from_wheel_by_suffix(
+            &resolved.jit_cache_wheel,
+            FLASHINFER_PAGE_SO_SUFFIX,
+            &page_so_path,
+        )?;
+    }
+
     let tvmffi_so_path = artifact_dir.join("libtvm_ffi.so");
     if !tvmffi_so_path.exists() {
         extract_member_from_wheel_exact(&resolved.tvmffi_wheel, TVMFFI_SO_MEMBER, &tvmffi_so_path)?;
@@ -1025,6 +1103,7 @@ fn extract_artifacts(
         artifact_dir,
         norm_so_path,
         gdn_prefill_sm90_so_path,
+        page_so_path,
         tvmffi_so_path,
     })
 }
@@ -1351,8 +1430,8 @@ fn default_cache_dir() -> Result<PathBuf, FlashInferError> {
 mod tests {
     use super::*;
     use crate::ffi::{
-        any_bool, any_dltensor_ptr, any_f64, any_none, DLDataType, DLDevice, DLTensor, TVMFFIAny,
-        KDL_CUDA, KDL_FLOAT,
+        DLDataType, DLDevice, DLTensor, KDL_CUDA, KDL_FLOAT, TVMFFIAny, any_bool, any_dltensor_ptr,
+        any_f64, any_none,
     };
 
     #[test]
