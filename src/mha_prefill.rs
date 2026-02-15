@@ -2,8 +2,8 @@ use std::ffi::c_void;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    DLDataType, DLDevice, DLTensor, KDL_CUDA, KDL_FLOAT, KDL_UINT, TVMFFIAny, any_dltensor_ptr,
-    any_f64, any_i64, any_none,
+    any_dltensor_ptr, any_f64, any_i64, any_none, DLDataType, DLDevice, DLTensor, TVMFFIAny,
+    KDL_CUDA, KDL_FLOAT, KDL_UINT,
 };
 use crate::norm::DType;
 use crate::runtime::FlashInferRuntime;
@@ -699,7 +699,11 @@ fn dtype_filename(dtype: DType) -> &'static str {
 }
 
 fn bool_name(value: bool) -> &'static str {
-    if value { "True" } else { "False" }
+    if value {
+        "True"
+    } else {
+        "False"
+    }
 }
 
 fn dl_dtype_from_norm_dtype(dtype: DType) -> DLDataType {

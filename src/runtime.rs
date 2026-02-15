@@ -15,8 +15,8 @@ use zip::ZipArchive;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    KDL_CUDA, TVMFFIAny, TVMFFIByteArray, TVMFFIObjectHandle, TVMFFIVersion, any_none,
-    byte_array_to_string, error_cell_ptr,
+    any_none, byte_array_to_string, error_cell_ptr, TVMFFIAny, TVMFFIByteArray, TVMFFIObjectHandle,
+    TVMFFIVersion, KDL_CUDA,
 };
 
 const ENV_JIT_CACHE_WHEEL: &str = "FLASHINFER_RS_JIT_CACHE_WHEEL";
@@ -1351,8 +1351,8 @@ fn default_cache_dir() -> Result<PathBuf, FlashInferError> {
 mod tests {
     use super::*;
     use crate::ffi::{
-        DLDataType, DLDevice, DLTensor, KDL_CUDA, KDL_FLOAT, TVMFFIAny, any_bool, any_dltensor_ptr,
-        any_f64, any_none,
+        any_bool, any_dltensor_ptr, any_f64, any_none, DLDataType, DLDevice, DLTensor, TVMFFIAny,
+        KDL_CUDA, KDL_FLOAT,
     };
 
     #[test]

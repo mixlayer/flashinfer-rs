@@ -2,8 +2,8 @@
 
 use cudarc::driver::CudaContext;
 use flashinfer_rs::{
-    DType, MhaBatchDecodeCudarcOptions, MhaSingleDecodeCudarcOptions,
-    mha_batch_decode_paged_cudarc, mha_single_decode_cudarc,
+    mha_batch_decode_paged_cudarc_plan, mha_batch_decode_paged_cudarc_run,
+    mha_single_decode_cudarc, DType, MhaBatchDecodeCudarcOptions, MhaSingleDecodeCudarcOptions,
 };
 
 fn should_run_gpu_tests() -> bool {
@@ -132,18 +132,34 @@ fn gpu_smoke_launch_batch_decode_paged() {
     let mut page_locked_int_workspace = vec![0_u8; 8 * 1024 * 1024];
     let mut out_dev = stream.alloc_zeros::<u16>(out_len).expect("alloc out");
 
-    mha_batch_decode_paged_cudarc(
+    let plan = mha_batch_decode_paged_cudarc_plan(
         stream.as_ref(),
+        &paged_kv_indptr_host,
+        &mut float_workspace,
+        &mut int_workspace,
+        &mut page_locked_int_workspace,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        head_dim,
+        page_size,
+        DType::F16,
+        MhaBatchDecodeCudarcOptions::default(),
+    )
+    .expect("plan batch decode paged");
+
+    mha_batch_decode_paged_cudarc_run(
+        stream.as_ref(),
+        &plan,
         &q_dev,
         &paged_k_dev,
         &paged_v_dev,
         &paged_kv_indptr_dev,
         &paged_kv_indices_dev,
         &paged_kv_last_page_len_dev,
-        &paged_kv_indptr_host,
         &mut float_workspace,
         &mut int_workspace,
-        &mut page_locked_int_workspace,
         &mut out_dev,
         num_qo_heads,
         num_kv_heads,
@@ -153,7 +169,7 @@ fn gpu_smoke_launch_batch_decode_paged() {
         DType::F16,
         MhaBatchDecodeCudarcOptions::default(),
     )
-    .expect("launch batch decode paged");
+    .expect("run batch decode paged");
 
     stream.synchronize().expect("synchronize");
 }
