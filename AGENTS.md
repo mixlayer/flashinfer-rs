@@ -112,6 +112,34 @@ Primary files to inspect:
 - Maintain feature parity: if core API is added, `cudarc` wrapper should be added in same change.
 - Never reuse a single params struct for both `plan` and `run`; define explicit plan-only and run-only param types.
 
+## Backend to URI Selection (fa2/fa3 and `_sm90`)
+
+How upstream selects the prefill kernel family:
+
+1. Backend decision:
+- In upstream Python wrappers, `backend="auto"` is resolved by `determine_attention_backend(...)`.
+- Source: `flashinfer/flashinfer/utils.py` and call sites in `flashinfer/flashinfer/prefill.py`.
+- For SM90 + supported feature set, it returns `fa3`; otherwise `fa2`.
+
+2. URI generation:
+- Prefill URI comes from `get_batch_prefill_uri(backend, ...)`.
+- Source: `flashinfer/flashinfer/jit/attention/modules.py`.
+- The URI suffix `"_sm90"` is appended only when `backend == "fa3"`.
+
+3. Module loading:
+- The wrapper loads exactly that URI, so `fa3` selects `<uri>_sm90.so` and `fa2` selects `<uri>.so`.
+
+Practical implication for Rust bindings:
+
+- If Rust builds the prefill URI without a backend choice (or always uses the unsuffixed URI),
+  runtime will load the generic prefill module even on Hopper.
+- That can be materially slower than the FA3/SM90 specialized module and is a likely cause
+  of large prefill regressions.
+- For parity with upstream behavior, Rust should:
+  - make backend explicit (`fa2` vs `fa3`) or implement equivalent auto-selection logic,
+  - append `"_sm90"` when the chosen backend is `fa3`,
+  - keep URI construction consistent with upstream `modules.py`.
+
 ## PR/Change Checklist
 
 - [ ] Wheel artifact path(s) identified and verified.
