@@ -1,3 +1,19 @@
+//! Build script for pinning and embedding FlashInfer runtime wheel artifacts.
+//!
+//! High-level flow:
+//! 1. Read pinned wheel metadata from `Cargo.toml`.
+//! 2. Detect the target architecture (`x86_64` or `aarch64`) and select matching
+//!    FlashInfer and Apache TVM-FFI wheel entries.
+//! 3. Download each wheel into a persistent build cache (`~/.cache/flashinfer-rs/build-wheels`),
+//!    reusing existing files when checksums match.
+//! 4. Verify SHA256 for all wheel bytes before use.
+//! 5. Stage verified wheels into `OUT_DIR/pinned` and generate
+//!    `OUT_DIR/embedded_wheels.rs`, which exposes `include_bytes!` constants used
+//!    by runtime initialization.
+//!
+//! The build fails if any required wheel cannot be fetched or verified, ensuring
+//! the crate remains pinned to explicit, validated artifacts.
+
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
