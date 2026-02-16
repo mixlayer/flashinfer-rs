@@ -14,6 +14,14 @@ A Python wheel (`*.whl`) is a zip archive that carries prebuilt artifacts. For t
 
 No Python runtime is required for calling `gemma_rmsnorm` once the `.so` files are extracted.
 
+Build/runtime model in this crate:
+
+1. `build.rs` selects pinned wheel entries from `Cargo.toml` by build-host CUDA version (`cu130`/`cu131`) and target architecture (`x86_64` or `aarch64`).
+2. `build.rs` downloads the selected wheels.
+3. `build.rs` verifies SHA256 and embeds wheel bytes with generated `include_bytes!`.
+4. Runtime materializes embedded wheels into `~/.cache/flashinfer-rs/wheels/` (or `FLASHINFER_RS_CACHE_DIR/wheels/`).
+5. Runtime extracts required `.so` members from cached wheel files.
+
 ## Artifact Download URLs
 `libtvm_ffi.so` source:
 
@@ -57,8 +65,8 @@ This wrapper handles argument decoding, validation, stream lookup, and dispatch 
 ## Dependency/artifact matrix
 Pinned v1 artifacts:
 
-- `flashinfer_jit_cache 0.6.3+cu130`
-- `apache_tvm_ffi 0.1.3`
+- `flashinfer_jit_cache 0.6.3+cu130` pins for both `cu130` and `cu131` metadata keys (`x86_64` and `aarch64`)
+- `apache_tvm_ffi 0.1.3` pins for both `cu130` and `cu131` metadata keys (`x86_64` and `aarch64`)
 
 Runtime loading order:
 
@@ -175,12 +183,14 @@ If `profile_ids` is omitted, Rust passes `None` and FlashInfer host code uses it
 ## Runtime configuration knobs
 Environment variables accepted by `flashinfer-rs`:
 
-- `FLASHINFER_RS_JIT_CACHE_WHEEL`
-- `FLASHINFER_RS_TVMFFI_WHEEL`
 - `FLASHINFER_RS_CACHE_DIR`
 
-Extracted artifacts are cached at:
+Runtime wheel cache:
+
+- `~/.cache/flashinfer-rs/wheels/<sha256>-<filename>.whl`
+
+Extracted shared-library cache:
 
 - `~/.cache/flashinfer-rs/<artifact-hash>/`
 
-with a lock file to avoid concurrent extraction races.
+Both wheel materialization and `.so` extraction use lock files to avoid concurrent races.
