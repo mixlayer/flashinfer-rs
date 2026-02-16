@@ -110,6 +110,7 @@ Primary files to inspect:
 - Re-check TVM-FFI type indices before adding new packed types.
 - Prefer on-demand loading for large variant spaces to avoid startup bloat.
 - Maintain feature parity: if core API is added, `cudarc` wrapper should be added in same change.
+- Never reuse a single params struct for both `plan` and `run`; define explicit plan-only and run-only param types.
 
 ## PR/Change Checklist
 

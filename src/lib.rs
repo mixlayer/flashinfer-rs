@@ -31,13 +31,13 @@ pub use mha_batch_prefill::{
     MhaBatchPrefillCudarcOptions, mha_batch_prefill_cudarc_plan, mha_batch_prefill_cudarc_run,
 };
 pub use mha_batch_prefill::{
-    MhaBatchPrefillParams, MhaBatchPrefillPlan, MhaHostTensor1DI32Desc, MhaHostTensor1DU8Desc,
-    MhaTensor1DI32Desc, MhaTensor1DU16Desc, MhaTensor1DU32Desc, mha_batch_prefill_plan,
-    mha_batch_prefill_run,
+    MhaBatchPrefillParams, MhaBatchPrefillPlan, MhaBatchPrefillPlanParams, MhaHostTensor1DI32Desc,
+    MhaHostTensor1DU8Desc, MhaTensor1DI32Desc, MhaTensor1DU16Desc, MhaTensor1DU32Desc,
+    mha_batch_prefill_plan, mha_batch_prefill_run,
 };
 pub use mha_batch_prefill_paged::{
-    MhaBatchPagedPrefillParams, MhaBatchPagedPrefillPlan, MhaTensor4DDesc,
-    mha_batch_prefill_paged_plan, mha_batch_prefill_paged_run,
+    MhaBatchPagedPrefillParams, MhaBatchPagedPrefillPlan, MhaBatchPagedPrefillPlanParams,
+    MhaTensor4DDesc, mha_batch_prefill_paged_plan, mha_batch_prefill_paged_run,
 };
 #[cfg(feature = "cudarc")]
 pub use mha_batch_prefill_paged::{
