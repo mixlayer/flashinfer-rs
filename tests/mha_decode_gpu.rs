@@ -2,8 +2,9 @@
 
 use cudarc::driver::CudaContext;
 use flashinfer_rs::{
+    DType, MhaBatchDecodeCudarcOptions, MhaSingleDecodeCudarcOptions,
     mha_batch_decode_paged_cudarc_plan, mha_batch_decode_paged_cudarc_run,
-    mha_single_decode_cudarc, DType, MhaBatchDecodeCudarcOptions, MhaSingleDecodeCudarcOptions,
+    mha_single_decode_cudarc,
 };
 
 fn should_run_gpu_tests() -> bool {

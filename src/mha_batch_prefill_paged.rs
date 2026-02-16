@@ -2,8 +2,8 @@ use std::ffi::c_void;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    any_bool, any_dltensor_ptr, any_f64, any_i64, any_none, any_object_handle, DLDataType,
-    DLDevice, DLTensor, TVMFFIAny, KDL_BFLOAT, KDL_CPU, KDL_CUDA, KDL_FLOAT, KDL_INT, KDL_UINT,
+    DLDataType, DLDevice, DLTensor, KDL_BFLOAT, KDL_CPU, KDL_CUDA, KDL_FLOAT, KDL_INT, KDL_UINT,
+    TVMFFIAny, any_bool, any_dltensor_ptr, any_f64, any_i64, any_none, any_object_handle,
 };
 #[cfg(feature = "cudarc")]
 use crate::mha_batch_prefill::MhaBatchPrefillCudarcOptions;
@@ -682,21 +682,157 @@ impl MhaBatchPagedPrefillParams {
     }
 }
 
-pub fn mha_batch_prefill_paged(params: &MhaBatchPagedPrefillParams) -> Result<(), FlashInferError> {
+pub struct MhaBatchPagedPrefillPlan {
+    runtime: &'static FlashInferRuntime,
+    plan_result: TVMFFIAny,
+    kernel_uri: String,
+    device_id: i32,
+    total_num_rows: i64,
+    batch_size: i64,
+    page_entries: i64,
+    num_qo_heads: i64,
+    num_kv_heads: i64,
+    page_size: i64,
+    head_dim_qk: i64,
+    head_dim_vo: i64,
+    q_dtype: DType,
+    kv_dtype: DType,
+    out_dtype: DType,
+    window_left: i64,
+    logits_soft_cap: f64,
+    use_fp16_qk_reduction: bool,
+    float_workspace_len: i64,
+    int_workspace_len: i64,
+}
+
+impl Drop for MhaBatchPagedPrefillPlan {
+    fn drop(&mut self) {
+        if let Some(obj) = any_object_handle(&self.plan_result) {
+            // SAFETY: object handle was created by TVM-FFI plan call and owned by this handle.
+            unsafe {
+                self.runtime.object_dec_ref(obj);
+            }
+        }
+    }
+}
+
+impl MhaBatchPagedPrefillPlan {
+    fn validate_run_compatibility(
+        &self,
+        params: &MhaBatchPagedPrefillParams,
+    ) -> Result<(), FlashInferError> {
+        if params.kernel_uri() != self.kernel_uri {
+            return Err(FlashInferError::invalid_argument(format!(
+                "prefill paged run kernel mismatch: planned `{}` but run requested `{}`",
+                self.kernel_uri,
+                params.kernel_uri()
+            )));
+        }
+        if params.q.device_id != self.device_id {
+            return Err(FlashInferError::invalid_argument(format!(
+                "prefill paged run device mismatch: planned device {} but got {}",
+                self.device_id, params.q.device_id
+            )));
+        }
+        if params.q.dim0 != self.total_num_rows {
+            return Err(FlashInferError::invalid_argument(format!(
+                "prefill paged run total_num_rows mismatch: planned {} but got {}",
+                self.total_num_rows, params.q.dim0
+            )));
+        }
+        if params.q.dim1 != self.num_qo_heads {
+            return Err(FlashInferError::invalid_argument(format!(
+                "prefill paged run num_qo_heads mismatch: planned {} but got {}",
+                self.num_qo_heads, params.q.dim1
+            )));
+        }
+        let (_, page_size, num_kv_heads, head_dim_qk) =
+            decode_paged_layout(params.paged_k_cache, params.kv_layout);
+        let (_, _, _, head_dim_vo) = decode_paged_layout(params.paged_v_cache, params.kv_layout);
+        if page_size != self.page_size || num_kv_heads != self.num_kv_heads {
+            return Err(FlashInferError::invalid_argument(format!(
+                "prefill paged run page/head mismatch: planned page_size={}, num_kv_heads={} but got page_size={}, num_kv_heads={}",
+                self.page_size, self.num_kv_heads, page_size, num_kv_heads
+            )));
+        }
+        if head_dim_qk != self.head_dim_qk || head_dim_vo != self.head_dim_vo {
+            return Err(FlashInferError::invalid_argument(format!(
+                "prefill paged run head dim mismatch: planned qk/vo=({},{}) but got ({},{})",
+                self.head_dim_qk, self.head_dim_vo, head_dim_qk, head_dim_vo
+            )));
+        }
+        if params.q.dtype != self.q_dtype
+            || params.paged_k_cache.dtype != self.kv_dtype
+            || params.paged_v_cache.dtype != self.kv_dtype
+            || params.out.dtype != self.out_dtype
+        {
+            return Err(FlashInferError::invalid_argument(
+                "prefill paged run dtype mismatch with prefill paged plan",
+            ));
+        }
+        if params.window_left != self.window_left {
+            return Err(FlashInferError::invalid_argument(
+                "prefill paged run window_left mismatch with prefill paged plan",
+            ));
+        }
+        if params.logits_soft_cap != self.logits_soft_cap {
+            return Err(FlashInferError::invalid_argument(
+                "prefill paged run logits_soft_cap mismatch with prefill paged plan",
+            ));
+        }
+        if params.use_fp16_qk_reduction != self.use_fp16_qk_reduction {
+            return Err(FlashInferError::invalid_argument(
+                "prefill paged run use_fp16_qk_reduction mismatch with prefill paged plan",
+            ));
+        }
+        if params.float_workspace.len != self.float_workspace_len
+            || params.int_workspace.len != self.int_workspace_len
+        {
+            return Err(FlashInferError::invalid_argument(
+                "prefill paged run workspace size mismatch with prefill paged plan",
+            ));
+        }
+        if params.qo_indptr.len != self.batch_size + 1 {
+            return Err(FlashInferError::invalid_argument(
+                "prefill paged run qo_indptr length mismatch with prefill paged plan",
+            ));
+        }
+        if params.paged_kv_indptr.len != self.batch_size + 1 {
+            return Err(FlashInferError::invalid_argument(
+                "prefill paged run paged_kv_indptr length mismatch with prefill paged plan",
+            ));
+        }
+        if params.paged_kv_last_page_len.len != self.batch_size {
+            return Err(FlashInferError::invalid_argument(
+                "prefill paged run paged_kv_last_page_len mismatch with prefill paged plan",
+            ));
+        }
+        if params.paged_kv_indices.len != self.page_entries {
+            return Err(FlashInferError::invalid_argument(
+                "prefill paged run paged_kv_indices length mismatch with prefill paged plan",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn mha_batch_prefill_paged_plan(
+    params: &MhaBatchPagedPrefillParams,
+) -> Result<MhaBatchPagedPrefillPlan, FlashInferError> {
     params.validate()?;
     let runtime = FlashInferRuntime::global()?;
     // SAFETY: FFI preconditions are validated by `params.validate` and runtime initialization.
-    unsafe { mha_batch_prefill_paged_with_runtime(runtime, params) }
+    unsafe { mha_batch_prefill_paged_plan_with_runtime(runtime, params) }
 }
 
-unsafe fn mha_batch_prefill_paged_with_runtime(
-    runtime: &FlashInferRuntime,
+unsafe fn mha_batch_prefill_paged_plan_with_runtime(
+    runtime: &'static FlashInferRuntime,
     params: &MhaBatchPagedPrefillParams,
-) -> Result<(), FlashInferError> {
+) -> Result<MhaBatchPagedPrefillPlan, FlashInferError> {
     let kernel_uri = params.kernel_uri();
 
     let qo_host = read_host_i32(params.qo_indptr_host)?;
-    let _paged_kv_host = read_host_i32(params.paged_kv_indptr_host)?;
+    let paged_kv_host = read_host_i32(params.paged_kv_indptr_host)?;
     let kv_len_arr_host = read_host_i32(params.kv_len_arr_host)?;
 
     let batch_size = i64::try_from(qo_host.len().saturating_sub(1))
@@ -706,6 +842,189 @@ unsafe fn mha_batch_prefill_paged_with_runtime(
     let (_, page_size, num_kv_heads, _) =
         decode_paged_layout(params.paged_k_cache, params.kv_layout);
 
+    let mut qo_host_shape = [params.qo_indptr_host.len];
+    let mut qo_host_strides = [params.qo_indptr_host.stride];
+    let qo_indptr_host_tensor = DLTensor {
+        data: params.qo_indptr_host.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CPU,
+            device_id: 0,
+        },
+        ndim: 1,
+        dtype: dl_dtype_i32(),
+        shape: qo_host_shape.as_mut_ptr(),
+        strides: qo_host_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut paged_kv_host_shape = [params.paged_kv_indptr_host.len];
+    let mut paged_kv_host_strides = [params.paged_kv_indptr_host.stride];
+    let paged_kv_indptr_host_tensor = DLTensor {
+        data: params.paged_kv_indptr_host.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CPU,
+            device_id: 0,
+        },
+        ndim: 1,
+        dtype: dl_dtype_i32(),
+        shape: paged_kv_host_shape.as_mut_ptr(),
+        strides: paged_kv_host_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut kv_len_arr_shape = [i64::try_from(kv_len_arr_host.len()).map_err(|_| {
+        FlashInferError::invalid_argument("kv_len_arr_host length does not fit in i64")
+    })?];
+    let mut kv_len_arr_strides = [1_i64];
+    let kv_len_arr_tensor = DLTensor {
+        data: kv_len_arr_host.as_ptr().cast_mut().cast(),
+        device: DLDevice {
+            device_type: KDL_CPU,
+            device_id: 0,
+        },
+        ndim: 1,
+        dtype: dl_dtype_i32(),
+        shape: kv_len_arr_shape.as_mut_ptr(),
+        strides: kv_len_arr_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut float_workspace_shape = [params.float_workspace.len];
+    let mut float_workspace_strides = [params.float_workspace.stride];
+    let float_workspace_tensor = DLTensor {
+        data: params.float_workspace.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: params.float_workspace.device_id,
+        },
+        ndim: 1,
+        dtype: dl_dtype_u8(),
+        shape: float_workspace_shape.as_mut_ptr(),
+        strides: float_workspace_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut int_workspace_shape = [params.int_workspace.len];
+    let mut int_workspace_strides = [params.int_workspace.stride];
+    let int_workspace_tensor = DLTensor {
+        data: params.int_workspace.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: params.int_workspace.device_id,
+        },
+        ndim: 1,
+        dtype: dl_dtype_u8(),
+        shape: int_workspace_shape.as_mut_ptr(),
+        strides: int_workspace_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut page_locked_workspace_shape = [params.page_locked_int_workspace.len];
+    let mut page_locked_workspace_strides = [params.page_locked_int_workspace.stride];
+    let page_locked_int_workspace_tensor = DLTensor {
+        data: params.page_locked_int_workspace.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CPU,
+            device_id: 0,
+        },
+        ndim: 1,
+        dtype: dl_dtype_u8(),
+        shape: page_locked_workspace_shape.as_mut_ptr(),
+        strides: page_locked_workspace_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut plan_result_view = any_none();
+    let plan_args: [TVMFFIAny; 19] = [
+        any_dltensor_ptr(&float_workspace_tensor),
+        any_dltensor_ptr(&int_workspace_tensor),
+        any_dltensor_ptr(&page_locked_int_workspace_tensor),
+        any_dltensor_ptr(&qo_indptr_host_tensor),
+        any_dltensor_ptr(&paged_kv_indptr_host_tensor),
+        any_dltensor_ptr(&kv_len_arr_tensor),
+        any_i64(total_num_rows),
+        any_i64(batch_size),
+        any_i64(num_qo_heads),
+        any_i64(num_kv_heads),
+        any_i64(page_size),
+        any_bool(false),
+        any_i64(params.q.dim2),
+        any_i64(params.out.dim2),
+        any_bool(params.causal),
+        any_i64(params.window_left),
+        any_i64(params.fixed_split_size),
+        any_bool(params.disable_split_kv),
+        any_i64(params.num_colocated_ctas),
+    ];
+
+    // SAFETY: stream context API contract comes from TVM-FFI and is validated on load.
+    let previous_stream = unsafe { runtime.set_stream(params.q.device_id, params.stream)? };
+    let mut restore_guard = StreamRestoreGuard::new(runtime, params.q.device_id, previous_stream);
+
+    let call_result = (|| -> Result<MhaBatchPagedPrefillPlan, FlashInferError> {
+        // SAFETY: argument packing follows TVMFFIAny ABI.
+        unsafe {
+            runtime.call_batch_prefill_plan(
+                &kernel_uri,
+                plan_args.as_ptr(),
+                plan_args.len() as i32,
+                &mut plan_result_view as *mut _,
+            )?;
+        }
+
+        // SAFETY: converts returned AnyView into owned Any so lifetime can cross calls safely.
+        let plan_result = unsafe { runtime.any_view_to_owned(&plan_result_view)? };
+        Ok(MhaBatchPagedPrefillPlan {
+            runtime,
+            plan_result,
+            kernel_uri,
+            device_id: params.q.device_id,
+            total_num_rows,
+            batch_size,
+            page_entries: i64::from(*paged_kv_host.last().unwrap_or(&0)),
+            num_qo_heads,
+            num_kv_heads,
+            page_size,
+            head_dim_qk: params.q.dim2,
+            head_dim_vo: params.out.dim2,
+            q_dtype: params.q.dtype,
+            kv_dtype: params.paged_k_cache.dtype,
+            out_dtype: params.out.dtype,
+            window_left: params.window_left,
+            logits_soft_cap: params.logits_soft_cap,
+            use_fp16_qk_reduction: params.use_fp16_qk_reduction,
+            float_workspace_len: params.float_workspace.len,
+            int_workspace_len: params.int_workspace.len,
+        })
+    })();
+
+    let restore_result = restore_guard.restore_now();
+
+    match (call_result, restore_result) {
+        (Err(call_error), _) => Err(call_error),
+        (Ok(plan), Err(restore_error)) => {
+            drop(plan);
+            Err(restore_error)
+        }
+        (Ok(plan), Ok(())) => Ok(plan),
+    }
+}
+
+pub fn mha_batch_prefill_paged_run(
+    plan: &MhaBatchPagedPrefillPlan,
+    params: &MhaBatchPagedPrefillParams,
+) -> Result<(), FlashInferError> {
+    params.validate()?;
+    plan.validate_run_compatibility(params)?;
+    // SAFETY: FFI preconditions are validated by `params.validate` and `plan` compatibility checks.
+    unsafe { mha_batch_prefill_paged_run_with_runtime(plan.runtime, plan, params) }
+}
+
+unsafe fn mha_batch_prefill_paged_run_with_runtime(
+    runtime: &FlashInferRuntime,
+    plan: &MhaBatchPagedPrefillPlan,
+    params: &MhaBatchPagedPrefillParams,
+) -> Result<(), FlashInferError> {
     let mut q_shape = [params.q.dim0, params.q.dim1, params.q.dim2];
     let mut q_strides = [params.q.stride0, params.q.stride1, params.q.stride2];
     let q_tensor = DLTensor {
@@ -831,53 +1150,6 @@ unsafe fn mha_batch_prefill_paged_with_runtime(
         byte_offset: 0,
     };
 
-    let mut qo_host_shape = [params.qo_indptr_host.len];
-    let mut qo_host_strides = [params.qo_indptr_host.stride];
-    let qo_indptr_host_tensor = DLTensor {
-        data: params.qo_indptr_host.ptr.cast_mut(),
-        device: DLDevice {
-            device_type: KDL_CPU,
-            device_id: 0,
-        },
-        ndim: 1,
-        dtype: dl_dtype_i32(),
-        shape: qo_host_shape.as_mut_ptr(),
-        strides: qo_host_strides.as_mut_ptr(),
-        byte_offset: 0,
-    };
-
-    let mut paged_kv_host_shape = [params.paged_kv_indptr_host.len];
-    let mut paged_kv_host_strides = [params.paged_kv_indptr_host.stride];
-    let paged_kv_indptr_host_tensor = DLTensor {
-        data: params.paged_kv_indptr_host.ptr.cast_mut(),
-        device: DLDevice {
-            device_type: KDL_CPU,
-            device_id: 0,
-        },
-        ndim: 1,
-        dtype: dl_dtype_i32(),
-        shape: paged_kv_host_shape.as_mut_ptr(),
-        strides: paged_kv_host_strides.as_mut_ptr(),
-        byte_offset: 0,
-    };
-
-    let mut kv_len_arr_shape = [i64::try_from(kv_len_arr_host.len()).map_err(|_| {
-        FlashInferError::invalid_argument("kv_len_arr_host length does not fit in i64")
-    })?];
-    let mut kv_len_arr_strides = [1_i64];
-    let kv_len_arr_tensor = DLTensor {
-        data: kv_len_arr_host.as_ptr().cast_mut().cast(),
-        device: DLDevice {
-            device_type: KDL_CPU,
-            device_id: 0,
-        },
-        ndim: 1,
-        dtype: dl_dtype_i32(),
-        shape: kv_len_arr_shape.as_mut_ptr(),
-        strides: kv_len_arr_strides.as_mut_ptr(),
-        byte_offset: 0,
-    };
-
     let mut float_workspace_shape = [params.float_workspace.len];
     let mut float_workspace_strides = [params.float_workspace.stride];
     let float_workspace_tensor = DLTensor {
@@ -905,21 +1177,6 @@ unsafe fn mha_batch_prefill_paged_with_runtime(
         dtype: dl_dtype_u8(),
         shape: int_workspace_shape.as_mut_ptr(),
         strides: int_workspace_strides.as_mut_ptr(),
-        byte_offset: 0,
-    };
-
-    let mut page_locked_workspace_shape = [params.page_locked_int_workspace.len];
-    let mut page_locked_workspace_strides = [params.page_locked_int_workspace.stride];
-    let page_locked_int_workspace_tensor = DLTensor {
-        data: params.page_locked_int_workspace.ptr.cast_mut(),
-        device: DLDevice {
-            device_type: KDL_CPU,
-            device_id: 0,
-        },
-        ndim: 1,
-        dtype: dl_dtype_u8(),
-        shape: page_locked_workspace_shape.as_mut_ptr(),
-        strides: page_locked_workspace_strides.as_mut_ptr(),
         byte_offset: 0,
     };
 
@@ -1071,117 +1328,72 @@ unsafe fn mha_batch_prefill_paged_with_runtime(
         }
     });
 
-    let mut plan_result_view = any_none();
-    let plan_args: [TVMFFIAny; 19] = [
+    let lse_any = lse_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+    let custom_mask_any = custom_mask_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+    let mask_indptr_any = mask_indptr_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+    let alibi_any = alibi_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+    let prefix_len_any = prefix_len_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+    let token_pos_any = token_pos_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+    let max_item_len_any = max_item_len_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+
+    let mut run_result = any_none();
+    let run_args: [TVMFFIAny; 27] = [
         any_dltensor_ptr(&float_workspace_tensor),
         any_dltensor_ptr(&int_workspace_tensor),
-        any_dltensor_ptr(&page_locked_int_workspace_tensor),
-        any_dltensor_ptr(&qo_indptr_host_tensor),
-        any_dltensor_ptr(&paged_kv_indptr_host_tensor),
-        any_dltensor_ptr(&kv_len_arr_tensor),
-        any_i64(total_num_rows),
-        any_i64(batch_size),
-        any_i64(num_qo_heads),
-        any_i64(num_kv_heads),
-        any_i64(page_size),
-        any_bool(false),
-        any_i64(params.q.dim2),
-        any_i64(params.out.dim2),
-        any_bool(params.causal),
+        plan.plan_result,
+        any_dltensor_ptr(&q_tensor),
+        any_dltensor_ptr(&paged_k_tensor),
+        any_dltensor_ptr(&paged_v_tensor),
+        any_dltensor_ptr(&qo_indptr_tensor),
+        any_dltensor_ptr(&paged_kv_indptr_tensor),
+        any_dltensor_ptr(&paged_kv_indices_tensor),
+        any_dltensor_ptr(&paged_kv_last_page_len_tensor),
+        any_dltensor_ptr(&out_tensor),
+        lse_any,
+        any_i64(mask_mode_code(params.mask_mode)),
+        any_i64(kv_layout_code(params.kv_layout)),
         any_i64(params.window_left),
-        any_i64(params.fixed_split_size),
-        any_bool(params.disable_split_kv),
-        any_i64(params.num_colocated_ctas),
+        any_bool(params.enable_pdl),
+        custom_mask_any,
+        mask_indptr_any,
+        alibi_any,
+        prefix_len_any,
+        token_pos_any,
+        max_item_len_any,
+        any_f64(params.logits_soft_cap),
+        any_f64(params.sm_scale),
+        any_f64(1.0 / params.rope_scale),
+        any_f64(1.0 / params.rope_theta),
+        any_i64(params.token_pos_in_items_len),
     ];
 
     // SAFETY: stream context API contract comes from TVM-FFI and is validated on load.
     let previous_stream = unsafe { runtime.set_stream(params.q.device_id, params.stream)? };
     let mut restore_guard = StreamRestoreGuard::new(runtime, params.q.device_id, previous_stream);
 
-    let call_result = (|| -> Result<(), FlashInferError> {
-        // SAFETY: argument packing follows TVMFFIAny ABI.
-        unsafe {
-            runtime.call_batch_prefill_plan(
-                &kernel_uri,
-                plan_args.as_ptr(),
-                plan_args.len() as i32,
-                &mut plan_result_view as *mut _,
-            )?;
-        }
-
-        // SAFETY: converts returned AnyView into owned Any so lifetime can cross calls safely.
-        let plan_result_owned = unsafe { runtime.any_view_to_owned(&plan_result_view)? };
-        let mut plan_result_guard = AnyObjectDecRefGuard::new(runtime, &plan_result_owned);
-
-        let lse_any = lse_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-        let custom_mask_any = custom_mask_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-        let mask_indptr_any = mask_indptr_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-        let alibi_any = alibi_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-        let prefix_len_any = prefix_len_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-        let token_pos_any = token_pos_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-        let max_item_len_any = max_item_len_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-
-        let mut run_result = any_none();
-        let run_args: [TVMFFIAny; 27] = [
-            any_dltensor_ptr(&float_workspace_tensor),
-            any_dltensor_ptr(&int_workspace_tensor),
-            plan_result_owned,
-            any_dltensor_ptr(&q_tensor),
-            any_dltensor_ptr(&paged_k_tensor),
-            any_dltensor_ptr(&paged_v_tensor),
-            any_dltensor_ptr(&qo_indptr_tensor),
-            any_dltensor_ptr(&paged_kv_indptr_tensor),
-            any_dltensor_ptr(&paged_kv_indices_tensor),
-            any_dltensor_ptr(&paged_kv_last_page_len_tensor),
-            any_dltensor_ptr(&out_tensor),
-            lse_any,
-            any_i64(mask_mode_code(params.mask_mode)),
-            any_i64(kv_layout_code(params.kv_layout)),
-            any_i64(params.window_left),
-            any_bool(params.enable_pdl),
-            custom_mask_any,
-            mask_indptr_any,
-            alibi_any,
-            prefix_len_any,
-            token_pos_any,
-            max_item_len_any,
-            any_f64(params.logits_soft_cap),
-            any_f64(params.sm_scale),
-            any_f64(1.0 / params.rope_scale),
-            any_f64(1.0 / params.rope_theta),
-            any_i64(params.token_pos_in_items_len),
-        ];
-
-        // SAFETY: argument packing follows TVMFFIAny ABI.
-        let launch_result = unsafe {
-            runtime.call_batch_prefill_paged(
-                &kernel_uri,
-                run_args.as_ptr(),
-                run_args.len() as i32,
-                &mut run_result as *mut _,
-            )
-        };
-
-        // Ensure plan_info object is released before leaving this scope.
-        let _ = plan_result_guard.release_now();
-
-        launch_result
-    })();
-
+    // SAFETY: argument packing follows TVMFFIAny ABI.
+    let call_result = unsafe {
+        runtime.call_batch_prefill_paged(
+            &plan.kernel_uri,
+            run_args.as_ptr(),
+            run_args.len() as i32,
+            &mut run_result as *mut _,
+        )
+    };
     let restore_result = restore_guard.restore_now();
 
     match (call_result, restore_result) {
@@ -1193,7 +1405,7 @@ unsafe fn mha_batch_prefill_paged_with_runtime(
 
 #[cfg(feature = "cudarc")]
 #[allow(clippy::too_many_arguments)]
-pub fn mha_batch_prefill_paged_cudarc<T, Q, K, V, O, QI, PI, I, L, FW, IW>(
+fn build_batch_prefill_paged_params_from_cudarc<T, Q, K, V, O, QI, PI, I, L, FW, IW>(
     stream: &cudarc::driver::CudaStream,
     q: &Q,
     paged_k_cache: &K,
@@ -1217,7 +1429,7 @@ pub fn mha_batch_prefill_paged_cudarc<T, Q, K, V, O, QI, PI, I, L, FW, IW>(
     kv_layout: MhaQkvLayout,
     dtype: DType,
     options: MhaBatchPrefillCudarcOptions,
-) -> Result<(), FlashInferError>
+) -> Result<MhaBatchPagedPrefillParams, FlashInferError>
 where
     Q: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
     K: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
@@ -1601,7 +1813,142 @@ where
     .with_disable_split_kv(options.disable_split_kv)
     .with_num_colocated_ctas(options.num_colocated_ctas);
 
-    mha_batch_prefill_paged(&params)
+    Ok(params)
+}
+
+#[cfg(feature = "cudarc")]
+#[allow(clippy::too_many_arguments)]
+pub fn mha_batch_prefill_paged_cudarc_plan<T, Q, K, V, O, QI, PI, I, L, FW, IW>(
+    stream: &cudarc::driver::CudaStream,
+    q: &Q,
+    paged_k_cache: &K,
+    paged_v_cache: &V,
+    qo_indptr: &QI,
+    paged_kv_indptr: &PI,
+    paged_kv_indices: &I,
+    paged_kv_last_page_len: &L,
+    qo_indptr_host: &[i32],
+    paged_kv_indptr_host: &[i32],
+    kv_len_arr_host: &[i32],
+    float_workspace: &mut FW,
+    int_workspace: &mut IW,
+    page_locked_int_workspace: &mut [u8],
+    out: &mut O,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim_qk: usize,
+    head_dim_vo: usize,
+    page_size: usize,
+    kv_layout: MhaQkvLayout,
+    dtype: DType,
+    options: MhaBatchPrefillCudarcOptions,
+) -> Result<MhaBatchPagedPrefillPlan, FlashInferError>
+where
+    Q: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
+    K: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
+    V: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
+    O: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtrMut<T>,
+    QI: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    PI: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    I: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    L: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    FW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
+    IW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
+{
+    let params = build_batch_prefill_paged_params_from_cudarc(
+        stream,
+        q,
+        paged_k_cache,
+        paged_v_cache,
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        qo_indptr_host,
+        paged_kv_indptr_host,
+        kv_len_arr_host,
+        float_workspace,
+        int_workspace,
+        page_locked_int_workspace,
+        out,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo,
+        page_size,
+        kv_layout,
+        dtype,
+        options,
+    )?;
+    mha_batch_prefill_paged_plan(&params)
+}
+
+#[cfg(feature = "cudarc")]
+#[allow(clippy::too_many_arguments)]
+pub fn mha_batch_prefill_paged_cudarc_run<T, Q, K, V, O, QI, PI, I, L, FW, IW>(
+    stream: &cudarc::driver::CudaStream,
+    plan: &MhaBatchPagedPrefillPlan,
+    q: &Q,
+    paged_k_cache: &K,
+    paged_v_cache: &V,
+    qo_indptr: &QI,
+    paged_kv_indptr: &PI,
+    paged_kv_indices: &I,
+    paged_kv_last_page_len: &L,
+    qo_indptr_host: &[i32],
+    paged_kv_indptr_host: &[i32],
+    kv_len_arr_host: &[i32],
+    float_workspace: &mut FW,
+    int_workspace: &mut IW,
+    page_locked_int_workspace: &mut [u8],
+    out: &mut O,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim_qk: usize,
+    head_dim_vo: usize,
+    page_size: usize,
+    kv_layout: MhaQkvLayout,
+    dtype: DType,
+    options: MhaBatchPrefillCudarcOptions,
+) -> Result<(), FlashInferError>
+where
+    Q: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
+    K: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
+    V: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
+    O: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtrMut<T>,
+    QI: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    PI: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    I: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    L: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    FW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
+    IW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
+{
+    let params = build_batch_prefill_paged_params_from_cudarc(
+        stream,
+        q,
+        paged_k_cache,
+        paged_v_cache,
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        qo_indptr_host,
+        paged_kv_indptr_host,
+        kv_len_arr_host,
+        float_workspace,
+        int_workspace,
+        page_locked_int_workspace,
+        out,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo,
+        page_size,
+        kv_layout,
+        dtype,
+        options,
+    )?;
+    mha_batch_prefill_paged_run(plan, &params)
 }
 
 struct StreamRestoreGuard<'a> {
@@ -1645,48 +1992,6 @@ impl Drop for StreamRestoreGuard<'_> {
             self.runtime
                 .restore_stream(self.device_id, self.previous_stream)
         };
-    }
-}
-
-struct AnyObjectDecRefGuard<'a> {
-    runtime: &'a FlashInferRuntime,
-    obj: *mut c_void,
-    active: bool,
-}
-
-impl<'a> AnyObjectDecRefGuard<'a> {
-    fn new(runtime: &'a FlashInferRuntime, any: &TVMFFIAny) -> Self {
-        let obj = any_object_handle(any).unwrap_or(std::ptr::null_mut());
-        Self {
-            runtime,
-            obj,
-            active: true,
-        }
-    }
-
-    fn release_now(&mut self) -> Result<(), FlashInferError> {
-        if !self.active {
-            return Ok(());
-        }
-        self.active = false;
-        // SAFETY: object handle was returned by TVM-FFI as part of plan result.
-        unsafe {
-            self.runtime.object_dec_ref(self.obj);
-        }
-        Ok(())
-    }
-}
-
-impl Drop for AnyObjectDecRefGuard<'_> {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        self.active = false;
-        // SAFETY: best-effort object decref in drop path.
-        unsafe {
-            self.runtime.object_dec_ref(self.obj);
-        }
     }
 }
 
@@ -1787,11 +2092,7 @@ fn dtype_filename(dtype: DType) -> &'static str {
 }
 
 fn bool_name(value: bool) -> &'static str {
-    if value {
-        "True"
-    } else {
-        "False"
-    }
+    if value { "True" } else { "False" }
 }
 
 fn pos_encoding_mode_code(mode: MhaPosEncodingMode) -> i64 {

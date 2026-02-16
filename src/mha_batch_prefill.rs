@@ -2,8 +2,8 @@ use std::ffi::c_void;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    any_bool, any_dltensor_ptr, any_f64, any_i64, any_none, any_object_handle, DLDataType,
-    DLDevice, DLTensor, TVMFFIAny, KDL_BFLOAT, KDL_CPU, KDL_CUDA, KDL_FLOAT, KDL_INT, KDL_UINT,
+    DLDataType, DLDevice, DLTensor, KDL_BFLOAT, KDL_CPU, KDL_CUDA, KDL_FLOAT, KDL_INT, KDL_UINT,
+    TVMFFIAny, any_bool, any_dltensor_ptr, any_f64, any_i64, any_none, any_object_handle,
 };
 use crate::mha_prefill::{
     MhaMaskMode, MhaPosEncodingMode, MhaQkvLayout, MhaTensor1DF32Desc, MhaTensor1DU8Desc,
@@ -667,17 +667,142 @@ impl MhaBatchPrefillParams {
     }
 }
 
-pub fn mha_batch_prefill(params: &MhaBatchPrefillParams) -> Result<(), FlashInferError> {
+pub struct MhaBatchPrefillPlan {
+    runtime: &'static FlashInferRuntime,
+    plan_result: TVMFFIAny,
+    kernel_uri: String,
+    device_id: i32,
+    total_num_rows: i64,
+    batch_size: i64,
+    num_qo_heads: i64,
+    num_kv_heads: i64,
+    head_dim_qk: i64,
+    head_dim_vo: i64,
+    q_dtype: DType,
+    kv_dtype: DType,
+    out_dtype: DType,
+    window_left: i64,
+    logits_soft_cap: f64,
+    use_fp16_qk_reduction: bool,
+    float_workspace_len: i64,
+    int_workspace_len: i64,
+}
+
+impl Drop for MhaBatchPrefillPlan {
+    fn drop(&mut self) {
+        if let Some(obj) = any_object_handle(&self.plan_result) {
+            // SAFETY: object handle was created by TVM-FFI plan call and owned by this handle.
+            unsafe {
+                self.runtime.object_dec_ref(obj);
+            }
+        }
+    }
+}
+
+impl MhaBatchPrefillPlan {
+    fn validate_run_compatibility(
+        &self,
+        params: &MhaBatchPrefillParams,
+    ) -> Result<(), FlashInferError> {
+        if params.kernel_uri() != self.kernel_uri {
+            return Err(FlashInferError::invalid_argument(format!(
+                "prefill run kernel mismatch: planned `{}` but run requested `{}`",
+                self.kernel_uri,
+                params.kernel_uri()
+            )));
+        }
+        if params.q.device_id != self.device_id {
+            return Err(FlashInferError::invalid_argument(format!(
+                "prefill run device mismatch: planned device {} but got {}",
+                self.device_id, params.q.device_id
+            )));
+        }
+        if params.q.dim0 != self.total_num_rows {
+            return Err(FlashInferError::invalid_argument(format!(
+                "prefill run total_num_rows mismatch: planned {} but got {}",
+                self.total_num_rows, params.q.dim0
+            )));
+        }
+        if params.q.dim1 != self.num_qo_heads {
+            return Err(FlashInferError::invalid_argument(format!(
+                "prefill run num_qo_heads mismatch: planned {} but got {}",
+                self.num_qo_heads, params.q.dim1
+            )));
+        }
+        let num_kv_heads = match params.kv_layout {
+            MhaQkvLayout::Nhd => params.k.dim1,
+            MhaQkvLayout::Hnd => params.k.dim0,
+        };
+        if num_kv_heads != self.num_kv_heads {
+            return Err(FlashInferError::invalid_argument(format!(
+                "prefill run num_kv_heads mismatch: planned {} but got {}",
+                self.num_kv_heads, num_kv_heads
+            )));
+        }
+        if params.q.dim2 != self.head_dim_qk || params.out.dim2 != self.head_dim_vo {
+            return Err(FlashInferError::invalid_argument(format!(
+                "prefill run head dim mismatch: planned qk/vo=({},{}) but got ({},{})",
+                self.head_dim_qk, self.head_dim_vo, params.q.dim2, params.out.dim2
+            )));
+        }
+        if params.q.dtype != self.q_dtype
+            || params.k.dtype != self.kv_dtype
+            || params.v.dtype != self.kv_dtype
+            || params.out.dtype != self.out_dtype
+        {
+            return Err(FlashInferError::invalid_argument(
+                "prefill run dtype mismatch with prefill plan",
+            ));
+        }
+        if params.window_left != self.window_left {
+            return Err(FlashInferError::invalid_argument(
+                "prefill run window_left mismatch with prefill plan",
+            ));
+        }
+        if params.logits_soft_cap != self.logits_soft_cap {
+            return Err(FlashInferError::invalid_argument(
+                "prefill run logits_soft_cap mismatch with prefill plan",
+            ));
+        }
+        if params.use_fp16_qk_reduction != self.use_fp16_qk_reduction {
+            return Err(FlashInferError::invalid_argument(
+                "prefill run use_fp16_qk_reduction mismatch with prefill plan",
+            ));
+        }
+        if params.float_workspace.len != self.float_workspace_len
+            || params.int_workspace.len != self.int_workspace_len
+        {
+            return Err(FlashInferError::invalid_argument(
+                "prefill run workspace size mismatch with prefill plan",
+            ));
+        }
+        if params.qo_indptr.len != self.batch_size + 1 {
+            return Err(FlashInferError::invalid_argument(
+                "prefill run qo_indptr length mismatch with prefill plan",
+            ));
+        }
+        if params.kv_indptr.len != self.batch_size + 1 {
+            return Err(FlashInferError::invalid_argument(
+                "prefill run kv_indptr length mismatch with prefill plan",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn mha_batch_prefill_plan(
+    params: &MhaBatchPrefillParams,
+) -> Result<MhaBatchPrefillPlan, FlashInferError> {
     params.validate()?;
     let runtime = FlashInferRuntime::global()?;
     // SAFETY: FFI preconditions are validated by `params.validate` and runtime initialization.
-    unsafe { mha_batch_prefill_with_runtime(runtime, params) }
+    unsafe { mha_batch_prefill_plan_with_runtime(runtime, params) }
 }
 
-unsafe fn mha_batch_prefill_with_runtime(
-    runtime: &FlashInferRuntime,
+unsafe fn mha_batch_prefill_plan_with_runtime(
+    runtime: &'static FlashInferRuntime,
     params: &MhaBatchPrefillParams,
-) -> Result<(), FlashInferError> {
+) -> Result<MhaBatchPrefillPlan, FlashInferError> {
     let kernel_uri = params.kernel_uri();
 
     let qo_host = read_host_i32(params.qo_indptr_host)?;
@@ -694,81 +819,6 @@ unsafe fn mha_batch_prefill_with_runtime(
     let num_kv_heads = match params.kv_layout {
         MhaQkvLayout::Nhd => params.k.dim1,
         MhaQkvLayout::Hnd => params.k.dim0,
-    };
-
-    let mut q_shape = [params.q.dim0, params.q.dim1, params.q.dim2];
-    let mut q_strides = [params.q.stride0, params.q.stride1, params.q.stride2];
-    let q_tensor = DLTensor {
-        data: params.q.ptr.cast_mut(),
-        device: DLDevice {
-            device_type: KDL_CUDA,
-            device_id: params.q.device_id,
-        },
-        ndim: 3,
-        dtype: dl_dtype_from_norm_dtype(params.q.dtype),
-        shape: q_shape.as_mut_ptr(),
-        strides: q_strides.as_mut_ptr(),
-        byte_offset: 0,
-    };
-
-    let mut k_shape = [params.k.dim0, params.k.dim1, params.k.dim2];
-    let mut k_strides = [params.k.stride0, params.k.stride1, params.k.stride2];
-    let k_tensor = DLTensor {
-        data: params.k.ptr.cast_mut(),
-        device: DLDevice {
-            device_type: KDL_CUDA,
-            device_id: params.k.device_id,
-        },
-        ndim: 3,
-        dtype: dl_dtype_from_norm_dtype(params.k.dtype),
-        shape: k_shape.as_mut_ptr(),
-        strides: k_strides.as_mut_ptr(),
-        byte_offset: 0,
-    };
-
-    let mut v_shape = [params.v.dim0, params.v.dim1, params.v.dim2];
-    let mut v_strides = [params.v.stride0, params.v.stride1, params.v.stride2];
-    let v_tensor = DLTensor {
-        data: params.v.ptr.cast_mut(),
-        device: DLDevice {
-            device_type: KDL_CUDA,
-            device_id: params.v.device_id,
-        },
-        ndim: 3,
-        dtype: dl_dtype_from_norm_dtype(params.v.dtype),
-        shape: v_shape.as_mut_ptr(),
-        strides: v_strides.as_mut_ptr(),
-        byte_offset: 0,
-    };
-
-    let mut qo_indptr_shape = [params.qo_indptr.len];
-    let mut qo_indptr_strides = [params.qo_indptr.stride];
-    let qo_indptr_tensor = DLTensor {
-        data: params.qo_indptr.ptr.cast_mut(),
-        device: DLDevice {
-            device_type: KDL_CUDA,
-            device_id: params.qo_indptr.device_id,
-        },
-        ndim: 1,
-        dtype: dl_dtype_i32(),
-        shape: qo_indptr_shape.as_mut_ptr(),
-        strides: qo_indptr_strides.as_mut_ptr(),
-        byte_offset: 0,
-    };
-
-    let mut kv_indptr_shape = [params.kv_indptr.len];
-    let mut kv_indptr_strides = [params.kv_indptr.stride];
-    let kv_indptr_tensor = DLTensor {
-        data: params.kv_indptr.ptr.cast_mut(),
-        device: DLDevice {
-            device_type: KDL_CUDA,
-            device_id: params.kv_indptr.device_id,
-        },
-        ndim: 1,
-        dtype: dl_dtype_i32(),
-        shape: kv_indptr_shape.as_mut_ptr(),
-        strides: kv_indptr_strides.as_mut_ptr(),
-        byte_offset: 0,
     };
 
     let mut qo_host_shape = [params.qo_indptr_host.len];
@@ -859,6 +909,200 @@ unsafe fn mha_batch_prefill_with_runtime(
         dtype: dl_dtype_u8(),
         shape: page_locked_workspace_shape.as_mut_ptr(),
         strides: page_locked_workspace_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut plan_result_view = any_none();
+    let plan_args: [TVMFFIAny; 19] = [
+        any_dltensor_ptr(&float_workspace_tensor),
+        any_dltensor_ptr(&int_workspace_tensor),
+        any_dltensor_ptr(&page_locked_int_workspace_tensor),
+        any_dltensor_ptr(&qo_indptr_host_tensor),
+        any_dltensor_ptr(&kv_indptr_host_tensor),
+        any_dltensor_ptr(&kv_len_tensor),
+        any_i64(total_num_rows),
+        any_i64(batch_size),
+        any_i64(num_qo_heads),
+        any_i64(num_kv_heads),
+        any_i64(1), // page_size for ragged plan path
+        any_bool(false),
+        any_i64(params.q.dim2),
+        any_i64(params.v.dim2),
+        any_bool(params.causal),
+        any_i64(params.window_left),
+        any_i64(params.fixed_split_size),
+        any_bool(params.disable_split_kv),
+        any_i64(params.num_colocated_ctas),
+    ];
+
+    // SAFETY: stream context API contract comes from TVM-FFI and is validated on load.
+    let previous_stream = unsafe { runtime.set_stream(params.q.device_id, params.stream)? };
+    let mut restore_guard = StreamRestoreGuard::new(runtime, params.q.device_id, previous_stream);
+
+    let call_result = (|| -> Result<MhaBatchPrefillPlan, FlashInferError> {
+        // SAFETY: argument packing follows TVMFFIAny ABI.
+        unsafe {
+            runtime.call_batch_prefill_plan(
+                &kernel_uri,
+                plan_args.as_ptr(),
+                plan_args.len() as i32,
+                &mut plan_result_view as *mut _,
+            )?;
+        }
+
+        // SAFETY: converts returned AnyView into owned Any so lifetime can cross calls safely.
+        let plan_result = unsafe { runtime.any_view_to_owned(&plan_result_view)? };
+        Ok(MhaBatchPrefillPlan {
+            runtime,
+            plan_result,
+            kernel_uri,
+            device_id: params.q.device_id,
+            total_num_rows,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk: params.q.dim2,
+            head_dim_vo: params.v.dim2,
+            q_dtype: params.q.dtype,
+            kv_dtype: params.k.dtype,
+            out_dtype: params.out.dtype,
+            window_left: params.window_left,
+            logits_soft_cap: params.logits_soft_cap,
+            use_fp16_qk_reduction: params.use_fp16_qk_reduction,
+            float_workspace_len: params.float_workspace.len,
+            int_workspace_len: params.int_workspace.len,
+        })
+    })();
+
+    let restore_result = restore_guard.restore_now();
+
+    match (call_result, restore_result) {
+        (Err(call_error), _) => Err(call_error),
+        (Ok(plan), Err(restore_error)) => {
+            drop(plan);
+            Err(restore_error)
+        }
+        (Ok(plan), Ok(())) => Ok(plan),
+    }
+}
+
+pub fn mha_batch_prefill_run(
+    plan: &MhaBatchPrefillPlan,
+    params: &MhaBatchPrefillParams,
+) -> Result<(), FlashInferError> {
+    params.validate()?;
+    plan.validate_run_compatibility(params)?;
+    // SAFETY: FFI preconditions are validated by `params.validate` and `plan` compatibility checks.
+    unsafe { mha_batch_prefill_run_with_runtime(plan.runtime, plan, params) }
+}
+
+unsafe fn mha_batch_prefill_run_with_runtime(
+    runtime: &FlashInferRuntime,
+    plan: &MhaBatchPrefillPlan,
+    params: &MhaBatchPrefillParams,
+) -> Result<(), FlashInferError> {
+    let mut q_shape = [params.q.dim0, params.q.dim1, params.q.dim2];
+    let mut q_strides = [params.q.stride0, params.q.stride1, params.q.stride2];
+    let q_tensor = DLTensor {
+        data: params.q.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: params.q.device_id,
+        },
+        ndim: 3,
+        dtype: dl_dtype_from_norm_dtype(params.q.dtype),
+        shape: q_shape.as_mut_ptr(),
+        strides: q_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut k_shape = [params.k.dim0, params.k.dim1, params.k.dim2];
+    let mut k_strides = [params.k.stride0, params.k.stride1, params.k.stride2];
+    let k_tensor = DLTensor {
+        data: params.k.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: params.k.device_id,
+        },
+        ndim: 3,
+        dtype: dl_dtype_from_norm_dtype(params.k.dtype),
+        shape: k_shape.as_mut_ptr(),
+        strides: k_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut v_shape = [params.v.dim0, params.v.dim1, params.v.dim2];
+    let mut v_strides = [params.v.stride0, params.v.stride1, params.v.stride2];
+    let v_tensor = DLTensor {
+        data: params.v.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: params.v.device_id,
+        },
+        ndim: 3,
+        dtype: dl_dtype_from_norm_dtype(params.v.dtype),
+        shape: v_shape.as_mut_ptr(),
+        strides: v_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut qo_indptr_shape = [params.qo_indptr.len];
+    let mut qo_indptr_strides = [params.qo_indptr.stride];
+    let qo_indptr_tensor = DLTensor {
+        data: params.qo_indptr.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: params.qo_indptr.device_id,
+        },
+        ndim: 1,
+        dtype: dl_dtype_i32(),
+        shape: qo_indptr_shape.as_mut_ptr(),
+        strides: qo_indptr_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut kv_indptr_shape = [params.kv_indptr.len];
+    let mut kv_indptr_strides = [params.kv_indptr.stride];
+    let kv_indptr_tensor = DLTensor {
+        data: params.kv_indptr.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: params.kv_indptr.device_id,
+        },
+        ndim: 1,
+        dtype: dl_dtype_i32(),
+        shape: kv_indptr_shape.as_mut_ptr(),
+        strides: kv_indptr_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut float_workspace_shape = [params.float_workspace.len];
+    let mut float_workspace_strides = [params.float_workspace.stride];
+    let float_workspace_tensor = DLTensor {
+        data: params.float_workspace.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: params.float_workspace.device_id,
+        },
+        ndim: 1,
+        dtype: dl_dtype_u8(),
+        shape: float_workspace_shape.as_mut_ptr(),
+        strides: float_workspace_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut int_workspace_shape = [params.int_workspace.len];
+    let mut int_workspace_strides = [params.int_workspace.stride];
+    let int_workspace_tensor = DLTensor {
+        data: params.int_workspace.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: params.int_workspace.device_id,
+        },
+        ndim: 1,
+        dtype: dl_dtype_u8(),
+        shape: int_workspace_shape.as_mut_ptr(),
+        strides: int_workspace_strides.as_mut_ptr(),
         byte_offset: 0,
     };
 
@@ -1010,115 +1254,70 @@ unsafe fn mha_batch_prefill_with_runtime(
         }
     });
 
-    let mut plan_result_view = any_none();
-    let plan_args: [TVMFFIAny; 19] = [
+    let lse_any = lse_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+    let custom_mask_any = custom_mask_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+    let mask_indptr_any = mask_indptr_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+    let alibi_any = alibi_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+    let prefix_len_any = prefix_len_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+    let token_pos_any = token_pos_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+    let max_item_len_any = max_item_len_tensor
+        .as_ref()
+        .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
+
+    let mut run_result = any_none();
+    let run_args: [TVMFFIAny; 25] = [
         any_dltensor_ptr(&float_workspace_tensor),
         any_dltensor_ptr(&int_workspace_tensor),
-        any_dltensor_ptr(&page_locked_int_workspace_tensor),
-        any_dltensor_ptr(&qo_indptr_host_tensor),
-        any_dltensor_ptr(&kv_indptr_host_tensor),
-        any_dltensor_ptr(&kv_len_tensor),
-        any_i64(total_num_rows),
-        any_i64(batch_size),
-        any_i64(num_qo_heads),
-        any_i64(num_kv_heads),
-        any_i64(1), // page_size for ragged plan path
-        any_bool(false),
-        any_i64(params.q.dim2),
-        any_i64(params.v.dim2),
-        any_bool(params.causal),
+        plan.plan_result,
+        any_dltensor_ptr(&q_tensor),
+        any_dltensor_ptr(&k_tensor),
+        any_dltensor_ptr(&v_tensor),
+        any_dltensor_ptr(&qo_indptr_tensor),
+        any_dltensor_ptr(&kv_indptr_tensor),
+        any_dltensor_ptr(&out_tensor),
+        lse_any,
+        any_i64(mask_mode_code(params.mask_mode)),
+        any_i64(kv_layout_code(params.kv_layout)),
         any_i64(params.window_left),
-        any_i64(params.fixed_split_size),
-        any_bool(params.disable_split_kv),
-        any_i64(params.num_colocated_ctas),
+        any_bool(params.enable_pdl),
+        custom_mask_any,
+        mask_indptr_any,
+        alibi_any,
+        prefix_len_any,
+        token_pos_any,
+        max_item_len_any,
+        any_f64(params.logits_soft_cap),
+        any_f64(params.sm_scale),
+        any_f64(1.0 / params.rope_scale),
+        any_f64(1.0 / params.rope_theta),
+        any_i64(params.token_pos_in_items_len),
     ];
 
     // SAFETY: stream context API contract comes from TVM-FFI and is validated on load.
     let previous_stream = unsafe { runtime.set_stream(params.q.device_id, params.stream)? };
     let mut restore_guard = StreamRestoreGuard::new(runtime, params.q.device_id, previous_stream);
 
-    let call_result = (|| -> Result<(), FlashInferError> {
-        // SAFETY: argument packing follows TVMFFIAny ABI.
-        unsafe {
-            runtime.call_batch_prefill_plan(
-                &kernel_uri,
-                plan_args.as_ptr(),
-                plan_args.len() as i32,
-                &mut plan_result_view as *mut _,
-            )?;
-        }
-
-        // SAFETY: converts returned AnyView into owned Any so lifetime can cross calls safely.
-        let plan_result_owned = unsafe { runtime.any_view_to_owned(&plan_result_view)? };
-        let mut plan_result_guard = AnyObjectDecRefGuard::new(runtime, &plan_result_owned);
-
-        let lse_any = lse_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-        let custom_mask_any = custom_mask_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-        let mask_indptr_any = mask_indptr_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-        let alibi_any = alibi_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-        let prefix_len_any = prefix_len_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-        let token_pos_any = token_pos_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-        let max_item_len_any = max_item_len_tensor
-            .as_ref()
-            .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
-
-        let mut run_result = any_none();
-        let run_args: [TVMFFIAny; 25] = [
-            any_dltensor_ptr(&float_workspace_tensor),
-            any_dltensor_ptr(&int_workspace_tensor),
-            plan_result_owned,
-            any_dltensor_ptr(&q_tensor),
-            any_dltensor_ptr(&k_tensor),
-            any_dltensor_ptr(&v_tensor),
-            any_dltensor_ptr(&qo_indptr_tensor),
-            any_dltensor_ptr(&kv_indptr_tensor),
-            any_dltensor_ptr(&out_tensor),
-            lse_any,
-            any_i64(mask_mode_code(params.mask_mode)),
-            any_i64(kv_layout_code(params.kv_layout)),
-            any_i64(params.window_left),
-            any_bool(params.enable_pdl),
-            custom_mask_any,
-            mask_indptr_any,
-            alibi_any,
-            prefix_len_any,
-            token_pos_any,
-            max_item_len_any,
-            any_f64(params.logits_soft_cap),
-            any_f64(params.sm_scale),
-            any_f64(1.0 / params.rope_scale),
-            any_f64(1.0 / params.rope_theta),
-            any_i64(params.token_pos_in_items_len),
-        ];
-
-        // SAFETY: argument packing follows TVMFFIAny ABI.
-        let launch_result = unsafe {
-            runtime.call_batch_prefill_ragged(
-                &kernel_uri,
-                run_args.as_ptr(),
-                run_args.len() as i32,
-                &mut run_result as *mut _,
-            )
-        };
-
-        // Ensure plan_info object is released before leaving this scope.
-        let _ = plan_result_guard.release_now();
-
-        launch_result
-    })();
-
+    // SAFETY: argument packing follows TVMFFIAny ABI.
+    let call_result = unsafe {
+        runtime.call_batch_prefill_ragged(
+            &plan.kernel_uri,
+            run_args.as_ptr(),
+            run_args.len() as i32,
+            &mut run_result as *mut _,
+        )
+    };
     let restore_result = restore_guard.restore_now();
 
     match (call_result, restore_result) {
@@ -1169,48 +1368,6 @@ impl Drop for StreamRestoreGuard<'_> {
             self.runtime
                 .restore_stream(self.device_id, self.previous_stream)
         };
-    }
-}
-
-struct AnyObjectDecRefGuard<'a> {
-    runtime: &'a FlashInferRuntime,
-    obj: *mut c_void,
-    active: bool,
-}
-
-impl<'a> AnyObjectDecRefGuard<'a> {
-    fn new(runtime: &'a FlashInferRuntime, any: &TVMFFIAny) -> Self {
-        let obj = any_object_handle(any).unwrap_or(std::ptr::null_mut());
-        Self {
-            runtime,
-            obj,
-            active: true,
-        }
-    }
-
-    fn release_now(&mut self) -> Result<(), FlashInferError> {
-        if !self.active {
-            return Ok(());
-        }
-        self.active = false;
-        // SAFETY: object handle was returned by TVM-FFI as part of plan result.
-        unsafe {
-            self.runtime.object_dec_ref(self.obj);
-        }
-        Ok(())
-    }
-}
-
-impl Drop for AnyObjectDecRefGuard<'_> {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        self.active = false;
-        // SAFETY: best-effort object decref in drop path.
-        unsafe {
-            self.runtime.object_dec_ref(self.obj);
-        }
     }
 }
 
@@ -1306,11 +1463,7 @@ fn dtype_filename(dtype: DType) -> &'static str {
 }
 
 fn bool_name(value: bool) -> &'static str {
-    if value {
-        "True"
-    } else {
-        "False"
-    }
+    if value { "True" } else { "False" }
 }
 
 fn pos_encoding_mode_code(mode: MhaPosEncodingMode) -> i64 {
@@ -1431,7 +1584,7 @@ impl Default for MhaBatchPrefillCudarcOptions {
 
 #[cfg(feature = "cudarc")]
 #[allow(clippy::too_many_arguments)]
-pub fn mha_batch_prefill_cudarc<T, Q, K, V, O, QI, KI, FW, IW>(
+fn build_batch_prefill_params_from_cudarc<T, Q, K, V, O, QI, KI, FW, IW>(
     stream: &cudarc::driver::CudaStream,
     q: &Q,
     k: &K,
@@ -1451,7 +1604,7 @@ pub fn mha_batch_prefill_cudarc<T, Q, K, V, O, QI, KI, FW, IW>(
     kv_layout: MhaQkvLayout,
     dtype: DType,
     options: MhaBatchPrefillCudarcOptions,
-) -> Result<(), FlashInferError>
+) -> Result<MhaBatchPrefillParams, FlashInferError>
 where
     Q: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
     K: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
@@ -1742,7 +1895,122 @@ where
     .with_disable_split_kv(options.disable_split_kv)
     .with_num_colocated_ctas(options.num_colocated_ctas);
 
-    mha_batch_prefill(&params)
+    Ok(params)
+}
+
+#[cfg(feature = "cudarc")]
+#[allow(clippy::too_many_arguments)]
+pub fn mha_batch_prefill_cudarc_plan<T, Q, K, V, O, QI, KI, FW, IW>(
+    stream: &cudarc::driver::CudaStream,
+    q: &Q,
+    k: &K,
+    v: &V,
+    qo_indptr: &QI,
+    kv_indptr: &KI,
+    qo_indptr_host: &[i32],
+    kv_indptr_host: &[i32],
+    float_workspace: &mut FW,
+    int_workspace: &mut IW,
+    page_locked_int_workspace: &mut [u8],
+    out: &mut O,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim_qk: usize,
+    head_dim_vo: usize,
+    kv_layout: MhaQkvLayout,
+    dtype: DType,
+    options: MhaBatchPrefillCudarcOptions,
+) -> Result<MhaBatchPrefillPlan, FlashInferError>
+where
+    Q: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
+    K: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
+    V: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
+    O: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtrMut<T>,
+    QI: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    KI: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    FW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
+    IW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
+{
+    let params = build_batch_prefill_params_from_cudarc(
+        stream,
+        q,
+        k,
+        v,
+        qo_indptr,
+        kv_indptr,
+        qo_indptr_host,
+        kv_indptr_host,
+        float_workspace,
+        int_workspace,
+        page_locked_int_workspace,
+        out,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo,
+        kv_layout,
+        dtype,
+        options,
+    )?;
+    mha_batch_prefill_plan(&params)
+}
+
+#[cfg(feature = "cudarc")]
+#[allow(clippy::too_many_arguments)]
+pub fn mha_batch_prefill_cudarc_run<T, Q, K, V, O, QI, KI, FW, IW>(
+    stream: &cudarc::driver::CudaStream,
+    plan: &MhaBatchPrefillPlan,
+    q: &Q,
+    k: &K,
+    v: &V,
+    qo_indptr: &QI,
+    kv_indptr: &KI,
+    qo_indptr_host: &[i32],
+    kv_indptr_host: &[i32],
+    float_workspace: &mut FW,
+    int_workspace: &mut IW,
+    page_locked_int_workspace: &mut [u8],
+    out: &mut O,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim_qk: usize,
+    head_dim_vo: usize,
+    kv_layout: MhaQkvLayout,
+    dtype: DType,
+    options: MhaBatchPrefillCudarcOptions,
+) -> Result<(), FlashInferError>
+where
+    Q: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
+    K: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
+    V: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
+    O: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtrMut<T>,
+    QI: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    KI: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    FW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
+    IW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
+{
+    let params = build_batch_prefill_params_from_cudarc(
+        stream,
+        q,
+        k,
+        v,
+        qo_indptr,
+        kv_indptr,
+        qo_indptr_host,
+        kv_indptr_host,
+        float_workspace,
+        int_workspace,
+        page_locked_int_workspace,
+        out,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo,
+        kv_layout,
+        dtype,
+        options,
+    )?;
+    mha_batch_prefill_run(plan, &params)
 }
 
 #[cfg(test)]

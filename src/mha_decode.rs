@@ -2,8 +2,8 @@ use std::ffi::c_void;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    any_bool, any_dltensor_ptr, any_f64, any_i64, any_none, any_object_handle, DLDataType,
-    DLDevice, DLTensor, TVMFFIAny, KDL_BFLOAT, KDL_CPU, KDL_CUDA, KDL_FLOAT, KDL_INT, KDL_UINT,
+    DLDataType, DLDevice, DLTensor, KDL_BFLOAT, KDL_CPU, KDL_CUDA, KDL_FLOAT, KDL_INT, KDL_UINT,
+    TVMFFIAny, any_bool, any_dltensor_ptr, any_f64, any_i64, any_none, any_object_handle,
 };
 use crate::mha_batch_prefill::{MhaHostTensor1DI32Desc, MhaHostTensor1DU8Desc, MhaTensor1DI32Desc};
 use crate::mha_batch_prefill_paged::MhaTensor4DDesc;
@@ -2479,11 +2479,7 @@ fn dtype_filename(dtype: DType) -> &'static str {
 }
 
 fn bool_name(value: bool) -> &'static str {
-    if value {
-        "True"
-    } else {
-        "False"
-    }
+    if value { "True" } else { "False" }
 }
 
 fn pos_encoding_mode_code(value: MhaPosEncodingMode) -> i64 {
