@@ -52,44 +52,30 @@ pub struct MhaHostTensor1DU8Desc {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MhaBatchPrefillParams {
-    /// Query tensor, rank-3: `[qo_indptr_host[-1], num_qo_heads, head_dim_qk]`.
+    /// Query tensor, rank-3: `[qo_indptr[-1], num_qo_heads, head_dim_qk]`.
     ///
     /// Cross-reference:
     /// `flashinfer/flashinfer/prefill.py::BatchPrefillWithRaggedKVCacheWrapper.run`.
     pub q: MhaTensor3DDesc,
     /// Key tensor, rank-3:
-    /// - `NHD`: `[kv_indptr_host[-1], num_kv_heads, head_dim_qk]`
-    /// - `HND`: `[num_kv_heads, kv_indptr_host[-1], head_dim_qk]`.
+    /// - `NHD`: `[kv_indptr[-1], num_kv_heads, head_dim_qk]`
+    /// - `HND`: `[num_kv_heads, kv_indptr[-1], head_dim_qk]`.
     pub k: MhaTensor3DDesc,
     /// Value tensor, rank-3:
-    /// - `NHD`: `[kv_indptr_host[-1], num_kv_heads, head_dim_vo]`
-    /// - `HND`: `[num_kv_heads, kv_indptr_host[-1], head_dim_vo]`.
+    /// - `NHD`: `[kv_indptr[-1], num_kv_heads, head_dim_vo]`
+    /// - `HND`: `[num_kv_heads, kv_indptr[-1], head_dim_vo]`.
     pub v: MhaTensor3DDesc,
     /// Query/output ragged offsets on device, rank-1 int32: `[batch_size + 1]`.
     pub qo_indptr: MhaTensor1DI32Desc,
     /// KV ragged offsets on device, rank-1 int32: `[batch_size + 1]`.
     pub kv_indptr: MhaTensor1DI32Desc,
-    /// Query/output ragged offsets on host, rank-1 int32: `[batch_size + 1]`.
-    ///
-    /// This host tensor feeds the planning API (`plan`) in FlashInfer.
-    pub qo_indptr_host: MhaHostTensor1DI32Desc,
-    /// KV ragged offsets on host, rank-1 int32: `[batch_size + 1]`.
-    ///
-    /// This host tensor feeds the planning API (`plan`) in FlashInfer.
-    pub kv_indptr_host: MhaHostTensor1DI32Desc,
     /// Float workspace on device, rank-1 u8: `[workspace_bytes]`.
     pub float_workspace: MhaTensor1DU8Desc,
     /// Int workspace on device, rank-1 u8: `[workspace_bytes]`.
     pub int_workspace: MhaTensor1DU8Desc,
-    /// Page-locked int workspace on host, rank-1 u8: `[workspace_bytes]`.
-    ///
-    /// Cross-reference:
-    /// `flashinfer/flashinfer/prefill.py::BatchPrefillWithRaggedKVCacheWrapper.plan`
-    /// (`_pin_memory_int_workspace_buffer`).
-    pub page_locked_int_workspace: MhaHostTensor1DU8Desc,
-    /// Output tensor, rank-3: `[qo_indptr_host[-1], num_qo_heads, head_dim_vo]`.
+    /// Output tensor, rank-3: `[q.dim0, num_qo_heads, head_dim_vo]`.
     pub out: MhaTensor3DDesc,
-    /// Optional log-sum-exp output, rank-2 f32: `[qo_indptr_host[-1], num_qo_heads]`.
+    /// Optional log-sum-exp output, rank-2 f32: `[q.dim0, num_qo_heads]`.
     pub lse: Option<MhaTensor2DF32Desc>,
     /// Optional packed custom mask, rank-1 u8.
     pub custom_mask: Option<MhaTensor1DU8Desc>,
@@ -103,8 +89,6 @@ pub struct MhaBatchPrefillParams {
     pub token_pos_in_items_ptr: Option<MhaTensor1DU16Desc>,
     /// Optional max item lengths, rank-1 u16: `[batch_size]`.
     pub max_item_len_ptr: Option<MhaTensor1DU16Desc>,
-    /// Causal flag used by planning (`plan`) stage.
-    pub causal: bool,
     /// Mask mode code used by run stage.
     pub mask_mode: MhaMaskMode,
     /// KV layout enum (`NHD` or `HND`).
@@ -127,12 +111,6 @@ pub struct MhaBatchPrefillParams {
     pub use_fp16_qk_reduction: bool,
     /// Whether to enable Programmatic Dependent Launch.
     pub enable_pdl: bool,
-    /// FA2 fixed split size; `-1` means auto.
-    pub fixed_split_size: i64,
-    /// Disable split-kv in FA2 path.
-    pub disable_split_kv: bool,
-    /// Number of colocated CTAs for planning.
-    pub num_colocated_ctas: i64,
     /// CUDA stream (`cudaStream_t`) used for async launch.
     pub stream: *mut c_void,
 }
@@ -145,11 +123,8 @@ impl MhaBatchPrefillParams {
         v: MhaTensor3DDesc,
         qo_indptr: MhaTensor1DI32Desc,
         kv_indptr: MhaTensor1DI32Desc,
-        qo_indptr_host: MhaHostTensor1DI32Desc,
-        kv_indptr_host: MhaHostTensor1DI32Desc,
         float_workspace: MhaTensor1DU8Desc,
         int_workspace: MhaTensor1DU8Desc,
-        page_locked_int_workspace: MhaHostTensor1DU8Desc,
         out: MhaTensor3DDesc,
         stream: *mut c_void,
     ) -> Self {
@@ -164,11 +139,8 @@ impl MhaBatchPrefillParams {
             v,
             qo_indptr,
             kv_indptr,
-            qo_indptr_host,
-            kv_indptr_host,
             float_workspace,
             int_workspace,
-            page_locked_int_workspace,
             out,
             lse: None,
             custom_mask: None,
@@ -177,7 +149,6 @@ impl MhaBatchPrefillParams {
             prefix_len_ptr: None,
             token_pos_in_items_ptr: None,
             max_item_len_ptr: None,
-            causal: false,
             mask_mode: MhaMaskMode::NonCausal,
             kv_layout: MhaQkvLayout::Nhd,
             pos_encoding_mode: MhaPosEncodingMode::None,
@@ -189,9 +160,6 @@ impl MhaBatchPrefillParams {
             token_pos_in_items_len: 0,
             use_fp16_qk_reduction: false,
             enable_pdl: false,
-            fixed_split_size: -1,
-            disable_split_kv: false,
-            num_colocated_ctas: 0,
             stream,
         }
     }
@@ -231,11 +199,6 @@ impl MhaBatchPrefillParams {
 
     pub fn with_max_item_len_ptr(mut self, max_item_len_ptr: MhaTensor1DU16Desc) -> Self {
         self.max_item_len_ptr = Some(max_item_len_ptr);
-        self
-    }
-
-    pub fn with_causal(mut self, causal: bool) -> Self {
-        self.causal = causal;
         self
     }
 
@@ -294,35 +257,14 @@ impl MhaBatchPrefillParams {
         self
     }
 
-    pub fn with_fixed_split_size(mut self, fixed_split_size: i64) -> Self {
-        self.fixed_split_size = fixed_split_size;
-        self
-    }
-
-    pub fn with_disable_split_kv(mut self, disable_split_kv: bool) -> Self {
-        self.disable_split_kv = disable_split_kv;
-        self
-    }
-
-    pub fn with_num_colocated_ctas(mut self, num_colocated_ctas: i64) -> Self {
-        self.num_colocated_ctas = num_colocated_ctas;
-        self
-    }
-
     pub fn validate(&self) -> Result<(), FlashInferError> {
         check_non_null(self.q.ptr, "q")?;
         check_non_null(self.k.ptr, "k")?;
         check_non_null(self.v.ptr, "v")?;
         check_non_null(self.qo_indptr.ptr, "qo_indptr")?;
         check_non_null(self.kv_indptr.ptr, "kv_indptr")?;
-        check_non_null(self.qo_indptr_host.ptr, "qo_indptr_host")?;
-        check_non_null(self.kv_indptr_host.ptr, "kv_indptr_host")?;
         check_non_null(self.float_workspace.ptr, "float_workspace")?;
         check_non_null(self.int_workspace.ptr, "int_workspace")?;
-        check_non_null(
-            self.page_locked_int_workspace.ptr,
-            "page_locked_int_workspace",
-        )?;
         check_non_null(self.out.ptr, "out")?;
 
         check_positive("q.dim0", self.q.dim0)?;
@@ -343,22 +285,16 @@ impl MhaBatchPrefillParams {
                 "workspace lengths must be positive",
             ));
         }
-        if self.page_locked_int_workspace.len <= 0 {
+        if self.qo_indptr.len <= 1 || self.kv_indptr.len <= 1 {
             return Err(FlashInferError::invalid_argument(
-                "page_locked_int_workspace length must be positive",
+                "qo_indptr/kv_indptr lengths must be at least 2",
             ));
         }
 
         check_contiguous_1d("qo_indptr", self.qo_indptr.stride)?;
         check_contiguous_1d("kv_indptr", self.kv_indptr.stride)?;
-        check_contiguous_1d("qo_indptr_host", self.qo_indptr_host.stride)?;
-        check_contiguous_1d("kv_indptr_host", self.kv_indptr_host.stride)?;
         check_contiguous_1d("float_workspace", self.float_workspace.stride)?;
         check_contiguous_1d("int_workspace", self.int_workspace.stride)?;
-        check_contiguous_1d(
-            "page_locked_int_workspace",
-            self.page_locked_int_workspace.stride,
-        )?;
 
         if self.q.stride2 != 1
             || self.k.stride2 != 1
@@ -384,42 +320,16 @@ impl MhaBatchPrefillParams {
             ));
         }
 
-        let qo_host = read_host_i32(self.qo_indptr_host)?;
-        let kv_host = read_host_i32(self.kv_indptr_host)?;
-
-        let batch_size = validate_indptr("qo_indptr_host", &qo_host)?;
-        let kv_batch_size = validate_indptr("kv_indptr_host", &kv_host)?;
-        if kv_batch_size != batch_size {
-            return Err(FlashInferError::invalid_argument(format!(
-                "kv_indptr_host batch size ({kv_batch_size}) must match qo_indptr_host batch size ({batch_size})"
-            )));
-        }
-
-        if self.qo_indptr.len != self.qo_indptr_host.len {
+        if self.qo_indptr.len != self.kv_indptr.len {
             return Err(FlashInferError::invalid_argument(
-                "qo_indptr (device) length must match qo_indptr_host length",
-            ));
-        }
-        if self.kv_indptr.len != self.kv_indptr_host.len {
-            return Err(FlashInferError::invalid_argument(
-                "kv_indptr (device) length must match kv_indptr_host length",
+                "qo_indptr and kv_indptr lengths must match",
             ));
         }
 
-        let qo_total = i64::from(*qo_host.last().unwrap_or(&0));
-        let kv_total = i64::from(*kv_host.last().unwrap_or(&0));
-
-        if self.q.dim0 != qo_total {
-            return Err(FlashInferError::invalid_argument(format!(
-                "q.dim0 ({}) must equal qo_indptr_host[-1] ({qo_total})",
-                self.q.dim0
-            )));
-        }
-        if self.out.dim0 != qo_total {
-            return Err(FlashInferError::invalid_argument(format!(
-                "out.dim0 ({}) must equal qo_indptr_host[-1] ({qo_total})",
-                self.out.dim0
-            )));
+        if self.out.dim0 != self.q.dim0 {
+            return Err(FlashInferError::invalid_argument(
+                "out dim0 must match q dim0",
+            ));
         }
 
         let num_qo_heads = self.q.dim1;
@@ -460,9 +370,9 @@ impl MhaBatchPrefillParams {
             MhaQkvLayout::Hnd => self.v.dim0,
         };
 
-        if k_kv_len != kv_total || v_kv_len != kv_total {
+        if k_kv_len != v_kv_len {
             return Err(FlashInferError::invalid_argument(
-                "k/v kv_len must equal kv_indptr_host[-1]",
+                "k and v kv_len must match for the selected kv_layout",
             ));
         }
         if v_num_kv_heads != num_kv_heads {
@@ -495,16 +405,6 @@ impl MhaBatchPrefillParams {
                 "window_left must be -1 or >= 0",
             ));
         }
-        if self.fixed_split_size < -1 {
-            return Err(FlashInferError::invalid_argument(
-                "fixed_split_size must be -1 or >= 0",
-            ));
-        }
-        if self.num_colocated_ctas < 0 {
-            return Err(FlashInferError::invalid_argument(
-                "num_colocated_ctas must be >= 0",
-            ));
-        }
         if self.token_pos_in_items_len < 0 {
             return Err(FlashInferError::invalid_argument(
                 "token_pos_in_items_len must be >= 0",
@@ -535,9 +435,9 @@ impl MhaBatchPrefillParams {
             check_non_null(lse.ptr, "lse")?;
             check_positive("lse.rows", lse.rows)?;
             check_positive("lse.cols", lse.cols)?;
-            if lse.rows != qo_total || lse.cols != num_qo_heads {
+            if lse.rows != self.q.dim0 || lse.cols != num_qo_heads {
                 return Err(FlashInferError::invalid_argument(
-                    "lse shape must be [qo_indptr_host[-1], num_qo_heads]",
+                    "lse shape must be [q.dim0, num_qo_heads]",
                 ));
             }
             if lse.stride_col != 1 || lse.stride_row != lse.cols {
@@ -566,7 +466,7 @@ impl MhaBatchPrefillParams {
         if let Some(mask_indptr) = self.mask_indptr {
             check_non_null(mask_indptr.ptr, "mask_indptr")?;
             check_contiguous_1d("mask_indptr", mask_indptr.stride)?;
-            if mask_indptr.len != self.qo_indptr_host.len {
+            if mask_indptr.len != self.qo_indptr.len {
                 return Err(FlashInferError::invalid_argument(
                     "mask_indptr length must equal batch_size + 1",
                 ));
@@ -607,10 +507,11 @@ impl MhaBatchPrefillParams {
             ));
         }
 
+        let batch_size = self.qo_indptr.len - 1;
         if let Some(prefix_len_ptr) = self.prefix_len_ptr {
             check_non_null(prefix_len_ptr.ptr, "prefix_len_ptr")?;
             check_contiguous_1d("prefix_len_ptr", prefix_len_ptr.stride)?;
-            if prefix_len_ptr.len != i64::from(batch_size) {
+            if prefix_len_ptr.len != batch_size {
                 return Err(FlashInferError::invalid_argument(
                     "prefix_len_ptr length must equal batch_size",
                 ));
@@ -636,7 +537,7 @@ impl MhaBatchPrefillParams {
         if let Some(max_item_len_ptr) = self.max_item_len_ptr {
             check_non_null(max_item_len_ptr.ptr, "max_item_len_ptr")?;
             check_contiguous_1d("max_item_len_ptr", max_item_len_ptr.stride)?;
-            if max_item_len_ptr.len != i64::from(batch_size) {
+            if max_item_len_ptr.len != batch_size {
                 return Err(FlashInferError::invalid_argument(
                     "max_item_len_ptr length must equal batch_size",
                 ));
@@ -659,6 +560,264 @@ impl MhaBatchPrefillParams {
             dtype_filename(self.out.dtype),
             self.q.dim2,
             self.v.dim2,
+            pos_encoding_mode_code(self.pos_encoding_mode),
+            bool_name(self.window_left >= 0),
+            bool_name(self.logits_soft_cap > 0.0),
+            bool_name(self.use_fp16_qk_reduction),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MhaBatchPrefillPlanParams {
+    /// Query/output ragged offsets on host, rank-1 int32: `[batch_size + 1]`.
+    pub qo_indptr_host: MhaHostTensor1DI32Desc,
+    /// KV ragged offsets on host, rank-1 int32: `[batch_size + 1]`.
+    pub kv_indptr_host: MhaHostTensor1DI32Desc,
+    /// Float workspace on device, rank-1 u8: `[workspace_bytes]`.
+    pub float_workspace: MhaTensor1DU8Desc,
+    /// Int workspace on device, rank-1 u8: `[workspace_bytes]`.
+    pub int_workspace: MhaTensor1DU8Desc,
+    /// Page-locked int workspace on host, rank-1 u8: `[workspace_bytes]`.
+    ///
+    /// Cross-reference:
+    /// `flashinfer/flashinfer/prefill.py::BatchPrefillWithRaggedKVCacheWrapper.plan`
+    /// (`_pin_memory_int_workspace_buffer`).
+    pub page_locked_int_workspace: MhaHostTensor1DU8Desc,
+    /// Total number of query rows (`qo_indptr_host[-1]`).
+    pub total_num_rows: i64,
+    /// Number of query/output heads.
+    pub num_qo_heads: i64,
+    /// Number of KV heads.
+    pub num_kv_heads: i64,
+    /// Query/key head dimension.
+    pub head_dim_qk: i64,
+    /// Value/output head dimension.
+    pub head_dim_vo: i64,
+    /// Query dtype.
+    pub q_dtype: DType,
+    /// KV dtype.
+    pub kv_dtype: DType,
+    /// Output dtype.
+    pub out_dtype: DType,
+    /// CUDA device id.
+    pub device_id: i32,
+    /// Causal flag used by planning (`plan`) stage.
+    pub causal: bool,
+    /// Positional encoding mode enum.
+    pub pos_encoding_mode: MhaPosEncodingMode,
+    /// Left sliding-window size; `-1` disables sliding window.
+    pub window_left: i64,
+    /// Logits soft cap value; `> 0` enables capping.
+    pub logits_soft_cap: f64,
+    /// Whether to enable fp16 QK reduction in compatible kernels.
+    pub use_fp16_qk_reduction: bool,
+    /// FA2 fixed split size; `-1` means auto.
+    pub fixed_split_size: i64,
+    /// Disable split-kv in FA2 path.
+    pub disable_split_kv: bool,
+    /// Number of colocated CTAs for planning.
+    pub num_colocated_ctas: i64,
+    /// CUDA stream (`cudaStream_t`) used for async launch.
+    pub stream: *mut c_void,
+}
+
+impl MhaBatchPrefillPlanParams {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        qo_indptr_host: MhaHostTensor1DI32Desc,
+        kv_indptr_host: MhaHostTensor1DI32Desc,
+        float_workspace: MhaTensor1DU8Desc,
+        int_workspace: MhaTensor1DU8Desc,
+        page_locked_int_workspace: MhaHostTensor1DU8Desc,
+        total_num_rows: i64,
+        num_qo_heads: i64,
+        num_kv_heads: i64,
+        head_dim_qk: i64,
+        head_dim_vo: i64,
+        q_dtype: DType,
+        kv_dtype: DType,
+        out_dtype: DType,
+        device_id: i32,
+        stream: *mut c_void,
+    ) -> Self {
+        Self {
+            qo_indptr_host,
+            kv_indptr_host,
+            float_workspace,
+            int_workspace,
+            page_locked_int_workspace,
+            total_num_rows,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk,
+            head_dim_vo,
+            q_dtype,
+            kv_dtype,
+            out_dtype,
+            device_id,
+            causal: false,
+            pos_encoding_mode: MhaPosEncodingMode::None,
+            window_left: -1,
+            logits_soft_cap: 0.0,
+            use_fp16_qk_reduction: false,
+            fixed_split_size: -1,
+            disable_split_kv: false,
+            num_colocated_ctas: 0,
+            stream,
+        }
+    }
+
+    pub fn with_causal(mut self, causal: bool) -> Self {
+        self.causal = causal;
+        self
+    }
+
+    pub fn with_pos_encoding_mode(mut self, pos_encoding_mode: MhaPosEncodingMode) -> Self {
+        self.pos_encoding_mode = pos_encoding_mode;
+        self
+    }
+
+    pub fn with_window_left(mut self, window_left: i64) -> Self {
+        self.window_left = window_left;
+        self
+    }
+
+    pub fn with_logits_soft_cap(mut self, logits_soft_cap: f64) -> Self {
+        self.logits_soft_cap = logits_soft_cap;
+        self
+    }
+
+    pub fn with_fp16_qk_reduction(mut self, use_fp16_qk_reduction: bool) -> Self {
+        self.use_fp16_qk_reduction = use_fp16_qk_reduction;
+        self
+    }
+
+    pub fn with_fixed_split_size(mut self, fixed_split_size: i64) -> Self {
+        self.fixed_split_size = fixed_split_size;
+        self
+    }
+
+    pub fn with_disable_split_kv(mut self, disable_split_kv: bool) -> Self {
+        self.disable_split_kv = disable_split_kv;
+        self
+    }
+
+    pub fn with_num_colocated_ctas(mut self, num_colocated_ctas: i64) -> Self {
+        self.num_colocated_ctas = num_colocated_ctas;
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), FlashInferError> {
+        check_non_null(self.qo_indptr_host.ptr, "qo_indptr_host")?;
+        check_non_null(self.kv_indptr_host.ptr, "kv_indptr_host")?;
+        check_non_null(self.float_workspace.ptr, "float_workspace")?;
+        check_non_null(self.int_workspace.ptr, "int_workspace")?;
+        check_non_null(
+            self.page_locked_int_workspace.ptr,
+            "page_locked_int_workspace",
+        )?;
+
+        check_positive("total_num_rows", self.total_num_rows)?;
+        check_positive("num_qo_heads", self.num_qo_heads)?;
+        check_positive("num_kv_heads", self.num_kv_heads)?;
+        check_positive("head_dim_qk", self.head_dim_qk)?;
+        check_positive("head_dim_vo", self.head_dim_vo)?;
+
+        if self.num_qo_heads % self.num_kv_heads != 0 {
+            return Err(FlashInferError::invalid_argument(
+                "num_qo_heads must be divisible by num_kv_heads",
+            ));
+        }
+
+        if self.float_workspace.len <= 0 || self.int_workspace.len <= 0 {
+            return Err(FlashInferError::invalid_argument(
+                "workspace lengths must be positive",
+            ));
+        }
+        if self.page_locked_int_workspace.len <= 0 {
+            return Err(FlashInferError::invalid_argument(
+                "page_locked_int_workspace length must be positive",
+            ));
+        }
+
+        check_contiguous_1d("qo_indptr_host", self.qo_indptr_host.stride)?;
+        check_contiguous_1d("kv_indptr_host", self.kv_indptr_host.stride)?;
+        check_contiguous_1d("float_workspace", self.float_workspace.stride)?;
+        check_contiguous_1d("int_workspace", self.int_workspace.stride)?;
+        check_contiguous_1d(
+            "page_locked_int_workspace",
+            self.page_locked_int_workspace.stride,
+        )?;
+
+        if self.q_dtype != self.kv_dtype || self.q_dtype != self.out_dtype {
+            return Err(FlashInferError::invalid_argument("q/kv/out dtype mismatch"));
+        }
+        if self.use_fp16_qk_reduction && self.q_dtype != DType::F16 {
+            return Err(FlashInferError::invalid_argument(
+                "use_fp16_qk_reduction requires dtype F16",
+            ));
+        }
+
+        if self.float_workspace.device_id != self.device_id
+            || self.int_workspace.device_id != self.device_id
+        {
+            return Err(FlashInferError::invalid_argument(
+                "plan workspaces must match plan device_id",
+            ));
+        }
+
+        let qo_host = read_host_i32(self.qo_indptr_host)?;
+        let kv_host = read_host_i32(self.kv_indptr_host)?;
+
+        let batch_size = validate_indptr("qo_indptr_host", &qo_host)?;
+        let kv_batch_size = validate_indptr("kv_indptr_host", &kv_host)?;
+        if kv_batch_size != batch_size {
+            return Err(FlashInferError::invalid_argument(format!(
+                "kv_indptr_host batch size ({kv_batch_size}) must match qo_indptr_host batch size ({batch_size})"
+            )));
+        }
+
+        let qo_total = i64::from(*qo_host.last().unwrap_or(&0));
+        if self.total_num_rows != qo_total {
+            return Err(FlashInferError::invalid_argument(format!(
+                "total_num_rows ({}) must equal qo_indptr_host[-1] ({qo_total})",
+                self.total_num_rows
+            )));
+        }
+
+        if self.window_left < -1 {
+            return Err(FlashInferError::invalid_argument(
+                "window_left must be -1 or >= 0",
+            ));
+        }
+        if self.fixed_split_size < -1 {
+            return Err(FlashInferError::invalid_argument(
+                "fixed_split_size must be -1 or >= 0",
+            ));
+        }
+        if self.num_colocated_ctas < 0 {
+            return Err(FlashInferError::invalid_argument(
+                "num_colocated_ctas must be >= 0",
+            ));
+        }
+        if !self.logits_soft_cap.is_finite() {
+            return Err(FlashInferError::invalid_argument(
+                "logits_soft_cap must be finite",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn kernel_uri(&self) -> String {
+        format!(
+            "batch_prefill_with_kv_cache_dtype_q_{}_dtype_kv_{}_dtype_o_{}_dtype_idx_i32_head_dim_qk_{}_head_dim_vo_{}_posenc_{}_use_swa_{}_use_logits_cap_{}_f16qk_{}",
+            dtype_filename(self.q_dtype),
+            dtype_filename(self.kv_dtype),
+            dtype_filename(self.out_dtype),
+            self.head_dim_qk,
+            self.head_dim_vo,
             pos_encoding_mode_code(self.pos_encoding_mode),
             bool_name(self.window_left >= 0),
             bool_name(self.logits_soft_cap > 0.0),
@@ -791,7 +950,7 @@ impl MhaBatchPrefillPlan {
 }
 
 pub fn mha_batch_prefill_plan(
-    params: &MhaBatchPrefillParams,
+    params: &MhaBatchPrefillPlanParams,
 ) -> Result<MhaBatchPrefillPlan, FlashInferError> {
     params.validate()?;
     let runtime = FlashInferRuntime::global()?;
@@ -801,7 +960,7 @@ pub fn mha_batch_prefill_plan(
 
 unsafe fn mha_batch_prefill_plan_with_runtime(
     runtime: &'static FlashInferRuntime,
-    params: &MhaBatchPrefillParams,
+    params: &MhaBatchPrefillPlanParams,
 ) -> Result<MhaBatchPrefillPlan, FlashInferError> {
     let kernel_uri = params.kernel_uri();
 
@@ -814,12 +973,9 @@ unsafe fn mha_batch_prefill_plan_with_runtime(
 
     let batch_size = i64::try_from(qo_host.len().saturating_sub(1))
         .map_err(|_| FlashInferError::invalid_argument("batch_size does not fit in i64"))?;
-    let total_num_rows = params.q.dim0;
-    let num_qo_heads = params.q.dim1;
-    let num_kv_heads = match params.kv_layout {
-        MhaQkvLayout::Nhd => params.k.dim1,
-        MhaQkvLayout::Hnd => params.k.dim0,
-    };
+    let total_num_rows = params.total_num_rows;
+    let num_qo_heads = params.num_qo_heads;
+    let num_kv_heads = params.num_kv_heads;
 
     let mut qo_host_shape = [params.qo_indptr_host.len];
     let mut qo_host_strides = [params.qo_indptr_host.stride];
@@ -926,8 +1082,8 @@ unsafe fn mha_batch_prefill_plan_with_runtime(
         any_i64(num_kv_heads),
         any_i64(1), // page_size for ragged plan path
         any_bool(false),
-        any_i64(params.q.dim2),
-        any_i64(params.v.dim2),
+        any_i64(params.head_dim_qk),
+        any_i64(params.head_dim_vo),
         any_bool(params.causal),
         any_i64(params.window_left),
         any_i64(params.fixed_split_size),
@@ -936,8 +1092,8 @@ unsafe fn mha_batch_prefill_plan_with_runtime(
     ];
 
     // SAFETY: stream context API contract comes from TVM-FFI and is validated on load.
-    let previous_stream = unsafe { runtime.set_stream(params.q.device_id, params.stream)? };
-    let mut restore_guard = StreamRestoreGuard::new(runtime, params.q.device_id, previous_stream);
+    let previous_stream = unsafe { runtime.set_stream(params.device_id, params.stream)? };
+    let mut restore_guard = StreamRestoreGuard::new(runtime, params.device_id, previous_stream);
 
     let call_result = (|| -> Result<MhaBatchPrefillPlan, FlashInferError> {
         // SAFETY: argument packing follows TVMFFIAny ABI.
@@ -956,16 +1112,16 @@ unsafe fn mha_batch_prefill_plan_with_runtime(
             runtime,
             plan_result,
             kernel_uri,
-            device_id: params.q.device_id,
+            device_id: params.device_id,
             total_num_rows,
             batch_size,
             num_qo_heads,
             num_kv_heads,
-            head_dim_qk: params.q.dim2,
-            head_dim_vo: params.v.dim2,
-            q_dtype: params.q.dtype,
-            kv_dtype: params.k.dtype,
-            out_dtype: params.out.dtype,
+            head_dim_qk: params.head_dim_qk,
+            head_dim_vo: params.head_dim_vo,
+            q_dtype: params.q_dtype,
+            kv_dtype: params.kv_dtype,
+            out_dtype: params.out_dtype,
             window_left: params.window_left,
             logits_soft_cap: params.logits_soft_cap,
             use_fp16_qk_reduction: params.use_fp16_qk_reduction,
@@ -1584,18 +1740,161 @@ impl Default for MhaBatchPrefillCudarcOptions {
 
 #[cfg(feature = "cudarc")]
 #[allow(clippy::too_many_arguments)]
-fn build_batch_prefill_params_from_cudarc<T, Q, K, V, O, QI, KI, FW, IW>(
+fn build_batch_prefill_plan_params_from_cudarc<FW, IW>(
+    stream: &cudarc::driver::CudaStream,
+    qo_indptr_host: &[i32],
+    kv_indptr_host: &[i32],
+    float_workspace: &mut FW,
+    int_workspace: &mut IW,
+    page_locked_int_workspace: &mut [u8],
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim_qk: usize,
+    head_dim_vo: usize,
+    dtype: DType,
+    options: MhaBatchPrefillCudarcOptions,
+) -> Result<MhaBatchPrefillPlanParams, FlashInferError>
+where
+    FW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
+    IW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
+{
+    if num_qo_heads == 0 || num_kv_heads == 0 || head_dim_qk == 0 || head_dim_vo == 0 {
+        return Err(FlashInferError::invalid_argument(
+            "num_heads/head_dim must be positive",
+        ));
+    }
+    if num_qo_heads % num_kv_heads != 0 {
+        return Err(FlashInferError::invalid_argument(
+            "num_qo_heads must be divisible by num_kv_heads",
+        ));
+    }
+
+    if qo_indptr_host.len() < 2 || kv_indptr_host.len() < 2 {
+        return Err(FlashInferError::invalid_argument(
+            "qo_indptr_host/kv_indptr_host length must be at least 2",
+        ));
+    }
+    if qo_indptr_host.len() != kv_indptr_host.len() {
+        return Err(FlashInferError::invalid_argument(
+            "qo_indptr_host and kv_indptr_host length mismatch",
+        ));
+    }
+
+    let batch_size = validate_indptr("qo_indptr_host", qo_indptr_host)?;
+    let kv_batch_size = validate_indptr("kv_indptr_host", kv_indptr_host)?;
+    if kv_batch_size != batch_size {
+        return Err(FlashInferError::invalid_argument(
+            "kv_indptr_host batch size must match qo_indptr_host batch size",
+        ));
+    }
+
+    let qo_total = i64::from(*qo_indptr_host.last().unwrap_or(&0));
+
+    let float_workspace_len = float_workspace.len();
+    let int_workspace_len = int_workspace.len();
+    if float_workspace_len == 0 || int_workspace_len == 0 {
+        return Err(FlashInferError::invalid_argument(
+            "float/int workspace lengths must be positive",
+        ));
+    }
+    if page_locked_int_workspace.is_empty() {
+        return Err(FlashInferError::invalid_argument(
+            "page_locked_int_workspace length must be positive",
+        ));
+    }
+
+    let (float_workspace_ptr, _float_ws_sync) = float_workspace.device_ptr_mut(stream);
+    let (int_workspace_ptr, _int_ws_sync) = int_workspace.device_ptr_mut(stream);
+
+    let qo_indptr_len_i64 = i64::try_from(qo_indptr_host.len()).map_err(|_| {
+        FlashInferError::invalid_argument("qo_indptr_host length does not fit in i64")
+    })?;
+    let kv_indptr_len_i64 = i64::try_from(kv_indptr_host.len()).map_err(|_| {
+        FlashInferError::invalid_argument("kv_indptr_host length does not fit in i64")
+    })?;
+    let num_qo_heads_i64 = i64::try_from(num_qo_heads)
+        .map_err(|_| FlashInferError::invalid_argument("num_qo_heads does not fit in i64"))?;
+    let num_kv_heads_i64 = i64::try_from(num_kv_heads)
+        .map_err(|_| FlashInferError::invalid_argument("num_kv_heads does not fit in i64"))?;
+    let head_dim_qk_i64 = i64::try_from(head_dim_qk)
+        .map_err(|_| FlashInferError::invalid_argument("head_dim_qk does not fit in i64"))?;
+    let head_dim_vo_i64 = i64::try_from(head_dim_vo)
+        .map_err(|_| FlashInferError::invalid_argument("head_dim_vo does not fit in i64"))?;
+    let float_ws_len_i64 = i64::try_from(float_workspace_len).map_err(|_| {
+        FlashInferError::invalid_argument("float_workspace length does not fit in i64")
+    })?;
+    let int_ws_len_i64 = i64::try_from(int_workspace_len).map_err(|_| {
+        FlashInferError::invalid_argument("int_workspace length does not fit in i64")
+    })?;
+    let page_locked_ws_len_i64 = i64::try_from(page_locked_int_workspace.len()).map_err(|_| {
+        FlashInferError::invalid_argument("page_locked_int_workspace length does not fit in i64")
+    })?;
+
+    let device_id = i32::try_from(stream.context().ordinal())
+        .map_err(|_| FlashInferError::invalid_argument("device id does not fit in i32"))?;
+
+    let params = MhaBatchPrefillPlanParams::new(
+        MhaHostTensor1DI32Desc {
+            ptr: qo_indptr_host.as_ptr().cast(),
+            len: qo_indptr_len_i64,
+            stride: 1,
+        },
+        MhaHostTensor1DI32Desc {
+            ptr: kv_indptr_host.as_ptr().cast(),
+            len: kv_indptr_len_i64,
+            stride: 1,
+        },
+        MhaTensor1DU8Desc {
+            ptr: float_workspace_ptr as usize as *const c_void,
+            len: float_ws_len_i64,
+            stride: 1,
+            device_id,
+        },
+        MhaTensor1DU8Desc {
+            ptr: int_workspace_ptr as usize as *const c_void,
+            len: int_ws_len_i64,
+            stride: 1,
+            device_id,
+        },
+        MhaHostTensor1DU8Desc {
+            ptr: page_locked_int_workspace.as_ptr().cast(),
+            len: page_locked_ws_len_i64,
+            stride: 1,
+        },
+        qo_total,
+        num_qo_heads_i64,
+        num_kv_heads_i64,
+        head_dim_qk_i64,
+        head_dim_vo_i64,
+        dtype,
+        dtype,
+        dtype,
+        device_id,
+        stream.cu_stream().cast(),
+    )
+    .with_causal(options.causal)
+    .with_pos_encoding_mode(options.pos_encoding_mode)
+    .with_window_left(options.window_left)
+    .with_logits_soft_cap(options.logits_soft_cap)
+    .with_fp16_qk_reduction(options.use_fp16_qk_reduction)
+    .with_fixed_split_size(options.fixed_split_size)
+    .with_disable_split_kv(options.disable_split_kv)
+    .with_num_colocated_ctas(options.num_colocated_ctas);
+
+    Ok(params)
+}
+
+#[cfg(feature = "cudarc")]
+#[allow(clippy::too_many_arguments)]
+fn build_batch_prefill_run_params_from_cudarc<T, Q, K, V, O, QI, KI, FW, IW>(
     stream: &cudarc::driver::CudaStream,
     q: &Q,
     k: &K,
     v: &V,
     qo_indptr: &QI,
     kv_indptr: &KI,
-    qo_indptr_host: &[i32],
-    kv_indptr_host: &[i32],
     float_workspace: &mut FW,
     int_workspace: &mut IW,
-    page_locked_int_workspace: &mut [u8],
     out: &mut O,
     num_qo_heads: usize,
     num_kv_heads: usize,
@@ -1620,58 +1919,56 @@ where
             "num_heads/head_dim must be positive",
         ));
     }
-
-    if qo_indptr_host.len() < 2 || kv_indptr_host.len() < 2 {
+    if num_qo_heads % num_kv_heads != 0 {
         return Err(FlashInferError::invalid_argument(
-            "qo_indptr_host/kv_indptr_host length must be at least 2",
-        ));
-    }
-    if qo_indptr_host.len() != kv_indptr_host.len() {
-        return Err(FlashInferError::invalid_argument(
-            "qo_indptr_host and kv_indptr_host length mismatch",
+            "num_qo_heads must be divisible by num_kv_heads",
         ));
     }
 
-    let qo_total = usize::try_from(*qo_indptr_host.last().unwrap_or(&0))
-        .map_err(|_| FlashInferError::invalid_argument("qo total does not fit in usize"))?;
-    let kv_total = usize::try_from(*kv_indptr_host.last().unwrap_or(&0))
-        .map_err(|_| FlashInferError::invalid_argument("kv total does not fit in usize"))?;
+    let q_row_size = num_qo_heads
+        .checked_mul(head_dim_qk)
+        .ok_or_else(|| FlashInferError::invalid_argument("q row size overflow"))?;
+    if q_row_size == 0 || q.len() % q_row_size != 0 {
+        return Err(FlashInferError::invalid_argument(
+            "q length must be divisible by num_qo_heads * head_dim_qk",
+        ));
+    }
+    let qo_total = q.len() / q_row_size;
+    if qo_total == 0 {
+        return Err(FlashInferError::invalid_argument(
+            "qo_total inferred from q must be positive",
+        ));
+    }
 
-    let expected_q = qo_total
-        .checked_mul(num_qo_heads)
-        .and_then(|v| v.checked_mul(head_dim_qk))
-        .ok_or_else(|| FlashInferError::invalid_argument("q size overflow"))?;
-    let expected_k = kv_total
-        .checked_mul(num_kv_heads)
-        .and_then(|v| v.checked_mul(head_dim_qk))
-        .ok_or_else(|| FlashInferError::invalid_argument("k size overflow"))?;
-    let expected_v = kv_total
-        .checked_mul(num_kv_heads)
-        .and_then(|v| v.checked_mul(head_dim_vo))
-        .ok_or_else(|| FlashInferError::invalid_argument("v size overflow"))?;
+    let k_row_size = num_kv_heads
+        .checked_mul(head_dim_qk)
+        .ok_or_else(|| FlashInferError::invalid_argument("k row size overflow"))?;
+    if k_row_size == 0 || k.len() % k_row_size != 0 {
+        return Err(FlashInferError::invalid_argument(
+            "k length must be divisible by num_kv_heads * head_dim_qk",
+        ));
+    }
+    let kv_total = k.len() / k_row_size;
+
+    let v_row_size = num_kv_heads
+        .checked_mul(head_dim_vo)
+        .ok_or_else(|| FlashInferError::invalid_argument("v row size overflow"))?;
+    if v_row_size == 0 || v.len() % v_row_size != 0 {
+        return Err(FlashInferError::invalid_argument(
+            "v length must be divisible by num_kv_heads * head_dim_vo",
+        ));
+    }
+    let kv_total_v = v.len() / v_row_size;
+    if kv_total_v != kv_total {
+        return Err(FlashInferError::invalid_argument(
+            "k and v inferred kv lengths must match",
+        ));
+    }
+
     let expected_out = qo_total
         .checked_mul(num_qo_heads)
         .and_then(|v| v.checked_mul(head_dim_vo))
         .ok_or_else(|| FlashInferError::invalid_argument("out size overflow"))?;
-
-    if q.len() != expected_q {
-        return Err(FlashInferError::invalid_argument(format!(
-            "q length ({}) must equal qo_total * num_qo_heads * head_dim_qk ({expected_q})",
-            q.len()
-        )));
-    }
-    if k.len() != expected_k {
-        return Err(FlashInferError::invalid_argument(format!(
-            "k length ({}) must equal kv_total * num_kv_heads * head_dim_qk ({expected_k})",
-            k.len()
-        )));
-    }
-    if v.len() != expected_v {
-        return Err(FlashInferError::invalid_argument(format!(
-            "v length ({}) must equal kv_total * num_kv_heads * head_dim_vo ({expected_v})",
-            v.len()
-        )));
-    }
     if out.len() != expected_out {
         return Err(FlashInferError::invalid_argument(format!(
             "out length ({}) must equal qo_total * num_qo_heads * head_dim_vo ({expected_out})",
@@ -1679,14 +1976,14 @@ where
         )));
     }
 
-    if qo_indptr.len() != qo_indptr_host.len() {
+    if qo_indptr.len() < 2 || kv_indptr.len() < 2 {
         return Err(FlashInferError::invalid_argument(
-            "qo_indptr device length must match qo_indptr_host length",
+            "qo_indptr/kv_indptr lengths must be at least 2",
         ));
     }
-    if kv_indptr.len() != kv_indptr_host.len() {
+    if qo_indptr.len() != kv_indptr.len() {
         return Err(FlashInferError::invalid_argument(
-            "kv_indptr device length must match kv_indptr_host length",
+            "qo_indptr and kv_indptr lengths must match",
         ));
     }
     let float_workspace_len = float_workspace.len();
@@ -1694,11 +1991,6 @@ where
     if float_workspace_len == 0 || int_workspace_len == 0 {
         return Err(FlashInferError::invalid_argument(
             "float/int workspace lengths must be positive",
-        ));
-    }
-    if page_locked_int_workspace.is_empty() {
-        return Err(FlashInferError::invalid_argument(
-            "page_locked_int_workspace length must be positive",
         ));
     }
 
@@ -1715,12 +2007,10 @@ where
         .map_err(|_| FlashInferError::invalid_argument("qo total does not fit in i64"))?;
     let kv_total_i64 = i64::try_from(kv_total)
         .map_err(|_| FlashInferError::invalid_argument("kv total does not fit in i64"))?;
-    let qo_indptr_len_i64 = i64::try_from(qo_indptr_host.len()).map_err(|_| {
-        FlashInferError::invalid_argument("qo_indptr_host length does not fit in i64")
-    })?;
-    let kv_indptr_len_i64 = i64::try_from(kv_indptr_host.len()).map_err(|_| {
-        FlashInferError::invalid_argument("kv_indptr_host length does not fit in i64")
-    })?;
+    let qo_indptr_len_i64 = i64::try_from(qo_indptr.len())
+        .map_err(|_| FlashInferError::invalid_argument("qo_indptr length does not fit in i64"))?;
+    let kv_indptr_len_i64 = i64::try_from(kv_indptr.len())
+        .map_err(|_| FlashInferError::invalid_argument("kv_indptr length does not fit in i64"))?;
     let num_qo_heads_i64 = i64::try_from(num_qo_heads)
         .map_err(|_| FlashInferError::invalid_argument("num_qo_heads does not fit in i64"))?;
     let num_kv_heads_i64 = i64::try_from(num_kv_heads)
@@ -1734,9 +2024,6 @@ where
     })?;
     let int_ws_len_i64 = i64::try_from(int_workspace_len).map_err(|_| {
         FlashInferError::invalid_argument("int_workspace length does not fit in i64")
-    })?;
-    let page_locked_ws_len_i64 = i64::try_from(page_locked_int_workspace.len()).map_err(|_| {
-        FlashInferError::invalid_argument("page_locked_int_workspace length does not fit in i64")
     })?;
 
     let device_id = i32::try_from(stream.context().ordinal())
@@ -1840,16 +2127,6 @@ where
             stride: 1,
             device_id,
         },
-        MhaHostTensor1DI32Desc {
-            ptr: qo_indptr_host.as_ptr().cast(),
-            len: qo_indptr_len_i64,
-            stride: 1,
-        },
-        MhaHostTensor1DI32Desc {
-            ptr: kv_indptr_host.as_ptr().cast(),
-            len: kv_indptr_len_i64,
-            stride: 1,
-        },
         MhaTensor1DU8Desc {
             ptr: float_workspace_ptr as usize as *const c_void,
             len: float_ws_len_i64,
@@ -1861,11 +2138,6 @@ where
             len: int_ws_len_i64,
             stride: 1,
             device_id,
-        },
-        MhaHostTensor1DU8Desc {
-            ptr: page_locked_int_workspace.as_ptr().cast(),
-            len: page_locked_ws_len_i64,
-            stride: 1,
         },
         MhaTensor3DDesc {
             ptr: out_ptr as usize as *const c_void,
@@ -1880,7 +2152,6 @@ where
         },
         stream.cu_stream().cast(),
     )
-    .with_causal(options.causal)
     .with_mask_mode(mask_mode)
     .with_kv_layout(kv_layout)
     .with_pos_encoding_mode(options.pos_encoding_mode)
@@ -1890,65 +2161,42 @@ where
     .with_rope_scale(options.rope_scale)
     .with_rope_theta(options.rope_theta)
     .with_fp16_qk_reduction(options.use_fp16_qk_reduction)
-    .with_enable_pdl(options.enable_pdl)
-    .with_fixed_split_size(options.fixed_split_size)
-    .with_disable_split_kv(options.disable_split_kv)
-    .with_num_colocated_ctas(options.num_colocated_ctas);
+    .with_enable_pdl(options.enable_pdl);
 
     Ok(params)
 }
 
 #[cfg(feature = "cudarc")]
 #[allow(clippy::too_many_arguments)]
-pub fn mha_batch_prefill_cudarc_plan<T, Q, K, V, O, QI, KI, FW, IW>(
+pub fn mha_batch_prefill_cudarc_plan<FW, IW>(
     stream: &cudarc::driver::CudaStream,
-    q: &Q,
-    k: &K,
-    v: &V,
-    qo_indptr: &QI,
-    kv_indptr: &KI,
     qo_indptr_host: &[i32],
     kv_indptr_host: &[i32],
     float_workspace: &mut FW,
     int_workspace: &mut IW,
     page_locked_int_workspace: &mut [u8],
-    out: &mut O,
     num_qo_heads: usize,
     num_kv_heads: usize,
     head_dim_qk: usize,
     head_dim_vo: usize,
-    kv_layout: MhaQkvLayout,
     dtype: DType,
     options: MhaBatchPrefillCudarcOptions,
 ) -> Result<MhaBatchPrefillPlan, FlashInferError>
 where
-    Q: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
-    K: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
-    V: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
-    O: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtrMut<T>,
-    QI: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
-    KI: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
     FW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
     IW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
 {
-    let params = build_batch_prefill_params_from_cudarc(
+    let params = build_batch_prefill_plan_params_from_cudarc(
         stream,
-        q,
-        k,
-        v,
-        qo_indptr,
-        kv_indptr,
         qo_indptr_host,
         kv_indptr_host,
         float_workspace,
         int_workspace,
         page_locked_int_workspace,
-        out,
         num_qo_heads,
         num_kv_heads,
         head_dim_qk,
         head_dim_vo,
-        kv_layout,
         dtype,
         options,
     )?;
@@ -1965,11 +2213,8 @@ pub fn mha_batch_prefill_cudarc_run<T, Q, K, V, O, QI, KI, FW, IW>(
     v: &V,
     qo_indptr: &QI,
     kv_indptr: &KI,
-    qo_indptr_host: &[i32],
-    kv_indptr_host: &[i32],
     float_workspace: &mut FW,
     int_workspace: &mut IW,
-    page_locked_int_workspace: &mut [u8],
     out: &mut O,
     num_qo_heads: usize,
     num_kv_heads: usize,
@@ -1989,18 +2234,15 @@ where
     FW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
     IW: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
 {
-    let params = build_batch_prefill_params_from_cudarc(
+    let params = build_batch_prefill_run_params_from_cudarc(
         stream,
         q,
         k,
         v,
         qo_indptr,
         kv_indptr,
-        qo_indptr_host,
-        kv_indptr_host,
         float_workspace,
         int_workspace,
-        page_locked_int_workspace,
         out,
         num_qo_heads,
         num_kv_heads,
@@ -2022,9 +2264,6 @@ mod tests {
     }
 
     fn valid_params() -> MhaBatchPrefillParams {
-        static QO_HOST: [i32; 3] = [0, 2, 4];
-        static KV_HOST: [i32; 3] = [0, 3, 5];
-
         MhaBatchPrefillParams::new(
             MhaTensor3DDesc {
                 ptr: non_null(),
@@ -2071,6 +2310,38 @@ mod tests {
                 stride: 1,
                 device_id: 0,
             },
+            MhaTensor1DU8Desc {
+                ptr: non_null(),
+                len: 4096,
+                stride: 1,
+                device_id: 0,
+            },
+            MhaTensor1DU8Desc {
+                ptr: non_null(),
+                len: 4096,
+                stride: 1,
+                device_id: 0,
+            },
+            MhaTensor3DDesc {
+                ptr: non_null(),
+                dim0: 4,
+                dim1: 8,
+                dim2: 128,
+                stride0: 1024,
+                stride1: 128,
+                stride2: 1,
+                dtype: DType::F16,
+                device_id: 0,
+            },
+            std::ptr::null_mut(),
+        )
+    }
+
+    fn valid_plan_params() -> MhaBatchPrefillPlanParams {
+        static QO_HOST: [i32; 3] = [0, 2, 4];
+        static KV_HOST: [i32; 3] = [0, 3, 5];
+
+        MhaBatchPrefillPlanParams::new(
             MhaHostTensor1DI32Desc {
                 ptr: QO_HOST.as_ptr().cast(),
                 len: 3,
@@ -2098,17 +2369,15 @@ mod tests {
                 len: 4096,
                 stride: 1,
             },
-            MhaTensor3DDesc {
-                ptr: non_null(),
-                dim0: 4,
-                dim1: 8,
-                dim2: 128,
-                stride0: 1024,
-                stride1: 128,
-                stride2: 1,
-                dtype: DType::F16,
-                device_id: 0,
-            },
+            4,
+            8,
+            4,
+            128,
+            128,
+            DType::F16,
+            DType::F16,
+            DType::F16,
+            0,
             std::ptr::null_mut(),
         )
     }
@@ -2138,6 +2407,12 @@ mod tests {
                 device_id: 0,
             });
         assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn plan_validate_accepts_plan_only_metadata() {
+        let params = valid_plan_params();
+        assert!(params.validate().is_ok());
     }
 
     #[test]
