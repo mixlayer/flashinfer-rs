@@ -46,14 +46,17 @@ Also see FlashInfer installation docs:
 
 This crate now pins wheels at build time via `Cargo.toml` metadata:
 
-- `[package.metadata.flashinfer_rs.pinned_wheels.flashinfer_jit_cache]`
-- `[package.metadata.flashinfer_rs.pinned_wheels.apache_tvm_ffi]`
+- `[package.metadata.flashinfer_rs.pinned_wheels.flashinfer_jit_cache.x86_64]`
+- `[package.metadata.flashinfer_rs.pinned_wheels.flashinfer_jit_cache.aarch64]`
+- `[package.metadata.flashinfer_rs.pinned_wheels.apache_tvm_ffi.x86_64]`
+- `[package.metadata.flashinfer_rs.pinned_wheels.apache_tvm_ffi.aarch64]`
 
 Build flow:
 
-1. `build.rs` downloads each pinned wheel.
-2. `build.rs` verifies wheel SHA256.
-3. `build.rs` embeds wheel bytes via generated `include_bytes!` constants.
+1. `build.rs` selects pinned wheel entries by target architecture (`x86_64` or `aarch64`).
+2. `build.rs` downloads each selected wheel.
+3. `build.rs` verifies wheel SHA256.
+4. `build.rs` embeds wheel bytes via generated `include_bytes!` constants.
 
 Runtime flow:
 

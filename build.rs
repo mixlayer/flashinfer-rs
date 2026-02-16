@@ -25,35 +25,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = manifest_dir.join(MANIFEST_FILE);
 
     let pinned = parse_pinned_wheels(&manifest_path)?;
+    let target_arch = current_target_arch()?;
+    let flashinfer_wheel = select_wheel_metadata(
+        "flashinfer_jit_cache",
+        &pinned.flashinfer_jit_cache,
+        &target_arch,
+    )?;
+    let tvmffi_wheel =
+        select_wheel_metadata("apache_tvm_ffi", &pinned.apache_tvm_ffi, &target_arch)?;
 
     let cache_dir = build_cache_dir()?;
     fs::create_dir_all(&cache_dir)?;
 
-    let cached_flashinfer = ensure_cached_wheel(
-        &cache_dir,
-        "flashinfer_jit_cache",
-        &pinned.flashinfer_jit_cache,
-    )?;
-    let cached_tvmffi = ensure_cached_wheel(&cache_dir, "apache_tvm_ffi", &pinned.apache_tvm_ffi)?;
+    let cached_flashinfer =
+        ensure_cached_wheel(&cache_dir, "flashinfer_jit_cache", flashinfer_wheel)?;
+    let cached_tvmffi = ensure_cached_wheel(&cache_dir, "apache_tvm_ffi", tvmffi_wheel)?;
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let pinned_out_dir = out_dir.join(PINNED_DIR_NAME);
     fs::create_dir_all(&pinned_out_dir)?;
 
-    let staged_flashinfer = stage_wheel_for_include(
-        &cached_flashinfer,
-        &pinned_out_dir,
-        &pinned.flashinfer_jit_cache,
-    )?;
-    let staged_tvmffi =
-        stage_wheel_for_include(&cached_tvmffi, &pinned_out_dir, &pinned.apache_tvm_ffi)?;
+    let staged_flashinfer =
+        stage_wheel_for_include(&cached_flashinfer, &pinned_out_dir, flashinfer_wheel)?;
+    let staged_tvmffi = stage_wheel_for_include(&cached_tvmffi, &pinned_out_dir, tvmffi_wheel)?;
 
     let module_path = out_dir.join(EMBEDDED_WHEELS_RS);
     write_embedded_wheels_module(
         &module_path,
-        &pinned.flashinfer_jit_cache,
+        flashinfer_wheel,
         &staged_flashinfer,
-        &pinned.apache_tvm_ffi,
+        tvmffi_wheel,
         &staged_tvmffi,
     )?;
 
@@ -82,8 +83,14 @@ struct FlashInferRsMetadata {
 
 #[derive(Debug, Deserialize)]
 struct PinnedWheelsMetadata {
-    flashinfer_jit_cache: WheelMetadata,
-    apache_tvm_ffi: WheelMetadata,
+    flashinfer_jit_cache: ArchWheelMetadata,
+    apache_tvm_ffi: ArchWheelMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchWheelMetadata {
+    x86_64: WheelMetadata,
+    aarch64: WheelMetadata,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -105,14 +112,23 @@ fn parse_pinned_wheels(
         .and_then(|m| m.pinned_wheels)
         .ok_or("missing [package.metadata.flashinfer_rs.pinned_wheels] configuration")?;
 
-    validate_wheel_metadata("flashinfer_jit_cache", &pinned.flashinfer_jit_cache)?;
-    validate_wheel_metadata("apache_tvm_ffi", &pinned.apache_tvm_ffi)?;
+    validate_arch_wheel_metadata("flashinfer_jit_cache", &pinned.flashinfer_jit_cache)?;
+    validate_arch_wheel_metadata("apache_tvm_ffi", &pinned.apache_tvm_ffi)?;
 
     Ok(pinned)
 }
 
-fn validate_wheel_metadata(
+fn validate_arch_wheel_metadata(
     name: &'static str,
+    wheels: &ArchWheelMetadata,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_wheel_metadata(&format!("{name}.x86_64"), &wheels.x86_64)?;
+    validate_wheel_metadata(&format!("{name}.aarch64"), &wheels.aarch64)?;
+    Ok(())
+}
+
+fn validate_wheel_metadata(
+    name: &str,
     wheel: &WheelMetadata,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if wheel.filename.trim().is_empty() {
@@ -129,6 +145,32 @@ fn validate_wheel_metadata(
         .into());
     }
     Ok(())
+}
+
+fn current_target_arch() -> Result<String, Box<dyn std::error::Error>> {
+    let arch = env::var("CARGO_CFG_TARGET_ARCH")
+        .unwrap_or_else(|_| env::consts::ARCH.to_string())
+        .trim()
+        .to_string();
+    if arch.is_empty() {
+        return Err("unable to resolve target architecture".into());
+    }
+    Ok(arch)
+}
+
+fn select_wheel_metadata<'a>(
+    wheel_name: &'static str,
+    wheels: &'a ArchWheelMetadata,
+    target_arch: &str,
+) -> Result<&'a WheelMetadata, Box<dyn std::error::Error>> {
+    match target_arch {
+        "x86_64" => Ok(&wheels.x86_64),
+        "aarch64" => Ok(&wheels.aarch64),
+        _ => Err(format!(
+            "unsupported target architecture `{target_arch}` for `{wheel_name}`; supported: x86_64, aarch64"
+        )
+        .into()),
+    }
 }
 
 fn build_cache_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
