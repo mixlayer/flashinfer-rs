@@ -2,6 +2,17 @@
 name = "flashinfer-rs"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
+
+[package.metadata.flashinfer_rs.pinned_wheels.flashinfer_jit_cache]
+filename = "flashinfer_jit_cache-0.6.3+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"
+url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.3/flashinfer_jit_cache-0.6.3+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"
+sha256 = "e5b0560aa02befa2964c76b8f9302959ed9fb2f558765b974753d68c4f8b4e1e"
+
+[package.metadata.flashinfer_rs.pinned_wheels.apache_tvm_ffi]
+filename = "apache_tvm_ffi-0.1.3-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl"
+url = "https://files.pythonhosted.org/packages/49/97/ffe70c4679aebef0c1e32eec3970dc7e35113995d318aeb8c2ef0e4a3eb9/apache_tvm_ffi-0.1.3-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl"
+sha256 = "48ad3df2224f1b0943344895c6cba2f3f0a53bc67ddafdd3e9d7a34f56100aa9"
 
 [features]
 default = []
@@ -21,6 +32,13 @@ libloading = "0.8.6"
 sha2 = "0.10.8"
 thiserror = "2.0.12"
 zip = { version = "2.2.3", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+fs2 = "0.4.3"
+serde = { version = "1.0.218", features = ["derive"] }
+sha2 = "0.10.8"
+toml = "0.8.20"
+ureq = { version = "2.12.1", default-features = true }
 
 [dev-dependencies]
 half = "2.4.1"

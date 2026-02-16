@@ -14,6 +14,13 @@ A Python wheel (`*.whl`) is a zip archive that carries prebuilt artifacts. For t
 
 No Python runtime is required for calling `gemma_rmsnorm` once the `.so` files are extracted.
 
+Build/runtime model in this crate:
+
+1. `build.rs` downloads pinned wheels from `Cargo.toml` metadata.
+2. `build.rs` verifies SHA256 and embeds wheel bytes with generated `include_bytes!`.
+3. Runtime materializes embedded wheels into `~/.cache/flashinfer-rs/wheels/` (or `FLASHINFER_RS_CACHE_DIR/wheels/`).
+4. Runtime extracts required `.so` members from cached wheel files.
+
 ## Artifact Download URLs
 `libtvm_ffi.so` source:
 
@@ -175,12 +182,14 @@ If `profile_ids` is omitted, Rust passes `None` and FlashInfer host code uses it
 ## Runtime configuration knobs
 Environment variables accepted by `flashinfer-rs`:
 
-- `FLASHINFER_RS_JIT_CACHE_WHEEL`
-- `FLASHINFER_RS_TVMFFI_WHEEL`
 - `FLASHINFER_RS_CACHE_DIR`
 
-Extracted artifacts are cached at:
+Runtime wheel cache:
+
+- `~/.cache/flashinfer-rs/wheels/<sha256>-<filename>.whl`
+
+Extracted shared-library cache:
 
 - `~/.cache/flashinfer-rs/<artifact-hash>/`
 
-with a lock file to avoid concurrent extraction races.
+Both wheel materialization and `.so` extraction use lock files to avoid concurrent races.

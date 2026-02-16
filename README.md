@@ -22,6 +22,7 @@ This repository is currently optimized for local/internal Linux x86_64 deploymen
 - NVIDIA GPU + CUDA runtime compatible with the selected wheel set
 - `libcudart.so.13` available at runtime for the CUDA 13 wheel path
 - Rust toolchain (edition 2024)
+- Network access for the first build (the build script downloads pinned wheels)
 
 ## Artifact Sources
 
@@ -41,26 +42,33 @@ Also see FlashInfer installation docs:
 
 - https://docs.flashinfer.ai/installation.html
 
-## Artifact Discovery and Cache
+## Pinned Wheels and Cache
 
-By default the runtime searches for wheels by filename prefix in the current directory:
+This crate now pins wheels at build time via `Cargo.toml` metadata:
 
-- `flashinfer_jit_cache-*.whl`
-- `apache_tvm_ffi-*.whl`
+- `[package.metadata.flashinfer_rs.pinned_wheels.flashinfer_jit_cache]`
+- `[package.metadata.flashinfer_rs.pinned_wheels.apache_tvm_ffi]`
 
-Or set explicit paths:
+Build flow:
 
-- `FLASHINFER_RS_JIT_CACHE_WHEEL`
-- `FLASHINFER_RS_TVMFFI_WHEEL`
+1. `build.rs` downloads each pinned wheel.
+2. `build.rs` verifies wheel SHA256.
+3. `build.rs` embeds wheel bytes via generated `include_bytes!` constants.
+
+Runtime flow:
+
+1. Embedded wheel bytes are materialized to `~/.cache/flashinfer-rs/wheels/` (or `FLASHINFER_RS_CACHE_DIR/wheels/`).
+2. Existing cached wheel files are SHA256-validated and rewritten if mismatched.
+3. Required `.so` members are extracted from cached wheel files into:
+   - `~/.cache/flashinfer-rs/<artifact-hash>/`
+
+Runtime env vars:
+
 - `FLASHINFER_RS_CACHE_DIR`
-
-Extracted libraries are cached under:
-
-- `~/.cache/flashinfer-rs/<artifact-hash>/`
 
 ## Quick Start
 
-1. Place both wheel files in the repo directory (or set env vars above).
+1. Build the crate (first build downloads pinned wheels from metadata URLs).
 2. Initialize runtime once:
 
 ```rust

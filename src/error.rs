@@ -10,9 +10,6 @@ pub enum FlashInferError {
     #[error("invalid environment variable `{name}`: {message}")]
     InvalidEnvironment { name: &'static str, message: String },
 
-    #[error("required artifact not found: {what}. {hint}")]
-    ArtifactNotFound { what: &'static str, hint: String },
-
     #[error("failed to open wheel `{wheel}`")]
     WheelOpen {
         wheel: PathBuf,
@@ -89,11 +86,22 @@ pub enum FlashInferError {
         source: std::io::Error,
     },
 
-    #[error("failed to read metadata for `{path}`")]
-    Metadata {
+    #[error("embedded wheel cache I/O failed for `{wheel}` at `{path}`")]
+    EmbeddedWheelCache {
+        wheel: &'static str,
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+
+    #[error(
+        "embedded wheel checksum mismatch for `{wheel}` at `{path}`: expected {expected}, found {found}"
+    )]
+    EmbeddedWheelChecksumMismatch {
+        wheel: &'static str,
+        path: PathBuf,
+        expected: String,
+        found: String,
     },
 
     #[error("runtime has already been initialized with a different configuration")]
