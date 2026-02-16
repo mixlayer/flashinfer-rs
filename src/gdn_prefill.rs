@@ -2,8 +2,8 @@ use std::ffi::c_void;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    any_dltensor_ptr, any_f64, any_none, DLDataType, DLDevice, DLTensor, TVMFFIAny, KDL_BFLOAT,
-    KDL_CUDA, KDL_FLOAT, KDL_INT, KDL_UINT,
+    DLDataType, DLDevice, DLTensor, KDL_BFLOAT, KDL_CUDA, KDL_FLOAT, KDL_INT, KDL_UINT, TVMFFIAny,
+    any_dltensor_ptr, any_f64, any_none,
 };
 use crate::norm::DType;
 use crate::runtime::FlashInferRuntime;

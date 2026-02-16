@@ -8,6 +8,7 @@ This file documents the expected process for adding new FlashInfer kernel bindin
 - We use pure Rust TVM-FFI call packing at the boundary.
 - We always add `cudarc` wrappers for each public kernel API.
 - We keep launch semantics async (no implicit synchronize in core APIs).
+- For kernels with planning + launch stages, we always expose explicit `plan` and `run` APIs and never implicitly combine them in a single public launch call.
 - We validate aggressively in Rust before crossing FFI.
 
 ## Kernel-Binding Workflow

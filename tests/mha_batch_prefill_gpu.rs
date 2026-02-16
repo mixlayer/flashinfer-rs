@@ -1,7 +1,10 @@
 #![cfg(feature = "cudarc")]
 
 use cudarc::driver::CudaContext;
-use flashinfer_rs::{DType, MhaBatchPrefillCudarcOptions, MhaQkvLayout, mha_batch_prefill_cudarc};
+use flashinfer_rs::{
+    DType, MhaBatchPrefillCudarcOptions, MhaQkvLayout, mha_batch_prefill_cudarc_plan,
+    mha_batch_prefill_cudarc_run,
+};
 
 fn should_run_gpu_tests() -> bool {
     std::env::var("FLASHINFER_RS_RUN_GPU_TESTS").ok().as_deref() == Some("1")
@@ -67,7 +70,7 @@ fn gpu_smoke_launch_batch_prefill_ragged() {
         ..Default::default()
     };
 
-    mha_batch_prefill_cudarc(
+    let plan = mha_batch_prefill_cudarc_plan(
         stream.as_ref(),
         &q_dev,
         &k_dev,
@@ -88,7 +91,31 @@ fn gpu_smoke_launch_batch_prefill_ragged() {
         DType::F16,
         options,
     )
-    .expect("launch batch prefill ragged");
+    .expect("plan batch prefill ragged");
+
+    mha_batch_prefill_cudarc_run(
+        stream.as_ref(),
+        &plan,
+        &q_dev,
+        &k_dev,
+        &v_dev,
+        &qo_indptr_dev,
+        &kv_indptr_dev,
+        &qo_indptr_host,
+        &kv_indptr_host,
+        &mut float_workspace,
+        &mut int_workspace,
+        &mut page_locked_int_workspace,
+        &mut out_dev,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo,
+        MhaQkvLayout::Nhd,
+        DType::F16,
+        options,
+    )
+    .expect("run batch prefill ragged");
 
     stream.synchronize().expect("synchronize");
 }

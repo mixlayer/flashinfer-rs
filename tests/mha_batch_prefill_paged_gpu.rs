@@ -2,7 +2,8 @@
 
 use cudarc::driver::CudaContext;
 use flashinfer_rs::{
-    DType, MhaBatchPrefillCudarcOptions, MhaQkvLayout, mha_batch_prefill_paged_cudarc,
+    DType, MhaBatchPrefillCudarcOptions, MhaQkvLayout, mha_batch_prefill_paged_cudarc_plan,
+    mha_batch_prefill_paged_cudarc_run,
 };
 
 fn should_run_gpu_tests() -> bool {
@@ -83,7 +84,7 @@ fn gpu_smoke_launch_batch_prefill_paged() {
         ..Default::default()
     };
 
-    mha_batch_prefill_paged_cudarc(
+    let plan = mha_batch_prefill_paged_cudarc_plan(
         stream.as_ref(),
         &q_dev,
         &paged_k_dev,
@@ -108,7 +109,35 @@ fn gpu_smoke_launch_batch_prefill_paged() {
         DType::F16,
         options,
     )
-    .expect("launch batch prefill paged");
+    .expect("plan batch prefill paged");
+
+    mha_batch_prefill_paged_cudarc_run(
+        stream.as_ref(),
+        &plan,
+        &q_dev,
+        &paged_k_dev,
+        &paged_v_dev,
+        &qo_indptr_dev,
+        &paged_kv_indptr_dev,
+        &paged_kv_indices_dev,
+        &paged_kv_last_page_len_dev,
+        &qo_indptr_host,
+        &paged_kv_indptr_host,
+        &kv_len_arr_host,
+        &mut float_workspace,
+        &mut int_workspace,
+        &mut page_locked_int_workspace,
+        &mut out_dev,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo,
+        page_size,
+        MhaQkvLayout::Nhd,
+        DType::F16,
+        options,
+    )
+    .expect("run batch prefill paged");
 
     stream.synchronize().expect("synchronize");
 }

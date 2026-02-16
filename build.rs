@@ -263,8 +263,8 @@ fn detect_build_host_cuda_tag() -> Result<CudaTag, Box<dyn std::error::Error>> {
     Err("unable to detect CUDA build-host version; expected CUDA version.json under CUDA_HOME/CUDA_PATH/CUDA_ROOT or /usr/local/cuda, or a working `nvcc --version`".into())
 }
 
-fn detect_cuda_version_from_version_json(
-) -> Result<Option<(String, String)>, Box<dyn std::error::Error>> {
+fn detect_cuda_version_from_version_json()
+-> Result<Option<(String, String)>, Box<dyn std::error::Error>> {
     for path in cuda_version_json_candidates() {
         if !path.is_file() {
             continue;

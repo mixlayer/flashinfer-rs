@@ -228,7 +228,8 @@ mha_single_prefill(&params)?;
 
 ```rust
 use flashinfer_rs::{
-    DType, MhaBatchPrefillCudarcOptions, MhaQkvLayout, mha_batch_prefill_cudarc,
+    DType, MhaBatchPrefillCudarcOptions, MhaQkvLayout, mha_batch_prefill_cudarc_plan,
+    mha_batch_prefill_cudarc_run,
 };
 
 let options = MhaBatchPrefillCudarcOptions {
@@ -236,7 +237,7 @@ let options = MhaBatchPrefillCudarcOptions {
     ..Default::default()
 };
 
-mha_batch_prefill_cudarc(
+let ragged_prefill_plan = mha_batch_prefill_cudarc_plan(
     stream.as_ref(),
     &q,
     &k,
@@ -257,13 +258,37 @@ mha_batch_prefill_cudarc(
     DType::F16,
     options,
 )?;
+
+mha_batch_prefill_cudarc_run(
+    stream.as_ref(),
+    &ragged_prefill_plan,
+    &q,
+    &k,
+    &v,
+    &qo_indptr_dev,
+    &kv_indptr_dev,
+    &qo_indptr_host,
+    &kv_indptr_host,
+    &mut float_workspace,
+    &mut int_workspace,
+    &mut page_locked_int_workspace,
+    &mut out,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    MhaQkvLayout::Nhd,
+    DType::F16,
+    options,
+)?;
 ```
 
 ## API Example: MHA Batched Paged Prefill (`cudarc`)
 
 ```rust
 use flashinfer_rs::{
-    DType, MhaBatchPrefillCudarcOptions, MhaQkvLayout, mha_batch_prefill_paged_cudarc,
+    DType, MhaBatchPrefillCudarcOptions, MhaQkvLayout, mha_batch_prefill_paged_cudarc_plan,
+    mha_batch_prefill_paged_cudarc_run,
 };
 
 let options = MhaBatchPrefillCudarcOptions {
@@ -271,8 +296,35 @@ let options = MhaBatchPrefillCudarcOptions {
     ..Default::default()
 };
 
-mha_batch_prefill_paged_cudarc(
+let paged_prefill_plan = mha_batch_prefill_paged_cudarc_plan(
     stream.as_ref(),
+    &q,
+    &paged_k_cache,
+    &paged_v_cache,
+    &qo_indptr_dev,
+    &paged_kv_indptr_dev,
+    &paged_kv_indices_dev,
+    &paged_kv_last_page_len_dev,
+    &qo_indptr_host,
+    &paged_kv_indptr_host,
+    &kv_len_arr_host,
+    &mut float_workspace,
+    &mut int_workspace,
+    &mut page_locked_int_workspace,
+    &mut out,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    page_size,
+    MhaQkvLayout::Nhd,
+    DType::F16,
+    options,
+)?;
+
+mha_batch_prefill_paged_cudarc_run(
+    stream.as_ref(),
+    &paged_prefill_plan,
     &q,
     &paged_k_cache,
     &paged_v_cache,
