@@ -22,7 +22,7 @@ This repository is currently optimized for local/internal Linux x86_64 deploymen
 - NVIDIA GPU + CUDA runtime compatible with the selected wheel set
 - `libcudart.so.13` available at runtime for the CUDA 13 wheel path
 - Rust toolchain (edition 2024)
-- Network access for the first build (the build script downloads pinned wheels)
+- Network access for first runtime initialization on a cold cache
 
 ## Artifact Sources
 
@@ -60,13 +60,11 @@ This crate now pins wheels at build time via `Cargo.toml` metadata:
 Build flow:
 
 1. `build.rs` detects build-host CUDA version (13.0 or 13.1) and target architecture (`x86_64` or `aarch64`) to select pinned wheel entries.
-2. `build.rs` downloads each selected wheel.
-3. `build.rs` verifies wheel SHA256.
-4. `build.rs` embeds wheel bytes via generated `include_bytes!` constants.
+2. `build.rs` emits selected pinned wheel metadata (filename, URL, SHA256) into generated constants.
 
 Runtime flow:
 
-1. Embedded wheel bytes are materialized to `~/.cache/flashinfer-rs/wheels/` (or `FLASHINFER_RS_CACHE_DIR/wheels/`).
+1. Runtime downloads pinned wheels into `~/.cache/flashinfer-rs/wheels/` (or `FLASHINFER_RS_CACHE_DIR/wheels/`) on cache miss.
 2. Existing cached wheel files are SHA256-validated and rewritten if mismatched.
 3. Required `.so` members are extracted from cached wheel files into:
    - `~/.cache/flashinfer-rs/<artifact-hash>/`
@@ -77,7 +75,7 @@ Runtime env vars:
 
 ## Quick Start
 
-1. Build the crate (first build downloads pinned wheels from metadata URLs).
+1. Build the crate.
 2. Initialize runtime once:
 
 ```rust

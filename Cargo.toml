@@ -65,14 +65,12 @@ libc = "0.2.170"
 libloading = "0.8.6"
 sha2 = "0.10.8"
 thiserror = "2.0.12"
+ureq = { version = "2.12.1", default-features = true }
 zip = { version = "2.2.3", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
-fs2 = "0.4.3"
 serde = { version = "1.0.218", features = ["derive"] }
-sha2 = "0.10.8"
 toml = "0.8.20"
-ureq = { version = "2.12.1", default-features = true }
 
 [dev-dependencies]
 half = "2.4.1"

@@ -96,11 +96,11 @@ struct MaterializedWheels {
 }
 
 #[derive(Clone, Copy)]
-struct EmbeddedWheel<'a> {
+struct PinnedWheelMetadata<'a> {
     logical_name: &'static str,
     filename: &'a str,
+    url: &'a str,
     sha256_hex: &'a str,
-    bytes: &'a [u8],
 }
 
 struct LoadedKernel {
@@ -750,7 +750,7 @@ impl FlashInferRuntime {
     }
 
     unsafe fn load(resolved: ResolvedRuntimeConfig) -> Result<Self, FlashInferError> {
-        let materialized_wheels = materialize_embedded_wheels(&resolved.cache_dir)?;
+        let materialized_wheels = ensure_pinned_wheels_cached(&resolved.cache_dir)?;
         let artifacts = extract_artifacts(&resolved, &materialized_wheels)?;
 
         let tvmffi_lib = unsafe {
@@ -1077,25 +1077,25 @@ fn extract_artifacts(
     })
 }
 
-fn embedded_flashinfer_jit_cache_wheel() -> EmbeddedWheel<'static> {
-    EmbeddedWheel {
+fn pinned_flashinfer_jit_cache_wheel() -> PinnedWheelMetadata<'static> {
+    PinnedWheelMetadata {
         logical_name: "flashinfer_jit_cache",
         filename: PINNED_FLASHINFER_JIT_CACHE_WHEEL_FILENAME,
+        url: PINNED_FLASHINFER_JIT_CACHE_WHEEL_URL,
         sha256_hex: PINNED_FLASHINFER_JIT_CACHE_WHEEL_SHA256,
-        bytes: PINNED_FLASHINFER_JIT_CACHE_WHEEL_BYTES,
     }
 }
 
-fn embedded_apache_tvm_ffi_wheel() -> EmbeddedWheel<'static> {
-    EmbeddedWheel {
+fn pinned_apache_tvm_ffi_wheel() -> PinnedWheelMetadata<'static> {
+    PinnedWheelMetadata {
         logical_name: "apache_tvm_ffi",
         filename: PINNED_APACHE_TVM_FFI_WHEEL_FILENAME,
+        url: PINNED_APACHE_TVM_FFI_WHEEL_URL,
         sha256_hex: PINNED_APACHE_TVM_FFI_WHEEL_SHA256,
-        bytes: PINNED_APACHE_TVM_FFI_WHEEL_BYTES,
     }
 }
 
-fn materialize_embedded_wheels(cache_dir: &Path) -> Result<MaterializedWheels, FlashInferError> {
+fn ensure_pinned_wheels_cached(cache_dir: &Path) -> Result<MaterializedWheels, FlashInferError> {
     let wheels_dir = cache_dir.join(WHEEL_CACHE_DIR_NAME);
     fs::create_dir_all(&wheels_dir).map_err(|e| FlashInferError::CreateCacheDir {
         path: wheels_dir.clone(),
@@ -1103,9 +1103,8 @@ fn materialize_embedded_wheels(cache_dir: &Path) -> Result<MaterializedWheels, F
     })?;
 
     let jit_cache_wheel_path =
-        materialize_embedded_wheel(&wheels_dir, embedded_flashinfer_jit_cache_wheel())?;
-    let tvmffi_wheel_path =
-        materialize_embedded_wheel(&wheels_dir, embedded_apache_tvm_ffi_wheel())?;
+        ensure_pinned_wheel_cached(&wheels_dir, pinned_flashinfer_jit_cache_wheel())?;
+    let tvmffi_wheel_path = ensure_pinned_wheel_cached(&wheels_dir, pinned_apache_tvm_ffi_wheel())?;
 
     Ok(MaterializedWheels {
         jit_cache_wheel_path,
@@ -1113,10 +1112,22 @@ fn materialize_embedded_wheels(cache_dir: &Path) -> Result<MaterializedWheels, F
     })
 }
 
-fn materialize_embedded_wheel(
+fn ensure_pinned_wheel_cached(
     wheels_dir: &Path,
-    wheel: EmbeddedWheel<'_>,
+    wheel: PinnedWheelMetadata<'_>,
 ) -> Result<PathBuf, FlashInferError> {
+    ensure_pinned_wheel_cached_with_downloader(wheels_dir, wheel, download_pinned_wheel)
+}
+
+fn ensure_pinned_wheel_cached_with_downloader<F>(
+    wheels_dir: &Path,
+    wheel: PinnedWheelMetadata<'_>,
+    mut downloader: F,
+) -> Result<PathBuf, FlashInferError>
+where
+    F: FnMut(&Path, PinnedWheelMetadata<'_>) -> Result<(), FlashInferError>,
+{
+    cleanup_stale_download_temps(wheels_dir, wheel);
     let output_path = wheels_dir.join(format!("{}-{}", wheel.sha256_hex, wheel.filename));
     let lock_path = output_path.with_extension("lock");
     let lock_file = OpenOptions::new()
@@ -1143,16 +1154,67 @@ fn materialize_embedded_wheel(
     }
 
     if needs_write {
-        write_embedded_wheel_file(&output_path, wheel)?;
+        if output_path.exists() {
+            fs::remove_file(&output_path).map_err(|e| FlashInferError::EmbeddedWheelCache {
+                wheel: wheel.logical_name,
+                path: output_path.clone(),
+                source: e,
+            })?;
+        }
+        downloader(&output_path, wheel)?;
     }
 
     let _ = lock_file.unlock();
     Ok(output_path)
 }
 
-fn write_embedded_wheel_file(
+fn cleanup_stale_download_temps(wheels_dir: &Path, wheel: PinnedWheelMetadata<'_>) {
+    let Ok(entries) = fs::read_dir(wheels_dir) else {
+        return;
+    };
+    let modern_prefix = format!("{}-{}.tmp-", wheel.sha256_hex, wheel.filename);
+    let legacy_prefix = format!(
+        "{}-{}.tmp-",
+        wheel.sha256_hex,
+        wheel.filename.trim_end_matches(".whl")
+    );
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&modern_prefix) || name.starts_with(&legacy_prefix) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn download_pinned_wheel(
     output_path: &Path,
-    wheel: EmbeddedWheel<'_>,
+    wheel: PinnedWheelMetadata<'_>,
+) -> Result<(), FlashInferError> {
+    let response =
+        ureq::get(wheel.url)
+            .call()
+            .map_err(|e| FlashInferError::EmbeddedWheelCache {
+                wheel: wheel.logical_name,
+                path: output_path.to_path_buf(),
+                source: io::Error::other(format!(
+                    "failed to download `{}` from `{}`: {e}",
+                    wheel.logical_name, wheel.url
+                )),
+            })?;
+    let mut reader = response.into_reader();
+    write_wheel_from_reader(&mut reader, output_path, wheel)
+}
+
+fn write_wheel_from_reader<R: Read>(
+    reader: &mut R,
+    output_path: &Path,
+    wheel: PinnedWheelMetadata<'_>,
 ) -> Result<(), FlashInferError> {
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).map_err(|e| FlashInferError::CreateCacheDir {
@@ -1161,17 +1223,12 @@ fn write_embedded_wheel_file(
         })?;
     }
 
-    let digest = sha256_bytes_hex(wheel.bytes);
-    if digest != wheel.sha256_hex {
-        return Err(FlashInferError::EmbeddedWheelChecksumMismatch {
-            wheel: wheel.logical_name,
-            path: output_path.to_path_buf(),
-            expected: wheel.sha256_hex.to_string(),
-            found: digest,
-        });
+    let temp_path = output_path.with_extension(format!("tmp-{}", std::process::id()));
+    if temp_path.exists() {
+        let _ = fs::remove_file(&temp_path);
     }
 
-    let temp_path = output_path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut hasher = Sha256::new();
     {
         let mut out =
             File::create(&temp_path).map_err(|e| FlashInferError::EmbeddedWheelCache {
@@ -1179,12 +1236,28 @@ fn write_embedded_wheel_file(
                 path: output_path.to_path_buf(),
                 source: e,
             })?;
-        out.write_all(wheel.bytes)
-            .map_err(|e| FlashInferError::EmbeddedWheelCache {
-                wheel: wheel.logical_name,
-                path: output_path.to_path_buf(),
-                source: e,
-            })?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read =
+                reader
+                    .read(&mut buffer)
+                    .map_err(|e| FlashInferError::EmbeddedWheelCache {
+                        wheel: wheel.logical_name,
+                        path: output_path.to_path_buf(),
+                        source: e,
+                    })?;
+            if read == 0 {
+                break;
+            }
+            let chunk = &buffer[..read];
+            out.write_all(chunk)
+                .map_err(|e| FlashInferError::EmbeddedWheelCache {
+                    wheel: wheel.logical_name,
+                    path: output_path.to_path_buf(),
+                    source: e,
+                })?;
+            hasher.update(chunk);
+        }
         out.sync_all()
             .map_err(|e| FlashInferError::EmbeddedWheelCache {
                 wheel: wheel.logical_name,
@@ -1193,12 +1266,42 @@ fn write_embedded_wheel_file(
             })?;
     }
 
-    fs::rename(&temp_path, output_path).map_err(|e| FlashInferError::EmbeddedWheelCache {
-        wheel: wheel.logical_name,
-        path: output_path.to_path_buf(),
-        source: e,
-    })?;
-    Ok(())
+    let found = format!("{:x}", hasher.finalize());
+    if found != wheel.sha256_hex {
+        let _ = fs::remove_file(&temp_path);
+        return Err(FlashInferError::EmbeddedWheelChecksumMismatch {
+            wheel: wheel.logical_name,
+            path: output_path.to_path_buf(),
+            expected: wheel.sha256_hex.to_string(),
+            found,
+        });
+    }
+
+    match fs::rename(&temp_path, output_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temp_path);
+            let existing = sha256_file_hex(output_path, wheel.logical_name)?;
+            if existing == wheel.sha256_hex {
+                Ok(())
+            } else {
+                Err(FlashInferError::EmbeddedWheelChecksumMismatch {
+                    wheel: wheel.logical_name,
+                    path: output_path.to_path_buf(),
+                    expected: wheel.sha256_hex.to_string(),
+                    found: existing,
+                })
+            }
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&temp_path);
+            Err(FlashInferError::EmbeddedWheelCache {
+                wheel: wheel.logical_name,
+                path: output_path.to_path_buf(),
+                source: err,
+            })
+        }
+    }
 }
 
 fn extract_jit_kernel(
@@ -1458,6 +1561,7 @@ mod tests {
         DLDataType, DLDevice, DLTensor, KDL_CUDA, KDL_FLOAT, TVMFFIAny, any_bool, any_dltensor_ptr,
         any_f64, any_none,
     };
+    use std::io::Cursor;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -1486,47 +1590,64 @@ mod tests {
     }
 
     #[test]
-    fn materialize_wheel_creates_missing_file() {
+    fn ensure_pinned_wheel_cached_creates_missing_file() {
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let wheels_dir = tmpdir.path().join("wheels");
         fs::create_dir_all(&wheels_dir).expect("create wheels dir");
 
         let bytes = b"wheel-bytes-v1";
         let sha = sha256_bytes_hex(bytes);
-        let wheel = EmbeddedWheel {
+        let wheel = PinnedWheelMetadata {
             logical_name: "test_wheel",
             filename: "test.whl",
+            url: "https://unused.invalid/test.whl",
             sha256_hex: &sha,
-            bytes,
         };
 
-        let output_path = materialize_embedded_wheel(&wheels_dir, wheel).expect("materialize");
+        let output_path =
+            ensure_pinned_wheel_cached_with_downloader(&wheels_dir, wheel, |output_path, wheel| {
+                let mut reader = Cursor::new(bytes.as_slice());
+                write_wheel_from_reader(&mut reader, output_path, wheel)
+            })
+            .expect("cache wheel");
         let written = fs::read(&output_path).expect("read output");
         assert_eq!(written, bytes);
     }
 
     #[test]
-    fn materialize_wheel_reuses_when_checksum_matches() {
+    fn ensure_pinned_wheel_cached_reuses_when_checksum_matches() {
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let wheels_dir = tmpdir.path().join("wheels");
         fs::create_dir_all(&wheels_dir).expect("create wheels dir");
 
         let bytes = b"wheel-bytes-v2";
         let sha = sha256_bytes_hex(bytes);
-        let wheel = EmbeddedWheel {
+        let wheel = PinnedWheelMetadata {
             logical_name: "test_wheel",
             filename: "reuse.whl",
+            url: "https://unused.invalid/reuse.whl",
             sha256_hex: &sha,
-            bytes,
         };
 
-        let output_path = materialize_embedded_wheel(&wheels_dir, wheel).expect("materialize 1");
+        let output_path =
+            ensure_pinned_wheel_cached_with_downloader(&wheels_dir, wheel, |output_path, wheel| {
+                let mut reader = Cursor::new(bytes.as_slice());
+                write_wheel_from_reader(&mut reader, output_path, wheel)
+            })
+            .expect("cache wheel 1");
         let before = fs::metadata(&output_path)
             .expect("metadata 1")
             .modified()
             .expect("modified 1");
         std::thread::sleep(Duration::from_millis(1100));
-        let output_path_2 = materialize_embedded_wheel(&wheels_dir, wheel).expect("materialize 2");
+        let output_path_2 = ensure_pinned_wheel_cached_with_downloader(
+            &wheels_dir,
+            wheel,
+            |_output_path, _wheel| {
+                panic!("downloader should not be called on cache hit");
+            },
+        )
+        .expect("cache wheel 2");
         let after = fs::metadata(&output_path_2)
             .expect("metadata 2")
             .modified()
@@ -1537,7 +1658,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_wheel_rewrites_when_checksum_mismatch() {
+    fn ensure_pinned_wheel_cached_rewrites_when_checksum_mismatch() {
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let wheels_dir = tmpdir.path().join("wheels");
         fs::create_dir_all(&wheels_dir).expect("create wheels dir");
@@ -1547,16 +1668,53 @@ mod tests {
         let target_path = wheels_dir.join(format!("{sha}-rewrite.whl"));
         fs::write(&target_path, b"corrupt-data").expect("write corrupt");
 
-        let wheel = EmbeddedWheel {
+        let wheel = PinnedWheelMetadata {
             logical_name: "test_wheel",
             filename: "rewrite.whl",
+            url: "https://unused.invalid/rewrite.whl",
             sha256_hex: &sha,
-            bytes,
         };
 
-        let output_path = materialize_embedded_wheel(&wheels_dir, wheel).expect("materialize");
+        let output_path =
+            ensure_pinned_wheel_cached_with_downloader(&wheels_dir, wheel, |output_path, wheel| {
+                let mut reader = Cursor::new(bytes.as_slice());
+                write_wheel_from_reader(&mut reader, output_path, wheel)
+            })
+            .expect("cache wheel");
         let written = fs::read(&output_path).expect("read output");
         assert_eq!(written, bytes);
+    }
+
+    #[test]
+    fn write_wheel_from_reader_checksum_mismatch_leaves_no_output() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let wheels_dir = tmpdir.path().join("wheels");
+        fs::create_dir_all(&wheels_dir).expect("create wheels dir");
+
+        let good_bytes = b"wheel-bytes-expected";
+        let bad_bytes = b"wheel-bytes-actual";
+        let sha = sha256_bytes_hex(good_bytes);
+        let output_path = wheels_dir.join(format!("{sha}-bad.whl"));
+        let wheel = PinnedWheelMetadata {
+            logical_name: "test_wheel",
+            filename: "bad.whl",
+            url: "https://unused.invalid/bad.whl",
+            sha256_hex: &sha,
+        };
+
+        let mut reader = Cursor::new(bad_bytes.as_slice());
+        let err = write_wheel_from_reader(&mut reader, &output_path, wheel)
+            .expect_err("checksum mismatch expected");
+
+        match err {
+            FlashInferError::EmbeddedWheelChecksumMismatch { .. } => {}
+            other => panic!("unexpected error variant: {other}"),
+        }
+
+        assert!(
+            !output_path.exists(),
+            "output should not exist on checksum mismatch"
+        );
     }
 
     #[test]

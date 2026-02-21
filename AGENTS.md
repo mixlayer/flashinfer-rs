@@ -5,6 +5,8 @@ This file documents the expected process for adding new FlashInfer kernel bindin
 ## Scope and Principles
 
 - We bind precompiled kernels from wheels, not ad-hoc local builds, unless explicitly requested.
+- We do not embed wheel bytes with `include_bytes!`; `build.rs` emits pinned wheel metadata (`filename`, `url`, `sha256`) only.
+- Wheel bytes are fetched at runtime on cache miss with synchronous I/O (no async runtime dependency).
 - We use pure Rust TVM-FFI call packing at the boundary.
 - We always add `cudarc` wrappers for each public kernel API.
 - We keep launch semantics async (no implicit synchronize in core APIs).
@@ -53,6 +55,9 @@ This file documents the expected process for adding new FlashInfer kernel bindin
 5. Runtime loading integration
 - If symbol is fixed: resolve during runtime init and store function pointer.
 - If symbol is variant-dependent: lazy extract/load by URI and cache library+function pointer for process lifetime.
+- Keep wheel cache under `<cache_dir>/wheels/<sha256>-<filename>` with lock-file protection and SHA256 verification.
+- On checksum mismatch, rewrite the cached wheel from the pinned URL.
+- Keep wheel download logic synchronous and streaming; do not introduce async runtime dependencies.
 - Keep `libtvm_ffi.so` loaded first with `RTLD_GLOBAL`.
 
 6. Add cudarc wrapper (required)
@@ -103,6 +108,7 @@ Primary files to inspect:
 ## Gotchas and Notes for Future Bindings
 
 - Wheel naming does not guarantee architecture suffix in URI; always inspect actual wheel members.
+- `build.rs` no longer downloads wheels; first runtime initialization on a cold cache performs network download and may block.
 - A generic host symbol (`__tvm_ffi_run`) can correspond to different ABI shapes across module families.
 - Do not infer ABI from cubin symbols; use host binding sources.
 - Optional parameters often map to `None`/null tensor slots and must preserve positional ABI.
@@ -143,11 +149,13 @@ Practical implication for Rust bindings:
 ## PR/Change Checklist
 
 - [ ] Wheel artifact path(s) identified and verified.
+- [ ] `build.rs` metadata constants updated/verified (`filename`, `url`, `sha256`) for selected wheel matrix.
 - [ ] Exported host symbol(s) verified from target `.so`.
 - [ ] ABI/order confirmed from submodule source and wrapper calls.
 - [ ] Field-level shape docs added/updated for all `*Params` struct fields.
 - [ ] Rust typed API + validation implemented.
 - [ ] Runtime loading strategy implemented (fixed vs lazy URI).
+- [ ] Runtime wheel cache/download path validated (SHA256 check + lock behavior, no async runtime introduced).
 - [ ] `cudarc` wrapper added.
 - [ ] Unit tests added/updated.
 - [ ] Wheel launch smoke test added/updated for ABI regression coverage.
