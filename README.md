@@ -399,15 +399,68 @@ FlashInfer host wrappers dispatch to architecture-specific kernels at runtime.
 
 ## Testing
 
+Unit tests (no GPU required):
+
 ```bash
 cargo test
 cargo test --features cudarc
+```
+
+GPU smoke tests (require `FLASHINFER_RS_RUN_GPU_TESTS=1` and a compatible GPU):
+
+```bash
 FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test gemma_rmsnorm_gpu
 FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test rmsnorm_gpu
 FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test mha_batch_prefill_gpu
 FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test mha_batch_prefill_paged_gpu
 FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test mha_decode_gpu
 ```
+
+### GDN Prefill Stress Tests
+
+`tests/gdn_prefill_stress_gpu.rs` contains stress tests for the
+`FlatKernelTmaWarpSpecializedDeltaRule` CUTLASS kernel, targeting
+synchronization and race-condition bugs in the warp-specialized pipeline.
+**Requires an SM 9.0 (Hopper) GPU** -- H100 or H200.
+
+Run all stress tests sequentially (recommended to isolate hangs):
+
+```bash
+FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test gdn_prefill_stress_gpu -- --test-threads=1
+```
+
+Run all stress tests concurrently for maximum stress:
+
+```bash
+FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test gdn_prefill_stress_gpu
+```
+
+Run a single test case:
+
+```bash
+FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test gdn_prefill_stress_gpu stress_gdn_prefill_qwen3_next_multi_stream_chained -- --test-threads=1
+```
+
+Each test has a 60-second watchdog. If `stream.synchronize()` does not return
+within that window, the test fails with `HANG DETECTED` instead of blocking
+forever. Adjust the `HANG_TIMEOUT` constant in the test file if needed.
+
+Test coverage:
+
+| Test | Kernel path exercised |
+|------|----------------------|
+| `stress_gdn_prefill_mixed_seqlens` | Tile scheduler with sub/at/above 64-token tile boundaries |
+| `stress_gdn_prefill_many_single_token_seqs` | Degenerate single-tile path (first == final block) |
+| `stress_gdn_prefill_rapid_fire_no_sync` | 50 back-to-back async launches, GVA + alpha/beta |
+| `stress_gdn_prefill_all_options_gqa` | GQA + alpha + beta + input_state + explicit scale |
+| `stress_gdn_prefill_all_options_gva` | GVA (`IsGVA=true`) + alpha + beta + input_state |
+| `stress_gdn_prefill_state_chain_with_gates` | Qwen3-Next GVA, 20-step state chain with alpha/beta |
+| `stress_gdn_prefill_multi_stream` | 4 concurrent streams, mixed GQA/GVA configs |
+| `stress_gdn_prefill_gqa_head_ratios` | GQA head ratios: 4:1, 6:2, 8:2, 8:4, 16:4 |
+| `stress_gdn_prefill_gva_head_ratios` | GVA head ratios: 1:2, 2:4, 4:8, 16:32 |
+| `stress_gdn_prefill_extreme_disparity` | 64 single-token seqs + 1 1024-token seq, GVA |
+| `stress_gdn_prefill_bf16_gva_all_options` | BF16 dtype, GVA + all options |
+| `stress_gdn_prefill_qwen3_next_multi_stream_chained` | Full production config: GVA q=k=16/v=32, alpha+beta, state chain, 4 concurrent streams |
 
 ## Additional Notes
 
