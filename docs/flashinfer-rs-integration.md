@@ -17,9 +17,9 @@ No Python runtime is required for calling `gemma_rmsnorm` once the `.so` files a
 Build/runtime model in this crate:
 
 1. `build.rs` selects pinned wheel entries from `Cargo.toml` by build-host CUDA version (`cu130`/`cu131`) and target architecture (`x86_64` or `aarch64`).
-2. `build.rs` downloads the selected wheels.
-3. `build.rs` verifies SHA256 and embeds wheel bytes with generated `include_bytes!`.
-4. Runtime materializes embedded wheels into `~/.cache/flashinfer-rs/wheels/` (or `FLASHINFER_RS_CACHE_DIR/wheels/`).
+2. `build.rs` emits selected wheel metadata (filename, URL, SHA256) as generated constants.
+3. Runtime downloads selected wheels into `~/.cache/flashinfer-rs/wheels/` (or `FLASHINFER_RS_CACHE_DIR/wheels/`) on cache miss.
+4. Runtime verifies cached wheel SHA256 and rewrites mismatches.
 5. Runtime extracts required `.so` members from cached wheel files.
 
 ## Artifact Download URLs
