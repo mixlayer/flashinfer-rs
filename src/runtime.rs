@@ -154,6 +154,7 @@ pub struct FlashInferRuntime {
     tvmffi_string_from_byte_array: TVMFFIStringFromByteArrayFn,
     tvm_ffi_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gemma_rmsnorm: TVMFFISafeCallFn,
+    tvm_ffi_gemma_fused_add_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gdn_prefill: TVMFFISafeCallFn,
     tvm_ffi_append_paged_kv_cache: TVMFFISafeCallFn,
     tvm_ffi_append_paged_mla_kv_cache: TVMFFISafeCallFn,
@@ -234,6 +235,21 @@ impl FlashInferRuntime {
         // SAFETY: symbol signature follows TVMFFISafeCallType.
         let code =
             unsafe { (self.tvm_ffi_gemma_rmsnorm)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_gemma_fused_add_rmsnorm(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        let code = unsafe {
+            (self.tvm_ffi_gemma_fused_add_rmsnorm)(std::ptr::null_mut(), args, num_args, result)
+        };
         if code == 0 {
             return Ok(());
         }
@@ -878,6 +894,15 @@ impl FlashInferRuntime {
             )?
         };
 
+        let tvm_ffi_gemma_fused_add_rmsnorm: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &norm_lib,
+                &artifacts.norm_so_path,
+                b"__tvm_ffi_gemma_fused_add_rmsnorm\0",
+                "__tvm_ffi_gemma_fused_add_rmsnorm",
+            )?
+        };
+
         let tvm_ffi_rmsnorm: TVMFFISafeCallFn = unsafe {
             resolve_symbol(
                 &norm_lib,
@@ -948,6 +973,7 @@ impl FlashInferRuntime {
             tvmffi_string_from_byte_array,
             tvm_ffi_rmsnorm,
             tvm_ffi_gemma_rmsnorm,
+            tvm_ffi_gemma_fused_add_rmsnorm,
             tvm_ffi_gdn_prefill,
             tvm_ffi_append_paged_kv_cache,
             tvm_ffi_append_paged_mla_kv_cache,

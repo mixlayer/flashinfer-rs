@@ -204,6 +204,63 @@ impl GemmaRmsNormParams {
     }
 }
 
+/// Gemma-style fused residual addition + RMS normalization (in-place).
+///
+/// Semantics (matching `flashinfer/csrc/norm.cu::gemma_fused_add_rmsnorm`):
+///   residual ← residual + input
+///   input    ← (residual / rms(residual)) * (1 + weight)
+///
+/// Both `input` and `residual` are mutated in-place.
+#[derive(Debug, Clone, Copy)]
+pub struct GemmaFusedAddRmsNormParams {
+    /// Input activations (mutated in-place to hold normalised output), rank-2: `[batch_size, hidden_size]`.
+    pub input: Tensor2DDesc,
+    /// Residual buffer (mutated in-place: residual += input), rank-2: `[batch_size, hidden_size]`.
+    pub residual: Tensor2DDesc,
+    /// RMSNorm weights, rank-1: `[hidden_size]`.
+    pub weight: Tensor1DDesc,
+    /// Numerical stability epsilon used in `rsqrt(mean(x^2) + eps)`.
+    pub eps: f64,
+    /// Whether to enable PDL mode in the FlashInfer kernel.
+    pub enable_pdl: bool,
+    /// CUDA stream (`cudaStream_t`) used for async launch.
+    pub stream: *mut c_void,
+}
+
+impl GemmaFusedAddRmsNormParams {
+    pub fn new(
+        input: Tensor2DDesc,
+        residual: Tensor2DDesc,
+        weight: Tensor1DDesc,
+        eps: f64,
+        stream: *mut c_void,
+    ) -> Self {
+        Self {
+            input,
+            residual,
+            weight,
+            eps,
+            enable_pdl: false,
+            stream,
+        }
+    }
+
+    pub fn with_enable_pdl(mut self, enable_pdl: bool) -> Self {
+        self.enable_pdl = enable_pdl;
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), FlashInferError> {
+        validate_fused_add_rmsnorm_2d(
+            self.input,
+            self.residual,
+            self.weight,
+            self.eps,
+            self.enable_pdl,
+        )
+    }
+}
+
 pub fn rmsnorm(params: &RmsNormParams) -> Result<(), FlashInferError> {
     params.validate()?;
     let runtime = FlashInferRuntime::global()?;
@@ -227,6 +284,94 @@ pub fn gemma_rmsnorm(params: &GemmaRmsNormParams) -> Result<(), FlashInferError>
     let runtime = FlashInferRuntime::global()?;
     // SAFETY: all FFI preconditions are validated by `params.validate` and runtime initialization.
     unsafe { gemma_rmsnorm_with_runtime(runtime, params) }
+}
+
+pub fn gemma_fused_add_rmsnorm(
+    params: &GemmaFusedAddRmsNormParams,
+) -> Result<(), FlashInferError> {
+    params.validate()?;
+    let runtime = FlashInferRuntime::global()?;
+    // SAFETY: all FFI preconditions are validated by `params.validate` and runtime initialization.
+    unsafe { gemma_fused_add_rmsnorm_with_runtime(runtime, params) }
+}
+
+unsafe fn gemma_fused_add_rmsnorm_with_runtime(
+    runtime: &FlashInferRuntime,
+    params: &GemmaFusedAddRmsNormParams,
+) -> Result<(), FlashInferError> {
+    let mut input_shape = [params.input.rows, params.input.cols];
+    let mut input_strides = [params.input.stride_row, params.input.stride_col];
+    let input_tensor = DLTensor {
+        data: params.input.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: params.input.device_id,
+        },
+        ndim: 2,
+        dtype: params.input.dtype.as_dl_dtype(),
+        shape: input_shape.as_mut_ptr(),
+        strides: input_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut residual_shape = [params.residual.rows, params.residual.cols];
+    let mut residual_strides = [params.residual.stride_row, params.residual.stride_col];
+    let residual_tensor = DLTensor {
+        data: params.residual.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: params.residual.device_id,
+        },
+        ndim: 2,
+        dtype: params.residual.dtype.as_dl_dtype(),
+        shape: residual_shape.as_mut_ptr(),
+        strides: residual_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let mut weight_shape = [params.weight.len];
+    let mut weight_strides = [params.weight.stride];
+    let weight_tensor = DLTensor {
+        data: params.weight.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: params.weight.device_id,
+        },
+        ndim: 1,
+        dtype: params.weight.dtype.as_dl_dtype(),
+        shape: weight_shape.as_mut_ptr(),
+        strides: weight_strides.as_mut_ptr(),
+        byte_offset: 0,
+    };
+
+    let args: [TVMFFIAny; 5] = [
+        any_dltensor_ptr(&input_tensor),
+        any_dltensor_ptr(&residual_tensor),
+        any_dltensor_ptr(&weight_tensor),
+        any_f64(params.eps),
+        any_bool(params.enable_pdl),
+    ];
+    let mut result = any_none();
+
+    // SAFETY: stream context API contract comes from tvm ffi and is validated on load.
+    let previous_stream = unsafe { runtime.set_stream(params.input.device_id, params.stream)? };
+    let mut restore_guard =
+        StreamRestoreGuard::new(runtime, params.input.device_id, previous_stream);
+    // SAFETY: argument packing follows TVMFFIAny ABI.
+    let call_result = unsafe {
+        runtime.call_gemma_fused_add_rmsnorm(
+            args.as_ptr(),
+            args.len() as i32,
+            &mut result as *mut _,
+        )
+    };
+    let restore_result = restore_guard.restore_now();
+
+    match (call_result, restore_result) {
+        (Err(call_error), _) => Err(call_error),
+        (Ok(()), Err(restore_error)) => Err(restore_error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 unsafe fn rmsnorm_2d_with_runtime(
@@ -638,6 +783,77 @@ fn validate_rmsnorm_3d(
     if input.device_id != out.device_id || input.device_id != weight.device_id {
         return Err(FlashInferError::invalid_argument(
             "device mismatch across input/weight/out",
+        ));
+    }
+    if !eps.is_finite() {
+        return Err(FlashInferError::invalid_argument(
+            "eps must be a finite value",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_fused_add_rmsnorm_2d(
+    input: Tensor2DDesc,
+    residual: Tensor2DDesc,
+    weight: Tensor1DDesc,
+    eps: f64,
+    _enable_pdl: bool,
+) -> Result<(), FlashInferError> {
+    if input.ptr.is_null() {
+        return Err(FlashInferError::invalid_argument("input pointer is null"));
+    }
+    if residual.ptr.is_null() {
+        return Err(FlashInferError::invalid_argument(
+            "residual pointer is null",
+        ));
+    }
+    if weight.ptr.is_null() {
+        return Err(FlashInferError::invalid_argument("weight pointer is null"));
+    }
+    if input.rows <= 0 || input.cols <= 0 {
+        return Err(FlashInferError::invalid_argument(
+            "input shape must be positive",
+        ));
+    }
+    if residual.rows != input.rows || residual.cols != input.cols {
+        return Err(FlashInferError::invalid_argument(format!(
+            "shape mismatch: residual ({}, {}) must match input ({}, {})",
+            residual.rows, residual.cols, input.rows, input.cols
+        )));
+    }
+    if weight.len <= 0 {
+        return Err(FlashInferError::invalid_argument(
+            "weight length must be positive",
+        ));
+    }
+    if input.cols != weight.len {
+        return Err(FlashInferError::invalid_argument(format!(
+            "shape mismatch: input.cols ({}) must equal weight.len ({})",
+            input.cols, weight.len
+        )));
+    }
+    if input.dtype != weight.dtype || input.dtype != residual.dtype {
+        return Err(FlashInferError::invalid_argument(
+            "dtype mismatch across input/residual/weight",
+        ));
+    }
+    if input.stride_col != 1 {
+        return Err(FlashInferError::invalid_argument(
+            "input last-dimension stride must be 1",
+        ));
+    }
+    if residual.stride_col != 1 {
+        return Err(FlashInferError::invalid_argument(
+            "residual last-dimension stride must be 1",
+        ));
+    }
+    if weight.stride != 1 {
+        return Err(FlashInferError::invalid_argument("weight stride must be 1"));
+    }
+    if input.device_id != residual.device_id || input.device_id != weight.device_id {
+        return Err(FlashInferError::invalid_argument(
+            "device mismatch across input/residual/weight",
         ));
     }
     if !eps.is_finite() {
@@ -1147,6 +1363,64 @@ mod tests {
     fn gemma_validate_rejects_device_mismatch() {
         let mut params = valid_gemma_params();
         params.out.device_id = 1;
+        assert!(params.validate().is_err());
+    }
+
+    fn valid_gemma_fused_add_params() -> GemmaFusedAddRmsNormParams {
+        GemmaFusedAddRmsNormParams::new(
+            Tensor2DDesc {
+                ptr: non_null(),
+                rows: 2,
+                cols: 4,
+                stride_row: 4,
+                stride_col: 1,
+                dtype: DType::F16,
+                device_id: 0,
+            },
+            Tensor2DDesc {
+                ptr: non_null(),
+                rows: 2,
+                cols: 4,
+                stride_row: 4,
+                stride_col: 1,
+                dtype: DType::F16,
+                device_id: 0,
+            },
+            Tensor1DDesc {
+                ptr: non_null(),
+                len: 4,
+                stride: 1,
+                dtype: DType::F16,
+                device_id: 0,
+            },
+            1e-6,
+            std::ptr::null_mut(),
+        )
+    }
+
+    #[test]
+    fn gemma_fused_add_validate_accepts_valid_params() {
+        assert!(valid_gemma_fused_add_params().validate().is_ok());
+    }
+
+    #[test]
+    fn gemma_fused_add_validate_rejects_shape_mismatch() {
+        let mut params = valid_gemma_fused_add_params();
+        params.residual.rows = 3;
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn gemma_fused_add_validate_rejects_dtype_mismatch() {
+        let mut params = valid_gemma_fused_add_params();
+        params.residual.dtype = DType::BF16;
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn gemma_fused_add_validate_rejects_device_mismatch() {
+        let mut params = valid_gemma_fused_add_params();
+        params.residual.device_id = 1;
         assert!(params.validate().is_err());
     }
 }

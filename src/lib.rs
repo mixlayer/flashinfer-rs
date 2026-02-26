@@ -60,8 +60,9 @@ pub use mha_prefill::{
 #[cfg(feature = "cudarc")]
 pub use mha_prefill::{MhaSinglePrefillCudarcOptions, mha_single_prefill_cudarc};
 pub use norm::{
-    DType, FusedQkRmsNormParams, GemmaRmsNormParams, RmsNormParams, Tensor1DDesc, Tensor2DDesc,
-    Tensor3DDesc as NormTensor3DDesc, fused_qk_rmsnorm, gemma_rmsnorm, qk_rmsnorm, rmsnorm,
+    DType, FusedQkRmsNormParams, GemmaFusedAddRmsNormParams, GemmaRmsNormParams, RmsNormParams,
+    Tensor1DDesc, Tensor2DDesc, Tensor3DDesc as NormTensor3DDesc, fused_qk_rmsnorm,
+    gemma_fused_add_rmsnorm, gemma_rmsnorm, qk_rmsnorm, rmsnorm,
 };
 #[cfg(feature = "cudarc")]
 pub use norm::{
