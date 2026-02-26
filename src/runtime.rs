@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::env;
-use std::ffi::c_char;
-use std::ffi::c_void;
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,8 +13,10 @@ use zip::ZipArchive;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    KDL_CUDA, TVMFFIAny, TVMFFIByteArray, TVMFFIObjectHandle, TVMFFIVersion, any_none,
-    byte_array_to_string, error_cell_ptr,
+    DLManagedTensorVersioned, DLPACK_MAJOR_VERSION, DLPACK_MINOR_VERSION,
+    DLPackManagedTensorAllocator, DLPackSetErrorFn, DLPackVersion, KDL_CUDA, TVMFFIAny,
+    TVMFFIByteArray, TVMFFIObjectHandle, TVMFFIVersion, any_none, byte_array_to_string,
+    error_cell_ptr,
 };
 
 include!(concat!(env!("OUT_DIR"), "/embedded_wheels.rs"));
@@ -34,6 +35,12 @@ const EXPECTED_TVMFFI_MINOR: u32 = 1;
 
 type TVMFFIGetVersionFn = unsafe extern "C" fn(*mut TVMFFIVersion);
 type TVMFFIEnvSetStreamFn = unsafe extern "C" fn(i32, i32, *mut c_void, *mut *mut c_void) -> i32;
+type TVMFFIEnvSetDLPackManagedTensorAllocatorFn = unsafe extern "C" fn(
+    DLPackManagedTensorAllocator,
+    i32,
+    *mut DLPackManagedTensorAllocator,
+) -> i32;
+type TVMFFIEnvGetStreamFn = unsafe extern "C" fn(i32, i32) -> *mut c_void;
 type TVMFFIErrorMoveFromRaisedFn = unsafe extern "C" fn(*mut TVMFFIObjectHandle);
 type TVMFFIObjectDecRefFn = unsafe extern "C" fn(TVMFFIObjectHandle) -> i32;
 type TVMFFIAnyViewToOwnedAnyFn = unsafe extern "C" fn(*const TVMFFIAny, *mut TVMFFIAny) -> i32;
@@ -45,6 +52,13 @@ type TVMFFIStringFromByteArrayFn =
     unsafe extern "C" fn(*const TVMFFIByteArray, *mut TVMFFIAny) -> i32;
 type TVMFFISafeCallFn =
     unsafe extern "C" fn(*mut c_void, *const TVMFFIAny, i32, *mut TVMFFIAny) -> i32;
+type CudaMallocFn = unsafe extern "C" fn(*mut *mut c_void, usize) -> i32;
+type CudaFreeFn = unsafe extern "C" fn(*mut c_void) -> i32;
+type CudaMallocAsyncFn = unsafe extern "C" fn(*mut *mut c_void, usize, *mut c_void) -> i32;
+type CudaFreeAsyncFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
+type CudaGetDeviceFn = unsafe extern "C" fn(*mut i32) -> i32;
+type CudaSetDeviceFn = unsafe extern "C" fn(i32) -> i32;
+type CudaGetErrorStringFn = unsafe extern "C" fn(i32) -> *const c_char;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedRuntimeConfig {
@@ -166,6 +180,28 @@ pub struct FlashInferRuntime {
 
 static GLOBAL_RUNTIME: OnceLock<FlashInferRuntime> = OnceLock::new();
 static RUNTIME_INIT_LOCK: Mutex<()> = Mutex::new(());
+static CUDA_RUNTIME_FNS: OnceLock<Result<CudaRuntimeFns, String>> = OnceLock::new();
+static TVM_ENV_GET_STREAM_FN: OnceLock<Option<TVMFFIEnvGetStreamFn>> = OnceLock::new();
+const RUNTIME_ERROR_KIND: &[u8] = b"RuntimeError\0";
+
+#[derive(Clone, Copy)]
+struct CudaRuntimeFns {
+    malloc: CudaMallocFn,
+    free: CudaFreeFn,
+    malloc_async: Option<CudaMallocAsyncFn>,
+    free_async: Option<CudaFreeAsyncFn>,
+    get_device: CudaGetDeviceFn,
+    set_device: CudaSetDeviceFn,
+    get_error_string: Option<CudaGetErrorStringFn>,
+}
+
+struct ManagedTensorContext {
+    data: *mut c_void,
+    device_id: i32,
+    used_async_alloc: bool,
+    shape: Box<[i64]>,
+    strides: Box<[i64]>,
+}
 
 impl FlashInferRuntime {
     pub fn initialize(config: RuntimeConfig) -> Result<&'static Self, FlashInferError> {
@@ -815,6 +851,16 @@ impl FlashInferRuntime {
             )?
         };
 
+        let tvmffi_env_set_dlpack_managed_tensor_allocator:
+            TVMFFIEnvSetDLPackManagedTensorAllocatorFn = unsafe {
+            resolve_symbol(
+                &tvmffi_lib,
+                &artifacts.tvmffi_so_path,
+                b"TVMFFIEnvSetDLPackManagedTensorAllocator\0",
+                "TVMFFIEnvSetDLPackManagedTensorAllocator",
+            )?
+        };
+
         let tvmffi_error_move_from_raised: TVMFFIErrorMoveFromRaisedFn = unsafe {
             resolve_symbol(
                 &tvmffi_lib,
@@ -930,6 +976,20 @@ impl FlashInferRuntime {
             });
         }
 
+        // SAFETY: function pointer is resolved from trusted tvm_ffi C ABI.
+        let set_allocator_code = unsafe {
+            (tvmffi_env_set_dlpack_managed_tensor_allocator)(
+                dlpack_managed_tensor_allocator,
+                1,
+                std::ptr::null_mut(),
+            )
+        };
+        if set_allocator_code != 0 {
+            return Err(FlashInferError::DLPackManagedTensorAllocatorSet {
+                code: set_allocator_code,
+            });
+        }
+
         Ok(Self {
             resolved,
             jit_cache_wheel_path: materialized_wheels.jit_cache_wheel_path,
@@ -1004,6 +1064,485 @@ unsafe fn resolve_symbol<T: Copy>(
             message: e.to_string(),
         })?;
     Ok(*symbol)
+}
+
+fn cuda_runtime_fns() -> Result<&'static CudaRuntimeFns, String> {
+    CUDA_RUNTIME_FNS
+        .get_or_init(|| {
+            // SAFETY: symbol resolution only reads process symbol table.
+            unsafe { load_cuda_runtime_fns() }
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+unsafe fn load_cuda_runtime_fns() -> Result<CudaRuntimeFns, String> {
+    // SAFETY: symbol signatures match CUDA Runtime API.
+    let malloc = unsafe {
+        std::mem::transmute::<*mut c_void, CudaMallocFn>(resolve_process_symbol(
+            "cudaMalloc",
+            b"cudaMalloc\0",
+        )?)
+    };
+    // SAFETY: symbol signatures match CUDA Runtime API.
+    let free = unsafe {
+        std::mem::transmute::<*mut c_void, CudaFreeFn>(resolve_process_symbol(
+            "cudaFree",
+            b"cudaFree\0",
+        )?)
+    };
+    // SAFETY: symbol signatures match CUDA Runtime API.
+    let get_device = unsafe {
+        std::mem::transmute::<*mut c_void, CudaGetDeviceFn>(resolve_process_symbol(
+            "cudaGetDevice",
+            b"cudaGetDevice\0",
+        )?)
+    };
+    // SAFETY: symbol signatures match CUDA Runtime API.
+    let set_device = unsafe {
+        std::mem::transmute::<*mut c_void, CudaSetDeviceFn>(resolve_process_symbol(
+            "cudaSetDevice",
+            b"cudaSetDevice\0",
+        )?)
+    };
+    // SAFETY: optional symbol; null means we fall back to `cudaMalloc`.
+    let malloc_async = unsafe {
+        let ptr = libc::dlsym(libc::RTLD_DEFAULT, b"cudaMallocAsync\0".as_ptr().cast());
+        if ptr.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, CudaMallocAsyncFn>(ptr))
+        }
+    };
+    // SAFETY: optional symbol; null means we fall back to `cudaFree`.
+    let free_async = unsafe {
+        let ptr = libc::dlsym(libc::RTLD_DEFAULT, b"cudaFreeAsync\0".as_ptr().cast());
+        if ptr.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, CudaFreeAsyncFn>(ptr))
+        }
+    };
+    // SAFETY: optional symbol; null means we fall back to numeric code messages.
+    let get_error_string = unsafe {
+        let ptr = libc::dlsym(libc::RTLD_DEFAULT, b"cudaGetErrorString\0".as_ptr().cast());
+        if ptr.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, CudaGetErrorStringFn>(
+                ptr,
+            ))
+        }
+    };
+
+    Ok(CudaRuntimeFns {
+        malloc,
+        free,
+        malloc_async,
+        free_async,
+        get_device,
+        set_device,
+        get_error_string,
+    })
+}
+
+unsafe fn resolve_process_symbol(
+    symbol_name: &'static str,
+    symbol_bytes: &'static [u8],
+) -> Result<*mut c_void, String> {
+    // SAFETY: direct process-wide symbol lookup.
+    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol_bytes.as_ptr().cast()) };
+    if ptr.is_null() {
+        return Err(format!(
+            "failed to resolve `{symbol_name}` from process runtime symbols"
+        ));
+    }
+    Ok(ptr)
+}
+
+fn cuda_error_message(fns: &CudaRuntimeFns, code: i32) -> String {
+    let mut message = format!("CUDA error code {code}");
+    if let Some(get_error_string) = fns.get_error_string {
+        // SAFETY: CUDA runtime returns a static C string for valid error codes.
+        let ptr = unsafe { get_error_string(code) };
+        if !ptr.is_null() {
+            // SAFETY: CUDA runtime provides a null-terminated string.
+            let detail = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+            message = format!("{message} ({detail})");
+        }
+    }
+    message
+}
+
+fn current_tvm_stream(device_id: i32) -> *mut c_void {
+    let get_stream = TVM_ENV_GET_STREAM_FN.get_or_init(|| {
+        // SAFETY: direct process-wide symbol lookup for optional tvm_ffi helper.
+        unsafe {
+            let ptr = libc::dlsym(libc::RTLD_DEFAULT, b"TVMFFIEnvGetStream\0".as_ptr().cast());
+            if ptr.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, TVMFFIEnvGetStreamFn>(
+                    ptr,
+                ))
+            }
+        }
+    });
+    match get_stream {
+        Some(get_stream) => {
+            // SAFETY: function pointer is resolved from trusted tvm_ffi C ABI.
+            unsafe { get_stream(KDL_CUDA, device_id) }
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+unsafe extern "C" fn dlpack_managed_tensor_allocator(
+    prototype: *mut crate::ffi::DLTensor,
+    out: *mut *mut DLManagedTensorVersioned,
+    error_ctx: *mut c_void,
+    set_error: DLPackSetErrorFn,
+) -> i32 {
+    let result = std::panic::catch_unwind(|| {
+        // SAFETY: pointer validation is handled inside `allocate_managed_tensor`.
+        unsafe { allocate_managed_tensor(prototype, out) }
+    });
+
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(message)) => {
+            // SAFETY: callback contract allows setting an error on failure.
+            unsafe { report_allocator_error(set_error, error_ctx, &message) };
+            -1
+        }
+        Err(_) => {
+            // SAFETY: callback contract allows setting an error on failure.
+            unsafe {
+                report_allocator_error(
+                    set_error,
+                    error_ctx,
+                    "panic while allocating DLPack managed tensor",
+                )
+            };
+            -1
+        }
+    }
+}
+
+unsafe fn allocate_managed_tensor(
+    prototype: *mut crate::ffi::DLTensor,
+    out: *mut *mut DLManagedTensorVersioned,
+) -> Result<(), String> {
+    if prototype.is_null() {
+        return Err("allocator received null prototype tensor".to_string());
+    }
+    if out.is_null() {
+        return Err("allocator received null output pointer".to_string());
+    }
+
+    // SAFETY: caller guarantees `prototype` is valid for the duration of the call.
+    let prototype = unsafe { &*prototype };
+    if prototype.device.device_type != KDL_CUDA {
+        return Err(format!(
+            "unsupported device_type {} in DLPack allocator; expected kDLCUDA ({KDL_CUDA})",
+            prototype.device.device_type
+        ));
+    }
+
+    let ndim = usize::try_from(prototype.ndim)
+        .map_err(|_| format!("negative ndim {} in prototype tensor", prototype.ndim))?;
+
+    let shape = if ndim == 0 {
+        Vec::new()
+    } else {
+        if prototype.shape.is_null() {
+            return Err("prototype shape pointer is null for ndim > 0".to_string());
+        }
+        // SAFETY: shape pointer is expected to have `ndim` elements.
+        let shape_slice = unsafe { std::slice::from_raw_parts(prototype.shape, ndim) };
+        let mut shape = Vec::with_capacity(ndim);
+        for (idx, dim) in shape_slice.iter().copied().enumerate() {
+            if dim < 0 {
+                return Err(format!("negative shape dim at index {idx}: {dim}"));
+            }
+            shape.push(dim);
+        }
+        shape
+    };
+
+    let element_bits = usize::from(prototype.dtype.bits)
+        .checked_mul(usize::from(prototype.dtype.lanes))
+        .ok_or_else(|| "dtype bit-size overflow".to_string())?;
+    if element_bits == 0 {
+        return Err("dtype bit-size is zero".to_string());
+    }
+    let element_bytes = (element_bits + 7) / 8;
+
+    let num_elements = if shape.is_empty() {
+        1_usize
+    } else {
+        shape.iter().try_fold(1_usize, |acc, &dim| {
+            let dim_usize = usize::try_from(dim)
+                .map_err(|_| format!("shape dim {dim} does not fit in usize"))?;
+            acc.checked_mul(dim_usize)
+                .ok_or_else(|| "tensor element-count overflow".to_string())
+        })?
+    };
+    let num_bytes = num_elements
+        .checked_mul(element_bytes)
+        .ok_or_else(|| "tensor byte-size overflow".to_string())?;
+
+    let strides = compute_contiguous_strides(&shape)?;
+    let (data, used_async_alloc) = if num_bytes == 0 {
+        (std::ptr::null_mut(), false)
+    } else {
+        let fns = cuda_runtime_fns()?;
+        allocate_cuda_buffer_on_device(fns, prototype.device.device_id, num_bytes)?
+    };
+
+    let mut ctx = Box::new(ManagedTensorContext {
+        data,
+        device_id: prototype.device.device_id,
+        used_async_alloc,
+        shape: shape.into_boxed_slice(),
+        strides: strides.into_boxed_slice(),
+    });
+    let shape_ptr = if ndim == 0 {
+        std::ptr::null_mut()
+    } else {
+        ctx.shape.as_mut_ptr()
+    };
+    let strides_ptr = if ndim == 0 {
+        std::ptr::null_mut()
+    } else {
+        ctx.strides.as_mut_ptr()
+    };
+    let ctx_ptr = Box::into_raw(ctx);
+
+    let managed_tensor = Box::new(DLManagedTensorVersioned {
+        version: DLPackVersion {
+            major: DLPACK_MAJOR_VERSION,
+            minor: DLPACK_MINOR_VERSION,
+        },
+        manager_ctx: ctx_ptr.cast(),
+        deleter: Some(dlpack_managed_tensor_deleter),
+        flags: 0,
+        dl_tensor: crate::ffi::DLTensor {
+            data,
+            device: prototype.device,
+            ndim: prototype.ndim,
+            dtype: prototype.dtype,
+            shape: shape_ptr,
+            strides: strides_ptr,
+            byte_offset: 0,
+        },
+    });
+
+    // SAFETY: `out` is validated non-null and points to caller-owned storage.
+    unsafe { *out = Box::into_raw(managed_tensor) };
+    Ok(())
+}
+
+fn compute_contiguous_strides(shape: &[i64]) -> Result<Vec<i64>, String> {
+    if shape.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut strides = vec![0_i64; shape.len()];
+    strides[shape.len() - 1] = 1;
+    for idx in (0..shape.len() - 1).rev() {
+        strides[idx] = strides[idx + 1]
+            .checked_mul(shape[idx + 1])
+            .ok_or_else(|| "stride overflow while computing contiguous layout".to_string())?;
+    }
+    Ok(strides)
+}
+
+fn allocate_cuda_buffer_on_device(
+    fns: &CudaRuntimeFns,
+    device_id: i32,
+    num_bytes: usize,
+) -> Result<(*mut c_void, bool), String> {
+    let mut previous_device = 0_i32;
+    // SAFETY: CUDA runtime symbol signatures are validated during resolution.
+    let get_device_code = unsafe { (fns.get_device)(&mut previous_device as *mut _) };
+    if get_device_code != 0 {
+        return Err(format!(
+            "cudaGetDevice failed: {}",
+            cuda_error_message(fns, get_device_code)
+        ));
+    }
+
+    let switched = previous_device != device_id;
+    if switched {
+        // SAFETY: CUDA runtime symbol signatures are validated during resolution.
+        let set_device_code = unsafe { (fns.set_device)(device_id) };
+        if set_device_code != 0 {
+            return Err(format!(
+                "cudaSetDevice({device_id}) failed: {}",
+                cuda_error_message(fns, set_device_code)
+            ));
+        }
+    }
+
+    let stream = current_tvm_stream(device_id);
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    let (malloc_code, used_async_alloc) = if let Some(malloc_async) = fns.malloc_async {
+        // SAFETY: CUDA runtime symbol signatures are validated during resolution.
+        let code = unsafe { malloc_async(&mut ptr as *mut _, num_bytes, stream) };
+        (code, true)
+    } else {
+        // SAFETY: CUDA runtime symbol signatures are validated during resolution.
+        let code = unsafe { (fns.malloc)(&mut ptr as *mut _, num_bytes) };
+        (code, false)
+    };
+
+    let mut restore_error = None;
+    if switched {
+        // SAFETY: CUDA runtime symbol signatures are validated during resolution.
+        let restore_code = unsafe { (fns.set_device)(previous_device) };
+        if restore_code != 0 {
+            restore_error = Some(format!(
+                "cudaSetDevice({previous_device}) restore failed: {}",
+                cuda_error_message(fns, restore_code)
+            ));
+        }
+    }
+
+    if malloc_code != 0 {
+        let alloc_kind = if used_async_alloc {
+            "cudaMallocAsync"
+        } else {
+            "cudaMalloc"
+        };
+        return Err(format!(
+            "{alloc_kind}({num_bytes}) failed: {}",
+            cuda_error_message(fns, malloc_code)
+        ));
+    }
+    if let Some(restore_error) = restore_error {
+        // SAFETY: pointer was allocated by `cudaMalloc` above and must be released.
+        let _ = unsafe { (fns.free)(ptr) };
+        return Err(restore_error);
+    }
+    Ok((ptr, used_async_alloc))
+}
+
+fn free_cuda_buffer_on_device(
+    fns: &CudaRuntimeFns,
+    device_id: i32,
+    data: *mut c_void,
+    used_async_alloc: bool,
+) -> Result<(), String> {
+    let mut previous_device = 0_i32;
+    // SAFETY: CUDA runtime symbol signatures are validated during resolution.
+    let get_device_code = unsafe { (fns.get_device)(&mut previous_device as *mut _) };
+    if get_device_code != 0 {
+        return Err(format!(
+            "cudaGetDevice failed during free: {}",
+            cuda_error_message(fns, get_device_code)
+        ));
+    }
+
+    let switched = previous_device != device_id;
+    if switched {
+        // SAFETY: CUDA runtime symbol signatures are validated during resolution.
+        let set_device_code = unsafe { (fns.set_device)(device_id) };
+        if set_device_code != 0 {
+            return Err(format!(
+                "cudaSetDevice({device_id}) failed during free: {}",
+                cuda_error_message(fns, set_device_code)
+            ));
+        }
+    }
+
+    let stream = current_tvm_stream(device_id);
+    let (free_code, free_kind) = if used_async_alloc {
+        if let Some(free_async) = fns.free_async {
+            // SAFETY: pointer originated from `cudaMallocAsync`.
+            (unsafe { free_async(data, stream) }, "cudaFreeAsync")
+        } else {
+            // SAFETY: fallback path for runtimes where async free is unavailable.
+            (unsafe { (fns.free)(data) }, "cudaFree")
+        }
+    } else {
+        // SAFETY: pointer originated from `cudaMalloc`.
+        (unsafe { (fns.free)(data) }, "cudaFree")
+    };
+
+    let mut restore_error = None;
+    if switched {
+        // SAFETY: CUDA runtime symbol signatures are validated during resolution.
+        let restore_code = unsafe { (fns.set_device)(previous_device) };
+        if restore_code != 0 {
+            restore_error = Some(format!(
+                "cudaSetDevice({previous_device}) restore failed after free: {}",
+                cuda_error_message(fns, restore_code)
+            ));
+        }
+    }
+
+    if free_code != 0 {
+        return Err(format!(
+            "{free_kind} failed: {}",
+            cuda_error_message(fns, free_code)
+        ));
+    }
+    if let Some(restore_error) = restore_error {
+        return Err(restore_error);
+    }
+    Ok(())
+}
+
+unsafe extern "C" fn dlpack_managed_tensor_deleter(managed_tensor: *mut DLManagedTensorVersioned) {
+    if managed_tensor.is_null() {
+        return;
+    }
+
+    // SAFETY: deleter receives ownership of `managed_tensor`.
+    let managed_tensor = unsafe { Box::from_raw(managed_tensor) };
+    let ctx_ptr = managed_tensor.manager_ctx.cast::<ManagedTensorContext>();
+    if ctx_ptr.is_null() {
+        return;
+    }
+
+    // SAFETY: manager_ctx is owned by this managed tensor.
+    let ctx = unsafe { Box::from_raw(ctx_ptr) };
+    if ctx.data.is_null() {
+        return;
+    }
+
+    if let Ok(fns) = cuda_runtime_fns() {
+        let _ = free_cuda_buffer_on_device(fns, ctx.device_id, ctx.data, ctx.used_async_alloc);
+    }
+}
+
+unsafe fn report_allocator_error(
+    set_error: DLPackSetErrorFn,
+    error_ctx: *mut c_void,
+    message: &str,
+) {
+    let Some(set_error) = set_error else {
+        return;
+    };
+
+    let sanitized = message.replace('\0', " ");
+    let message_cstr = match CString::new(sanitized) {
+        Ok(msg) => msg,
+        Err(_) => match CString::new("allocator error") {
+            Ok(msg) => msg,
+            Err(_) => return,
+        },
+    };
+
+    // SAFETY: callback contract allows producer to report a string error.
+    unsafe {
+        set_error(
+            error_ctx,
+            RUNTIME_ERROR_KIND.as_ptr().cast(),
+            message_cstr.as_ptr(),
+        )
+    };
 }
 
 fn extract_artifacts(
@@ -1396,12 +1935,6 @@ fn sha256_file_hex(path: &Path, wheel: &'static str) -> Result<String, FlashInfe
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn sha256_bytes_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
-}
-
 fn extract_member_from_wheel_by_suffix(
     wheel_path: &Path,
     member_suffix: &str,
@@ -1566,6 +2099,12 @@ mod tests {
     use std::time::Duration;
 
     static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn sha256_bytes_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
 
     #[test]
     fn env_path_empty_is_error() {
