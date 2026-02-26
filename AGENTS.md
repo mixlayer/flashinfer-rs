@@ -146,6 +146,70 @@ Practical implication for Rust bindings:
   - append `"_sm90"` when the chosen backend is `fa3`,
   - keep URI construction consistent with upstream `modules.py`.
 
+## GEMM Integration Approach (TGV f16/bf16 + TRTLLM tactics)
+
+This section captures the current GEMM binding approach used in this repo.
+
+1. Scope
+- f16/bf16 GEMM support is MM-only in current pinned wheels.
+- Do not add f16/bf16 BMM API unless matching wheel exports are verified.
+
+2. Wheel artifacts and exported symbols
+- TGV MM artifacts:
+  - `flashinfer_jit_cache/.../jit_cache/tgv_gemm_fp16/tgv_gemm_fp16.so`
+  - `flashinfer_jit_cache/.../jit_cache/tgv_gemm_bf16/tgv_gemm_bf16.so`
+- TGV symbols:
+  - `__tvm_ffi_tgv_gemm`
+  - `__tvm_ffi_tgv_gemm_tactic_num`
+- TRTLLM GEMM artifact:
+  - `flashinfer_jit_cache/.../jit_cache/trtllm_gemm/trtllm_gemm.so`
+- TRTLLM GEMM symbol:
+  - `__tvm_ffi_trtllm_gemm_tactics`
+- TRTLLM low-latency GEMM artifact:
+  - `flashinfer_jit_cache/.../jit_cache/trtllm_low_latency_gemm/trtllm_low_latency_gemm.so`
+- TRTLLM low-latency symbols:
+  - `__tvm_ffi_trtllm_low_latency_gemm_tactics`
+  - `__tvm_ffi_get_workspace_size_in_bytes`
+
+3. ABI mapping for TGV MM
+- Public semantics: `out = A @ B (+bias)` with:
+  - `A`: `[m, k]` row-major
+  - `B`: `[k, n]` column-major
+  - `out`: `[m, n]` row-major
+  - optional `bias`: `[n]`
+- TVM call packing must match upstream TGV runner convention:
+  - `mat1 = B^T`, `mat2 = A^T`, `bias`, `tactic`, `out`, `pdl`
+- Use transpose views only (no staging copy) by swapping shape/stride metadata.
+
+4. Validation requirements (GEMM)
+- Pointer non-null for all required tensors.
+- Positive dimensions.
+- Dtype consistency across inputs/outputs (`f16` or `bf16` for TGV path).
+- Device consistency across all tensors.
+- Stride/layout checks:
+  - `A.stride_col == 1` (row-major)
+  - `B.stride_row == 1` (column-major)
+  - `out.stride_col == 1` (row-major)
+  - `bias.stride == 1` when present
+- Scalar domain checks:
+  - tactic selector values in allowed range (`-1` or non-negative as API defines)
+  - tactics/workspace query dims must be positive.
+
+5. Runtime loading and result decoding
+- Treat TGV/TRTLLM GEMM modules as lazy-loaded URI kernels and cache function pointers for process lifetime.
+- For APIs returning `Array<int64_t>` (TRTLLM tactics), decode through TVM globals:
+  - `ffi.ArraySize`
+  - `ffi.ArrayGetItem`
+- Resolve those globals using existing `get_global_function` + `call_function`, and preserve object/handle decref discipline.
+
+6. API surface expectations
+- Core typed API:
+  - parameter structs for TGV launch
+  - typed enums for TRTLLM dtype codes
+  - typed query structs for tactics/workspace helpers
+- `cudarc` wrappers are required for public TGV MM APIs (with and without bias).
+- Default launch behavior should remain async with no implicit synchronize.
+
 ## PR/Change Checklist
 
 - [ ] Wheel artifact path(s) identified and verified.
@@ -160,3 +224,4 @@ Practical implication for Rust bindings:
 - [ ] Unit tests added/updated.
 - [ ] Wheel launch smoke test added/updated for ABI regression coverage.
 - [ ] Docs (`README.md` and/or `docs/flashinfer-rs-integration.md`) updated.
+- [ ] For GEMM tactics APIs, `Array<int64_t>` decode path (`ffi.ArraySize`/`ffi.ArrayGetItem`) validated.

@@ -6,6 +6,8 @@ Rust-first integration for calling precompiled FlashInfer kernels through TVM-FF
 
 - `gemma_rmsnorm` from `norm.so`
 - `rmsnorm` (2D) and fused QK RMSNorm (3D) from `norm.so`
+- TGV GEMM MM (`f16`/`bf16`) from `tgv_gemm_fp16.so` and `tgv_gemm_bf16.so`
+- TRTLLM GEMM tactics/workspace query APIs from `trtllm_gemm.so` and `trtllm_low_latency_gemm.so`
 - `gdn_prefill` from `gdn_prefill_sm90.so` (SM90A path)
 - MHA single prefill (`single_prefill_with_kv_cache`) via on-demand JIT-cache module loading
 - MHA batched ragged/paged prefill (`batch_prefill_with_kv_cache`) via on-demand JIT-cache module loading
@@ -125,6 +127,52 @@ let params = GemmaRmsNormParams::new(
 );
 
 gemma_rmsnorm(&params)?;
+```
+
+## API Example: TGV GEMM (MM)
+
+```rust
+use flashinfer_rs::{
+    DType, GemmTensor2DDesc, TgvGemmParams, tgv_gemm,
+};
+use std::ffi::c_void;
+
+let m = 48_i64;
+let k = 64_i64;
+let n = 80_i64;
+
+let params = TgvGemmParams::new(
+    GemmTensor2DDesc {
+        ptr: a_ptr as *const c_void, // A: [m, k] row-major
+        rows: m,
+        cols: k,
+        stride_row: k,
+        stride_col: 1,
+        dtype: DType::BF16,
+        device_id: 0,
+    },
+    GemmTensor2DDesc {
+        ptr: b_ptr as *const c_void, // B: [k, n] column-major
+        rows: k,
+        cols: n,
+        stride_row: 1,
+        stride_col: k,
+        dtype: DType::BF16,
+        device_id: 0,
+    },
+    GemmTensor2DDesc {
+        ptr: out_ptr as *const c_void, // out: [m, n] row-major
+        rows: m,
+        cols: n,
+        stride_row: n,
+        stride_col: 1,
+        dtype: DType::BF16,
+        device_id: 0,
+    },
+    stream_ptr, // cudaStream_t as *mut c_void
+);
+
+tgv_gemm(&params)?;
 ```
 
 ## API Example: SM90 Prefill (`cudarc`)
