@@ -2,6 +2,7 @@ pub mod error;
 mod ffi;
 pub mod fused_moe;
 pub mod gdn_prefill;
+pub mod gemm;
 pub mod mha_batch_prefill;
 pub mod mha_batch_prefill_paged;
 pub mod mha_decode;
@@ -26,6 +27,14 @@ pub use gdn_prefill::{
     gdn_prefill_sm90_cudarc, gdn_prefill_sm90_cudarc_with_options,
     gdn_prefill_sm90_cudarc_with_scale,
 };
+pub use gemm::{
+    GemmTensor1DDesc, GemmTensor2DDesc, TgvGemmParams, TrtllmGemmTacticsQuery, TrtllmInputDType,
+    TrtllmLowLatencyGemmTacticsQuery, TrtllmOutputDType, tgv_gemm, tgv_gemm_tactic_num,
+    trtllm_gemm_tactics, trtllm_low_latency_gemm_tactics,
+    trtllm_low_latency_workspace_size_in_bytes,
+};
+#[cfg(feature = "cudarc")]
+pub use gemm::{TgvGemmCudarcOptions, tgv_gemm_cudarc, tgv_gemm_cudarc_with_bias};
 #[cfg(feature = "cudarc")]
 pub use mha_batch_prefill::{
     MhaBatchPrefillCudarcOptions, mha_batch_prefill_cudarc_plan, mha_batch_prefill_cudarc_run,

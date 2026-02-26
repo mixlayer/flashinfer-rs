@@ -14,8 +14,8 @@ use zip::ZipArchive;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    KDL_CUDA, TVMFFIAny, TVMFFIByteArray, TVMFFIObjectHandle, TVMFFIVersion, any_none,
-    byte_array_to_string, error_cell_ptr,
+    KDL_CUDA, KTVM_FFI_INT, TVMFFIAny, TVMFFIByteArray, TVMFFIObjectHandle, TVMFFIVersion, any_i64,
+    any_none, any_object_handle, byte_array_to_string, error_cell_ptr,
 };
 
 include!(concat!(env!("OUT_DIR"), "/embedded_wheels.rs"));
@@ -136,6 +136,38 @@ struct LoadedBatchDecodeKernel {
     fns: BatchDecodeKernelFns,
 }
 
+#[derive(Clone, Copy)]
+struct TgvGemmKernelFns {
+    run: TVMFFISafeCallFn,
+    tactic_num: TVMFFISafeCallFn,
+}
+
+struct LoadedTgvGemmKernel {
+    _lib: Library,
+    fns: TgvGemmKernelFns,
+}
+
+#[derive(Clone, Copy)]
+struct TrtllmGemmKernelFns {
+    tactics: TVMFFISafeCallFn,
+}
+
+struct LoadedTrtllmGemmKernel {
+    _lib: Library,
+    fns: TrtllmGemmKernelFns,
+}
+
+#[derive(Clone, Copy)]
+struct TrtllmLowLatencyGemmKernelFns {
+    tactics: TVMFFISafeCallFn,
+    workspace_size: TVMFFISafeCallFn,
+}
+
+struct LoadedTrtllmLowLatencyGemmKernel {
+    _lib: Library,
+    fns: TrtllmLowLatencyGemmKernelFns,
+}
+
 pub struct FlashInferRuntime {
     resolved: ResolvedRuntimeConfig,
     jit_cache_wheel_path: PathBuf,
@@ -162,6 +194,9 @@ pub struct FlashInferRuntime {
     single_decode_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
     batch_decode_kernel_cache: Mutex<HashMap<String, LoadedBatchDecodeKernel>>,
     fused_moe_kernel_cache: Mutex<HashMap<String, LoadedFusedMoeKernel>>,
+    tgv_gemm_kernel_cache: Mutex<HashMap<String, LoadedTgvGemmKernel>>,
+    trtllm_gemm_kernel_cache: Mutex<HashMap<String, LoadedTrtllmGemmKernel>>,
+    trtllm_low_latency_gemm_kernel_cache: Mutex<HashMap<String, LoadedTrtllmLowLatencyGemmKernel>>,
 }
 
 static GLOBAL_RUNTIME: OnceLock<FlashInferRuntime> = OnceLock::new();
@@ -437,6 +472,91 @@ impl FlashInferRuntime {
         Err(self.decode_raised_error(code))
     }
 
+    pub(crate) unsafe fn call_tgv_gemm(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_tgv_gemm_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.run)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_tgv_gemm_tactic_num(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_tgv_gemm_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.tactic_num)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_trtllm_gemm_tactics(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_trtllm_gemm_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.tactics)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_trtllm_low_latency_gemm_tactics(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_trtllm_low_latency_gemm_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.tactics)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_trtllm_low_latency_workspace_size(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_trtllm_low_latency_gemm_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.workspace_size)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
     pub(crate) unsafe fn any_view_to_owned(
         &self,
         any_view: &TVMFFIAny,
@@ -511,6 +631,86 @@ impl FlashInferRuntime {
         }
         // SAFETY: object handle was created by TVM-FFI APIs and may be decref'd here.
         let _ = unsafe { (self.tvmffi_object_dec_ref)(obj) };
+    }
+
+    pub(crate) unsafe fn decode_i64_array(
+        &self,
+        any_view: &TVMFFIAny,
+    ) -> Result<Vec<i64>, FlashInferError> {
+        // SAFETY: result view is produced by TVM-FFI and copied to owned Any.
+        let owned = unsafe { self.any_view_to_owned(any_view)? };
+        let object = any_object_handle(&owned).ok_or_else(|| {
+            FlashInferError::invalid_argument("expected TVM array object in result")
+        })?;
+
+        let decode_result = (|| -> Result<Vec<i64>, FlashInferError> {
+            // SAFETY: functions are resolved from global table; caller owns references and must decref.
+            let array_size_handle = unsafe { self.get_global_function("ffi.ArraySize")? };
+            // SAFETY: functions are resolved from global table; caller owns references and must decref.
+            let array_get_item_handle =
+                match unsafe { self.get_global_function("ffi.ArrayGetItem") } {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        // SAFETY: handle is an owned reference from TVMFFIFunctionGetGlobal.
+                        unsafe {
+                            self.object_dec_ref(array_size_handle);
+                        }
+                        return Err(error);
+                    }
+                };
+
+            let decode_result = (|| -> Result<Vec<i64>, FlashInferError> {
+                let mut size_args = [owned];
+                let mut size_result = any_none();
+                // SAFETY: invoking TVM Function object with ABI-packed args.
+                unsafe {
+                    self.call_function(
+                        array_size_handle,
+                        size_args.as_mut_ptr(),
+                        size_args.len() as i32,
+                        &mut size_result as *mut _,
+                    )?;
+                }
+                let size = any_to_i64(&size_result, "ffi.ArraySize return value")?;
+                if size < 0 {
+                    return Err(FlashInferError::invalid_argument(
+                        "ffi.ArraySize returned a negative length",
+                    ));
+                }
+
+                let mut values = Vec::with_capacity(usize::try_from(size).map_err(|_| {
+                    FlashInferError::invalid_argument("ffi.ArraySize result does not fit in usize")
+                })?);
+                for i in 0..size {
+                    let mut item_args = [owned, any_i64(i)];
+                    let mut item_result = any_none();
+                    // SAFETY: invoking TVM Function object with ABI-packed args.
+                    unsafe {
+                        self.call_function(
+                            array_get_item_handle,
+                            item_args.as_mut_ptr(),
+                            item_args.len() as i32,
+                            &mut item_result as *mut _,
+                        )?;
+                    }
+                    values.push(any_to_i64(&item_result, "ffi.ArrayGetItem return value")?);
+                }
+                Ok(values)
+            })();
+
+            // SAFETY: handles are owned references from TVMFFIFunctionGetGlobal.
+            unsafe {
+                self.object_dec_ref(array_get_item_handle);
+                self.object_dec_ref(array_size_handle);
+            }
+            decode_result
+        })();
+
+        // SAFETY: owned object from any_view_to_owned must be decref'd by caller.
+        unsafe {
+            self.object_dec_ref(object);
+        }
+        decode_result
     }
 
     unsafe fn resolve_single_prefill_kernel(
@@ -749,6 +949,156 @@ impl FlashInferRuntime {
         Ok(fns)
     }
 
+    unsafe fn resolve_tgv_gemm_kernel(
+        &self,
+        kernel_uri: &str,
+    ) -> Result<TgvGemmKernelFns, FlashInferError> {
+        let mut cache = self
+            .tgv_gemm_kernel_cache
+            .lock()
+            .map_err(|_| FlashInferError::invalid_argument("tgv gemm cache lock is poisoned"))?;
+
+        if let Some(kernel) = cache.get(kernel_uri) {
+            return Ok(kernel.fns);
+        }
+
+        let kernel_path =
+            extract_jit_kernel(&self.jit_cache_wheel_path, &self.artifact_dir, kernel_uri)?;
+
+        let kernel_lib =
+            unsafe { Library::open(Some(&kernel_path), libc::RTLD_NOW | libc::RTLD_LOCAL) }
+                .map_err(|e| FlashInferError::LibraryLoad {
+                    library: kernel_path.clone(),
+                    message: e.to_string(),
+                })?;
+
+        let run: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_tgv_gemm\0",
+                "__tvm_ffi_tgv_gemm",
+            )?
+        };
+        let tactic_num: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_tgv_gemm_tactic_num\0",
+                "__tvm_ffi_tgv_gemm_tactic_num",
+            )?
+        };
+        let fns = TgvGemmKernelFns { run, tactic_num };
+
+        cache.insert(
+            kernel_uri.to_string(),
+            LoadedTgvGemmKernel {
+                _lib: kernel_lib,
+                fns,
+            },
+        );
+        Ok(fns)
+    }
+
+    unsafe fn resolve_trtllm_gemm_kernel(
+        &self,
+        kernel_uri: &str,
+    ) -> Result<TrtllmGemmKernelFns, FlashInferError> {
+        let mut cache = self
+            .trtllm_gemm_kernel_cache
+            .lock()
+            .map_err(|_| FlashInferError::invalid_argument("trtllm gemm cache lock is poisoned"))?;
+
+        if let Some(kernel) = cache.get(kernel_uri) {
+            return Ok(kernel.fns);
+        }
+
+        let kernel_path =
+            extract_jit_kernel(&self.jit_cache_wheel_path, &self.artifact_dir, kernel_uri)?;
+
+        let kernel_lib =
+            unsafe { Library::open(Some(&kernel_path), libc::RTLD_NOW | libc::RTLD_LOCAL) }
+                .map_err(|e| FlashInferError::LibraryLoad {
+                    library: kernel_path.clone(),
+                    message: e.to_string(),
+                })?;
+
+        let tactics: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_trtllm_gemm_tactics\0",
+                "__tvm_ffi_trtllm_gemm_tactics",
+            )?
+        };
+        let fns = TrtllmGemmKernelFns { tactics };
+
+        cache.insert(
+            kernel_uri.to_string(),
+            LoadedTrtllmGemmKernel {
+                _lib: kernel_lib,
+                fns,
+            },
+        );
+        Ok(fns)
+    }
+
+    unsafe fn resolve_trtllm_low_latency_gemm_kernel(
+        &self,
+        kernel_uri: &str,
+    ) -> Result<TrtllmLowLatencyGemmKernelFns, FlashInferError> {
+        let mut cache = self
+            .trtllm_low_latency_gemm_kernel_cache
+            .lock()
+            .map_err(|_| {
+                FlashInferError::invalid_argument("trtllm low latency gemm cache lock is poisoned")
+            })?;
+
+        if let Some(kernel) = cache.get(kernel_uri) {
+            return Ok(kernel.fns);
+        }
+
+        let kernel_path =
+            extract_jit_kernel(&self.jit_cache_wheel_path, &self.artifact_dir, kernel_uri)?;
+
+        let kernel_lib =
+            unsafe { Library::open(Some(&kernel_path), libc::RTLD_NOW | libc::RTLD_LOCAL) }
+                .map_err(|e| FlashInferError::LibraryLoad {
+                    library: kernel_path.clone(),
+                    message: e.to_string(),
+                })?;
+
+        let tactics: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_trtllm_low_latency_gemm_tactics\0",
+                "__tvm_ffi_trtllm_low_latency_gemm_tactics",
+            )?
+        };
+        let workspace_size: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_get_workspace_size_in_bytes\0",
+                "__tvm_ffi_get_workspace_size_in_bytes",
+            )?
+        };
+        let fns = TrtllmLowLatencyGemmKernelFns {
+            tactics,
+            workspace_size,
+        };
+
+        cache.insert(
+            kernel_uri.to_string(),
+            LoadedTrtllmLowLatencyGemmKernel {
+                _lib: kernel_lib,
+                fns,
+            },
+        );
+        Ok(fns)
+    }
+
     unsafe fn load(resolved: ResolvedRuntimeConfig) -> Result<Self, FlashInferError> {
         let materialized_wheels = ensure_pinned_wheels_cached(&resolved.cache_dir)?;
         let artifacts = extract_artifacts(&resolved, &materialized_wheels)?;
@@ -956,6 +1306,9 @@ impl FlashInferRuntime {
             single_decode_kernel_cache: Mutex::new(HashMap::new()),
             batch_decode_kernel_cache: Mutex::new(HashMap::new()),
             fused_moe_kernel_cache: Mutex::new(HashMap::new()),
+            tgv_gemm_kernel_cache: Mutex::new(HashMap::new()),
+            trtllm_gemm_kernel_cache: Mutex::new(HashMap::new()),
+            trtllm_low_latency_gemm_kernel_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -988,6 +1341,17 @@ impl FlashInferRuntime {
 
         FlashInferError::tvm_ffi_call(code, kind, message, backtrace)
     }
+}
+
+fn any_to_i64(any: &TVMFFIAny, context: &str) -> Result<i64, FlashInferError> {
+    if any.type_index != KTVM_FFI_INT {
+        return Err(FlashInferError::invalid_argument(format!(
+            "{context} returned non-int type index {}",
+            any.type_index
+        )));
+    }
+    // SAFETY: type_index is checked to be KTVM_FFI_INT.
+    Ok(unsafe { any.value.v_int64 })
 }
 
 unsafe fn resolve_symbol<T: Copy>(
@@ -1396,6 +1760,7 @@ fn sha256_file_hex(path: &Path, wheel: &'static str) -> Result<String, FlashInfe
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[cfg(test)]
 fn sha256_bytes_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);

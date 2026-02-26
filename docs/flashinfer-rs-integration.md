@@ -6,6 +6,10 @@ A Python wheel (`*.whl`) is a zip archive that carries prebuilt artifacts. For t
 - `flashinfer_jit_cache/.../jit_cache/norm/norm.so`
 - `flashinfer_jit_cache/.../jit_cache/gdn_prefill_sm90/gdn_prefill_sm90.so`
 - `flashinfer_jit_cache/.../jit_cache/page/page.so`
+- `flashinfer_jit_cache/.../jit_cache/tgv_gemm_fp16/tgv_gemm_fp16.so`
+- `flashinfer_jit_cache/.../jit_cache/tgv_gemm_bf16/tgv_gemm_bf16.so`
+- `flashinfer_jit_cache/.../jit_cache/trtllm_gemm/trtllm_gemm.so`
+- `flashinfer_jit_cache/.../jit_cache/trtllm_low_latency_gemm/trtllm_low_latency_gemm.so`
 - `flashinfer_jit_cache/.../jit_cache/single_prefill_with_kv_cache_.../single_prefill_with_kv_cache_....so`
 - `flashinfer_jit_cache/.../jit_cache/batch_prefill_with_kv_cache_.../batch_prefill_with_kv_cache_....so`
 - `flashinfer_jit_cache/.../jit_cache/single_decode_with_kv_cache_.../single_decode_with_kv_cache_....so`
@@ -55,6 +59,9 @@ The Rust integration calls the exported TVM-FFI host wrapper:
 - `__tvm_ffi_gdn_prefill`
 - `__tvm_ffi_append_paged_kv_cache` (from fixed `page.so`)
 - `__tvm_ffi_append_paged_mla_kv_cache` (from fixed `page.so`)
+- `__tvm_ffi_tgv_gemm` and `__tvm_ffi_tgv_gemm_tactic_num` (from `tgv_gemm_fp16.so` / `tgv_gemm_bf16.so`)
+- `__tvm_ffi_trtllm_gemm_tactics` (from `trtllm_gemm.so`)
+- `__tvm_ffi_trtllm_low_latency_gemm_tactics` and `__tvm_ffi_get_workspace_size_in_bytes` (from `trtllm_low_latency_gemm.so`)
 - `__tvm_ffi_run` (for `single_prefill_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_plan`, `__tvm_ffi_ragged_run`, and `__tvm_ffi_paged_run` (for `batch_prefill_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_run` (for `single_decode_with_kv_cache` JIT-cache modules)
@@ -78,6 +85,9 @@ Runtime loading order:
 6. Load `batch_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
 7. Load `single_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
 8. Load `batch_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+9. Load `tgv_gemm_fp16`/`tgv_gemm_bf16` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+10. Load `trtllm_gemm` module on demand with `RTLD_NOW | RTLD_LOCAL`
+11. Load `trtllm_low_latency_gemm` module on demand with `RTLD_NOW | RTLD_LOCAL`
 
 Required CUDA runtime dependency from `norm.so`:
 
@@ -138,6 +148,18 @@ For paged KV append kernels, Rust resolves fixed symbols from the fixed `page.so
 
 - `__tvm_ffi_append_paged_kv_cache`
 - `__tvm_ffi_append_paged_mla_kv_cache`
+
+For GEMM in this integration:
+
+- `tgv_gemm` is bound for MM-only semantics (`A [m,k]`, `B [k,n]`, `out [m,n]`) with `f16`/`bf16`.
+- Rust maps MM semantics to the upstream ABI by passing transposed views (`mat1=B^T`, `mat2=A^T`) without copies.
+- f16/bf16 BMM is intentionally out of scope in this change because corresponding wheel exports are not present in the pinned artifacts.
+
+For TRTLLM GEMM support:
+
+- `trtllm_gemm_tactics` is exposed from `trtllm_gemm.so`.
+- `trtllm_low_latency_gemm_tactics` and `get_workspace_size_in_bytes` are exposed from `trtllm_low_latency_gemm.so`.
+- Array results (`Array<int64_t>`) are decoded via TVM globals `ffi.ArraySize` and `ffi.ArrayGetItem`.
 
 For MHA batched ragged prefill (FA2 path), Rust similarly constructs:
 
