@@ -72,6 +72,9 @@ pub enum FlashInferError {
     #[error("failed to restore CUDA stream context for device {device_id} (code {code})")]
     StreamRestore { device_id: i32, code: i32 },
 
+    #[error("failed to register DLPack managed tensor allocator with TVM-FFI (code {code})")]
+    DLPackManagedTensorAllocatorSet { code: i32 },
+
     #[error("failed to create cache directory `{path}`")]
     CreateCacheDir {
         path: PathBuf,

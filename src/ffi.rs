@@ -21,6 +21,9 @@ pub const KDL_BFLOAT: u8 = 4;
 
 pub type TVMFFIObjectHandle = *mut c_void;
 
+pub const DLPACK_MAJOR_VERSION: u32 = 1;
+pub const DLPACK_MINOR_VERSION: u32 = 2;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DLDevice {
@@ -47,6 +50,32 @@ pub struct DLTensor {
     pub strides: *mut i64,
     pub byte_offset: u64,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DLPackVersion {
+    pub major: u32,
+    pub minor: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DLManagedTensorVersioned {
+    pub version: DLPackVersion,
+    pub manager_ctx: *mut c_void,
+    pub deleter: Option<unsafe extern "C" fn(*mut DLManagedTensorVersioned)>,
+    pub flags: u64,
+    pub dl_tensor: DLTensor,
+}
+
+pub type DLPackSetErrorFn = Option<unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char)>;
+
+pub type DLPackManagedTensorAllocator = unsafe extern "C" fn(
+    *mut DLTensor,
+    *mut *mut DLManagedTensorVersioned,
+    *mut c_void,
+    DLPackSetErrorFn,
+) -> i32;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
