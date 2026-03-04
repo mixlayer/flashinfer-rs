@@ -2,8 +2,10 @@ use std::ffi::c_void;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    DLDataType, DLDevice, DLTensor, KDL_BFLOAT, KDL_CUDA, KDL_FLOAT, KDL_INT, TVMFFIAny, any_bool,
-    any_dltensor_ptr, any_dtype, any_i64, any_none, any_object_handle,
+    DLDataType, DLDevice, DLManagedTensorVersioned, DLPACK_MAJOR_VERSION, DLPACK_MINOR_VERSION,
+    DLPackVersion, DLTensor, KDL_BFLOAT, KDL_CUDA, KDL_FLOAT, KDL_FLOAT8_E4M3FN, KDL_INT,
+    TVMFFIAny, any_bool, any_dltensor_ptr, any_dtype, any_i64, any_none, any_object_handle,
+    any_tensor_object,
 };
 use crate::norm::DType;
 use crate::runtime::FlashInferRuntime;
@@ -112,6 +114,67 @@ pub struct FusedMoeTensor2DF32Desc {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct FusedMoeTensor0DF32Desc {
+    pub ptr: *const c_void,
+    pub device_id: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FusedMoeTensor1DF32Desc {
+    pub ptr: *const c_void,
+    pub len: i64,
+    pub stride: i64,
+    pub device_id: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FusedMoeTensor3DF32Desc {
+    pub ptr: *const c_void,
+    pub dim0: i64,
+    pub dim1: i64,
+    pub dim2: i64,
+    pub stride0: i64,
+    pub stride1: i64,
+    pub stride2: i64,
+    pub device_id: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum FusedMoeFp8ActScaleDesc {
+    Scalar(FusedMoeTensor0DF32Desc),
+    PerExpert(FusedMoeTensor1DF32Desc),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FusedMoeFp8PerTensorQuantParams {
+    /// FC1 dequant scale, rank-1 f32: `[num_experts_on_rank]`.
+    pub fc1_dequant: FusedMoeTensor1DF32Desc,
+    /// FC2 activation quant scale, either rank-0 f32 scalar or rank-1 f32:
+    /// `[num_experts_on_rank]`.
+    pub fc2_quant: FusedMoeFp8ActScaleDesc,
+    /// FC2 dequant scale, rank-1 f32: `[num_experts_on_rank]`.
+    pub fc2_dequant: FusedMoeTensor1DF32Desc,
+    /// FC1 input dequant scale, rank-0 f32 scalar.
+    pub fc1_input_dequant: FusedMoeTensor0DF32Desc,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FusedMoeDeepSeekFp8BlockScaleQuantParams {
+    /// FC1 block scales, rank-3 f32:
+    /// `[num_experts_on_rank, fc1_expert_weights.dim1 / 128, hidden_size / 128]`.
+    pub fc1_scales: FusedMoeTensor3DF32Desc,
+    /// FC2 block scales, rank-3 f32:
+    /// `[num_experts_on_rank, hidden_size / 128, inter_size / 128]`.
+    pub fc2_scales: FusedMoeTensor3DF32Desc,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum FusedMoeQuantization {
+    Fp8PerTensor(FusedMoeFp8PerTensorQuantParams),
+    DeepSeekFp8BlockScale(FusedMoeDeepSeekFp8BlockScaleQuantParams),
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct FusedMoeParams {
     /// Output tensor, rank-2: `[num_tokens, hidden_size]`.
     ///
@@ -154,6 +217,8 @@ pub struct FusedMoeParams {
     ///
     /// If omitted, FlashInfer host code selects defaults.
     pub profile_ids: Option<[i64; 2]>,
+    /// Optional quantization mode/scales consumed by CUTLASS fused MoE.
+    pub quantization: Option<FusedMoeQuantization>,
     /// CUDA stream (`cudaStream_t`) used for async launch.
     pub stream: *mut c_void,
 }
@@ -186,6 +251,7 @@ impl FusedMoeParams {
             ep_rank: 0,
             enable_alltoall: false,
             profile_ids: None,
+            quantization: None,
             stream,
         }
     }
@@ -234,6 +300,27 @@ impl FusedMoeParams {
 
     pub fn with_profile_ids(mut self, gemm1_profile_id: i64, gemm2_profile_id: i64) -> Self {
         self.profile_ids = Some([gemm1_profile_id, gemm2_profile_id]);
+        self
+    }
+
+    pub fn with_quantization(mut self, quantization: FusedMoeQuantization) -> Self {
+        self.quantization = Some(quantization);
+        self
+    }
+
+    pub fn with_fp8_per_tensor_quantization(
+        mut self,
+        quantization: FusedMoeFp8PerTensorQuantParams,
+    ) -> Self {
+        self.quantization = Some(FusedMoeQuantization::Fp8PerTensor(quantization));
+        self
+    }
+
+    pub fn with_deepseek_fp8_block_scale_quantization(
+        mut self,
+        quantization: FusedMoeDeepSeekFp8BlockScaleQuantParams,
+    ) -> Self {
+        self.quantization = Some(FusedMoeQuantization::DeepSeekFp8BlockScale(quantization));
         self
     }
 
@@ -363,11 +450,16 @@ unsafe fn fused_moe_with_runtime(
         )
     });
 
+    let use_deepseek_fp8_block_scale = matches!(
+        params.quantization,
+        Some(FusedMoeQuantization::DeepSeekFp8BlockScale(_))
+    );
+
     let init_args: [TVMFFIAny; 7] = [
         any_dtype(dl_dtype_from_dtype(params.input.dtype)),
         any_dtype(dl_dtype_from_dtype(params.fc1_expert_weights.dtype)),
         any_dtype(dl_dtype_from_dtype(params.out.dtype)),
-        any_bool(false), // use_deepseek_fp8_block_scale
+        any_bool(use_deepseek_fp8_block_scale),
         any_bool(false), // use_w4_group_scaling
         any_bool(false), // use_mxfp8_act_scaling
         any_bool(false), // use_packed_weights
@@ -460,6 +552,174 @@ unsafe fn fused_moe_with_runtime(
             .map(|any| AnyObjectDecRefGuard::new(runtime, any));
         let profile_ids_any = profile_ids_owned.as_ref().copied().unwrap_or_else(any_none);
 
+        let mut quant_tensor_guards: Vec<RawObjectDecRefGuard<'_>> = Vec::new();
+        let mut quant_scales_array_guard: Option<AnyObjectDecRefGuard<'_>> = None;
+        let quant_scales_any = if let Some(quantization) = params.quantization {
+            let mut scale_args = Vec::<TVMFFIAny>::new();
+            match quantization {
+                FusedMoeQuantization::Fp8PerTensor(quant) => {
+                    let mut fc1_dequant_shape = [quant.fc1_dequant.len];
+                    let mut fc1_dequant_strides = [quant.fc1_dequant.stride];
+                    let fc1_dequant_tensor = tensor_1d_f32(
+                        quant.fc1_dequant.ptr,
+                        quant.fc1_dequant.device_id,
+                        &mut fc1_dequant_shape,
+                        &mut fc1_dequant_strides,
+                        quant.fc1_dequant.len,
+                        quant.fc1_dequant.stride,
+                    );
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc1_dequant_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    match quant.fc2_quant {
+                        FusedMoeFp8ActScaleDesc::Scalar(scalar) => {
+                            let fc2_quant_tensor = tensor_0d_f32(scalar.ptr, scalar.device_id);
+                            unsafe {
+                                push_quant_scale_tensor_arg(
+                                    runtime,
+                                    &fc2_quant_tensor,
+                                    &mut scale_args,
+                                    &mut quant_tensor_guards,
+                                )?
+                            };
+                        }
+                        FusedMoeFp8ActScaleDesc::PerExpert(per_expert) => {
+                            let mut fc2_quant_shape = [per_expert.len];
+                            let mut fc2_quant_strides = [per_expert.stride];
+                            let fc2_quant_tensor = tensor_1d_f32(
+                                per_expert.ptr,
+                                per_expert.device_id,
+                                &mut fc2_quant_shape,
+                                &mut fc2_quant_strides,
+                                per_expert.len,
+                                per_expert.stride,
+                            );
+                            unsafe {
+                                push_quant_scale_tensor_arg(
+                                    runtime,
+                                    &fc2_quant_tensor,
+                                    &mut scale_args,
+                                    &mut quant_tensor_guards,
+                                )?
+                            };
+                        }
+                    }
+
+                    let mut fc2_dequant_shape = [quant.fc2_dequant.len];
+                    let mut fc2_dequant_strides = [quant.fc2_dequant.stride];
+                    let fc2_dequant_tensor = tensor_1d_f32(
+                        quant.fc2_dequant.ptr,
+                        quant.fc2_dequant.device_id,
+                        &mut fc2_dequant_shape,
+                        &mut fc2_dequant_strides,
+                        quant.fc2_dequant.len,
+                        quant.fc2_dequant.stride,
+                    );
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc2_dequant_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let fc1_input_dequant_tensor = tensor_0d_f32(
+                        quant.fc1_input_dequant.ptr,
+                        quant.fc1_input_dequant.device_id,
+                    );
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc1_input_dequant_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+                }
+                FusedMoeQuantization::DeepSeekFp8BlockScale(quant) => {
+                    let mut fc1_scales_shape = [
+                        quant.fc1_scales.dim0,
+                        quant.fc1_scales.dim1,
+                        quant.fc1_scales.dim2,
+                    ];
+                    let mut fc1_scales_strides = [
+                        quant.fc1_scales.stride0,
+                        quant.fc1_scales.stride1,
+                        quant.fc1_scales.stride2,
+                    ];
+                    let fc1_scales_tensor = tensor_3d_f32(
+                        quant.fc1_scales.ptr,
+                        quant.fc1_scales.device_id,
+                        &mut fc1_scales_shape,
+                        &mut fc1_scales_strides,
+                    );
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc1_scales_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let mut fc2_scales_shape = [
+                        quant.fc2_scales.dim0,
+                        quant.fc2_scales.dim1,
+                        quant.fc2_scales.dim2,
+                    ];
+                    let mut fc2_scales_strides = [
+                        quant.fc2_scales.stride0,
+                        quant.fc2_scales.stride1,
+                        quant.fc2_scales.stride2,
+                    ];
+                    let fc2_scales_tensor = tensor_3d_f32(
+                        quant.fc2_scales.ptr,
+                        quant.fc2_scales.device_id,
+                        &mut fc2_scales_shape,
+                        &mut fc2_scales_strides,
+                    );
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc2_scales_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+                }
+            }
+
+            // SAFETY: function is resolved from global table; caller owns reference and must decref.
+            let array_ctor_handle = unsafe { runtime.get_global_function(ARRAY_GLOBAL)? };
+            let mut array_ctor_guard = RawObjectDecRefGuard::new(runtime, array_ctor_handle);
+            let mut quant_scales_view = any_none();
+            // SAFETY: invoking TVM Function object with ABI-packed args.
+            unsafe {
+                runtime.call_function(
+                    array_ctor_handle,
+                    scale_args.as_mut_ptr(),
+                    scale_args.len() as i32,
+                    &mut quant_scales_view as *mut _,
+                )?;
+            }
+
+            // SAFETY: result view is produced by TVM-FFI and copied to owned Any.
+            let quant_scales_owned = unsafe { runtime.any_view_to_owned(&quant_scales_view)? };
+            array_ctor_guard.release_now();
+            quant_scales_array_guard =
+                Some(AnyObjectDecRefGuard::new(runtime, &quant_scales_owned));
+            quant_scales_owned
+        } else {
+            any_none()
+        };
+
         let mut run_args: [TVMFFIAny; 24] = [
             any_dltensor_ptr(&out_tensor),
             any_dltensor_ptr(&input_tensor),
@@ -469,7 +729,7 @@ unsafe fn fused_moe_with_runtime(
             optional_dltensor_any(fc1_expert_biases_tensor.as_ref()),
             any_dltensor_ptr(&fc2_expert_weights_tensor),
             optional_dltensor_any(fc2_expert_biases_tensor.as_ref()),
-            any_none(), // quant_scales
+            quant_scales_any,
             any_none(), // input_sf
             any_none(), // swiglu_alpha
             any_none(), // swiglu_beta
@@ -500,6 +760,12 @@ unsafe fn fused_moe_with_runtime(
 
         if let Some(profile_ids_guard) = profile_ids_guard.as_mut() {
             profile_ids_guard.release_now();
+        }
+        if let Some(quant_scales_array_guard) = quant_scales_array_guard.as_mut() {
+            quant_scales_array_guard.release_now();
+        }
+        for quant_tensor_guard in quant_tensor_guards.iter_mut().rev() {
+            quant_tensor_guard.release_now();
         }
         run_moe_function_guard.release_now();
         run_moe_name_guard.release_now();
@@ -617,13 +883,33 @@ fn validate_fused_moe(params: &FusedMoeParams) -> Result<(), FlashInferError> {
         )));
     }
 
-    if params.input.dtype != params.fc1_expert_weights.dtype
-        || params.input.dtype != params.fc2_expert_weights.dtype
-        || params.input.dtype != params.out.dtype
-    {
-        return Err(FlashInferError::invalid_argument(
-            "dtype mismatch: v1 fused_moe requires input/weights/out to share the same dtype",
-        ));
+    match params.quantization {
+        None => {
+            if params.input.dtype == DType::F8E4M3FN
+                || params.fc1_expert_weights.dtype == DType::F8E4M3FN
+                || params.fc2_expert_weights.dtype == DType::F8E4M3FN
+                || params.out.dtype == DType::F8E4M3FN
+            {
+                return Err(FlashInferError::invalid_argument(
+                    "fp8 fused_moe requires explicit quantization metadata",
+                ));
+            }
+
+            if params.input.dtype != params.fc1_expert_weights.dtype
+                || params.input.dtype != params.fc2_expert_weights.dtype
+                || params.input.dtype != params.out.dtype
+            {
+                return Err(FlashInferError::invalid_argument(
+                    "dtype mismatch: fused_moe requires input/weights/out to share the same dtype when quantization is disabled",
+                ));
+            }
+        }
+        Some(FusedMoeQuantization::Fp8PerTensor(quant)) => {
+            validate_fp8_per_tensor_quantization(params, quant)?;
+        }
+        Some(FusedMoeQuantization::DeepSeekFp8BlockScale(quant)) => {
+            validate_deepseek_fp8_block_scale_quantization(params, quant)?;
+        }
     }
 
     if let Some(desc) = params.token_final_scales {
@@ -724,6 +1010,185 @@ fn validate_fused_moe(params: &FusedMoeParams) -> Result<(), FlashInferError> {
     Ok(())
 }
 
+fn validate_fp8_per_tensor_quantization(
+    params: &FusedMoeParams,
+    quant: FusedMoeFp8PerTensorQuantParams,
+) -> Result<(), FlashInferError> {
+    check_non_null(quant.fc1_dequant.ptr, "quant.fc1_dequant")?;
+    check_non_null(quant.fc2_dequant.ptr, "quant.fc2_dequant")?;
+    check_non_null(quant.fc1_input_dequant.ptr, "quant.fc1_input_dequant")?;
+    match quant.fc2_quant {
+        FusedMoeFp8ActScaleDesc::Scalar(desc) => {
+            check_non_null(desc.ptr, "quant.fc2_quant")?;
+            if desc.device_id != params.input.device_id {
+                return Err(FlashInferError::invalid_argument(
+                    "device mismatch: quant.fc2_quant must be on same device as input",
+                ));
+            }
+        }
+        FusedMoeFp8ActScaleDesc::PerExpert(desc) => {
+            check_non_null(desc.ptr, "quant.fc2_quant")?;
+            check_positive("quant.fc2_quant.len", desc.len)?;
+            if desc.stride != 1 {
+                return Err(FlashInferError::invalid_argument(
+                    "quant.fc2_quant last-dimension stride must be 1",
+                ));
+            }
+            if desc.device_id != params.input.device_id {
+                return Err(FlashInferError::invalid_argument(
+                    "device mismatch: quant.fc2_quant must be on same device as input",
+                ));
+            }
+        }
+    }
+
+    if params.input.dtype != DType::F8E4M3FN
+        || params.fc1_expert_weights.dtype != DType::F8E4M3FN
+        || params.fc2_expert_weights.dtype != DType::F8E4M3FN
+    {
+        return Err(FlashInferError::invalid_argument(
+            "fp8 per-tensor fused_moe requires input/fc1/fc2 dtypes to be F8E4M3FN",
+        ));
+    }
+
+    if params.out.dtype != DType::F16 && params.out.dtype != DType::BF16 {
+        return Err(FlashInferError::invalid_argument(
+            "fp8 per-tensor fused_moe requires out dtype to be F16 or BF16",
+        ));
+    }
+
+    check_positive("quant.fc1_dequant.len", quant.fc1_dequant.len)?;
+    check_positive("quant.fc2_dequant.len", quant.fc2_dequant.len)?;
+    if quant.fc1_dequant.stride != 1 {
+        return Err(FlashInferError::invalid_argument(
+            "quant.fc1_dequant last-dimension stride must be 1",
+        ));
+    }
+    if quant.fc2_dequant.stride != 1 {
+        return Err(FlashInferError::invalid_argument(
+            "quant.fc2_dequant last-dimension stride must be 1",
+        ));
+    }
+
+    let num_experts_on_rank = params.fc1_expert_weights.dim0;
+    if quant.fc1_dequant.len != num_experts_on_rank {
+        return Err(FlashInferError::invalid_argument(format!(
+            "shape mismatch: quant.fc1_dequant.len ({}) must equal num_experts_on_rank ({num_experts_on_rank})",
+            quant.fc1_dequant.len
+        )));
+    }
+    if quant.fc2_dequant.len != num_experts_on_rank {
+        return Err(FlashInferError::invalid_argument(format!(
+            "shape mismatch: quant.fc2_dequant.len ({}) must equal num_experts_on_rank ({num_experts_on_rank})",
+            quant.fc2_dequant.len
+        )));
+    }
+    if let FusedMoeFp8ActScaleDesc::PerExpert(desc) = quant.fc2_quant {
+        if desc.len != num_experts_on_rank {
+            return Err(FlashInferError::invalid_argument(format!(
+                "shape mismatch: quant.fc2_quant.len ({}) must equal num_experts_on_rank ({num_experts_on_rank})",
+                desc.len
+            )));
+        }
+    }
+
+    if quant.fc1_dequant.device_id != params.input.device_id
+        || quant.fc2_dequant.device_id != params.input.device_id
+        || quant.fc1_input_dequant.device_id != params.input.device_id
+    {
+        return Err(FlashInferError::invalid_argument(
+            "device mismatch: fp8 per-tensor quant scales must be on same device as input",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_deepseek_fp8_block_scale_quantization(
+    params: &FusedMoeParams,
+    quant: FusedMoeDeepSeekFp8BlockScaleQuantParams,
+) -> Result<(), FlashInferError> {
+    check_non_null(quant.fc1_scales.ptr, "quant.fc1_scales")?;
+    check_non_null(quant.fc2_scales.ptr, "quant.fc2_scales")?;
+    check_positive("quant.fc1_scales.dim0", quant.fc1_scales.dim0)?;
+    check_positive("quant.fc1_scales.dim1", quant.fc1_scales.dim1)?;
+    check_positive("quant.fc1_scales.dim2", quant.fc1_scales.dim2)?;
+    check_positive("quant.fc2_scales.dim0", quant.fc2_scales.dim0)?;
+    check_positive("quant.fc2_scales.dim1", quant.fc2_scales.dim1)?;
+    check_positive("quant.fc2_scales.dim2", quant.fc2_scales.dim2)?;
+    check_last_contiguous_3d("quant.fc1_scales", quant.fc1_scales.stride2)?;
+    check_last_contiguous_3d("quant.fc2_scales", quant.fc2_scales.stride2)?;
+
+    if params.backend != FusedMoeBackend::Sm90 {
+        return Err(FlashInferError::invalid_argument(
+            "deepseek fp8 block-scale fused_moe currently requires backend Sm90",
+        ));
+    }
+    if params.input.dtype != DType::BF16 || params.out.dtype != DType::BF16 {
+        return Err(FlashInferError::invalid_argument(
+            "deepseek fp8 block-scale fused_moe requires input/out dtype to be BF16",
+        ));
+    }
+    if params.fc1_expert_weights.dtype != DType::F8E4M3FN
+        || params.fc2_expert_weights.dtype != DType::F8E4M3FN
+    {
+        return Err(FlashInferError::invalid_argument(
+            "deepseek fp8 block-scale fused_moe requires fc1/fc2 weight dtype to be F8E4M3FN",
+        ));
+    }
+
+    if params.input.cols % 128 != 0 {
+        return Err(FlashInferError::invalid_argument(format!(
+            "deepseek fp8 block-scale requires hidden_size (input.cols={}) divisible by 128",
+            params.input.cols
+        )));
+    }
+    if params.fc2_expert_weights.dim2 % 128 != 0 {
+        return Err(FlashInferError::invalid_argument(format!(
+            "deepseek fp8 block-scale requires inter_size (fc2_expert_weights.dim2={}) divisible by 128",
+            params.fc2_expert_weights.dim2
+        )));
+    }
+    if params.fc1_expert_weights.dim1 % 128 != 0 {
+        return Err(FlashInferError::invalid_argument(format!(
+            "deepseek fp8 block-scale requires fc1_expert_weights.dim1 ({}) divisible by 128",
+            params.fc1_expert_weights.dim1
+        )));
+    }
+
+    let expected_fc1_dim1 = params.fc1_expert_weights.dim1 / 128;
+    let expected_hidden_scale = params.input.cols / 128;
+    let expected_fc2_dim2 = params.fc2_expert_weights.dim2 / 128;
+    let num_experts_on_rank = params.fc1_expert_weights.dim0;
+
+    if quant.fc1_scales.dim0 != num_experts_on_rank
+        || quant.fc1_scales.dim1 != expected_fc1_dim1
+        || quant.fc1_scales.dim2 != expected_hidden_scale
+    {
+        return Err(FlashInferError::invalid_argument(format!(
+            "shape mismatch: quant.fc1_scales must be [{num_experts_on_rank}, {expected_fc1_dim1}, {expected_hidden_scale}]",
+        )));
+    }
+    if quant.fc2_scales.dim0 != num_experts_on_rank
+        || quant.fc2_scales.dim1 != expected_hidden_scale
+        || quant.fc2_scales.dim2 != expected_fc2_dim2
+    {
+        return Err(FlashInferError::invalid_argument(format!(
+            "shape mismatch: quant.fc2_scales must be [{num_experts_on_rank}, {expected_hidden_scale}, {expected_fc2_dim2}]",
+        )));
+    }
+
+    if quant.fc1_scales.device_id != params.input.device_id
+        || quant.fc2_scales.device_id != params.input.device_id
+    {
+        return Err(FlashInferError::invalid_argument(
+            "device mismatch: deepseek fp8 block scales must be on same device as input",
+        ));
+    }
+
+    Ok(())
+}
+
 fn optional_dltensor_any(tensor: Option<&DLTensor>) -> TVMFFIAny {
     match tensor {
         Some(tensor) => any_dltensor_ptr(tensor),
@@ -741,6 +1206,11 @@ fn dl_dtype_from_dtype(dtype: DType) -> DLDataType {
         DType::BF16 => DLDataType {
             code: KDL_BFLOAT,
             bits: 16,
+            lanes: 1,
+        },
+        DType::F8E4M3FN => DLDataType {
+            code: KDL_FLOAT8_E4M3FN,
+            bits: 8,
             lanes: 1,
         },
     }
@@ -843,6 +1313,211 @@ fn tensor_2d_f32(
         strides: strides.as_mut_ptr(),
         byte_offset: 0,
     }
+}
+
+fn tensor_0d_f32(ptr: *const c_void, device_id: i32) -> DLTensor {
+    DLTensor {
+        data: ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id,
+        },
+        ndim: 0,
+        dtype: DLDataType {
+            code: KDL_FLOAT,
+            bits: 32,
+            lanes: 1,
+        },
+        shape: std::ptr::null_mut(),
+        strides: std::ptr::null_mut(),
+        byte_offset: 0,
+    }
+}
+
+fn tensor_1d_f32(
+    ptr: *const c_void,
+    device_id: i32,
+    shape: &mut [i64; 1],
+    strides: &mut [i64; 1],
+    len: i64,
+    stride: i64,
+) -> DLTensor {
+    shape[0] = len;
+    strides[0] = stride;
+
+    DLTensor {
+        data: ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id,
+        },
+        ndim: 1,
+        dtype: DLDataType {
+            code: KDL_FLOAT,
+            bits: 32,
+            lanes: 1,
+        },
+        shape: shape.as_mut_ptr(),
+        strides: strides.as_mut_ptr(),
+        byte_offset: 0,
+    }
+}
+
+fn tensor_3d_f32(
+    ptr: *const c_void,
+    device_id: i32,
+    shape: &mut [i64; 3],
+    strides: &mut [i64; 3],
+) -> DLTensor {
+    DLTensor {
+        data: ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id,
+        },
+        ndim: 3,
+        dtype: DLDataType {
+            code: KDL_FLOAT,
+            bits: 32,
+            lanes: 1,
+        },
+        shape: shape.as_mut_ptr(),
+        strides: strides.as_mut_ptr(),
+        byte_offset: 0,
+    }
+}
+
+struct BorrowedDLPackTensorContext {
+    shape: Box<[i64]>,
+    strides: Box<[i64]>,
+}
+
+struct ManagedDLPackTensor {
+    raw: *mut DLManagedTensorVersioned,
+}
+
+impl ManagedDLPackTensor {
+    fn from_dltensor(tensor: &DLTensor) -> Result<Self, FlashInferError> {
+        let ndim = usize::try_from(tensor.ndim).map_err(|_| {
+            FlashInferError::invalid_argument(format!("negative tensor ndim {}", tensor.ndim))
+        })?;
+
+        let mut shape = Vec::with_capacity(ndim);
+        let mut strides = Vec::with_capacity(ndim);
+        if ndim > 0 {
+            if tensor.shape.is_null() {
+                return Err(FlashInferError::invalid_argument(
+                    "tensor shape pointer is null for ndim > 0",
+                ));
+            }
+            if tensor.strides.is_null() {
+                return Err(FlashInferError::invalid_argument(
+                    "tensor strides pointer is null for ndim > 0",
+                ));
+            }
+            // SAFETY: `shape`/`strides` pointers must be valid for `ndim` elements for this call.
+            let shape_src = unsafe { std::slice::from_raw_parts(tensor.shape, ndim) };
+            // SAFETY: `shape`/`strides` pointers must be valid for `ndim` elements for this call.
+            let strides_src = unsafe { std::slice::from_raw_parts(tensor.strides, ndim) };
+            shape.extend_from_slice(shape_src);
+            strides.extend_from_slice(strides_src);
+        }
+
+        let mut ctx = Box::new(BorrowedDLPackTensorContext {
+            shape: shape.into_boxed_slice(),
+            strides: strides.into_boxed_slice(),
+        });
+        let shape_ptr = if ndim == 0 {
+            std::ptr::null_mut()
+        } else {
+            ctx.shape.as_mut_ptr()
+        };
+        let strides_ptr = if ndim == 0 {
+            std::ptr::null_mut()
+        } else {
+            ctx.strides.as_mut_ptr()
+        };
+        let ctx_ptr = Box::into_raw(ctx).cast::<c_void>();
+
+        let managed = Box::new(DLManagedTensorVersioned {
+            version: DLPackVersion {
+                major: DLPACK_MAJOR_VERSION,
+                minor: DLPACK_MINOR_VERSION,
+            },
+            manager_ctx: ctx_ptr,
+            deleter: Some(borrowed_dlpack_tensor_deleter),
+            flags: 0,
+            dl_tensor: DLTensor {
+                data: tensor.data,
+                device: tensor.device,
+                ndim: tensor.ndim,
+                dtype: tensor.dtype,
+                shape: shape_ptr,
+                strides: strides_ptr,
+                byte_offset: tensor.byte_offset,
+            },
+        });
+
+        Ok(Self {
+            raw: Box::into_raw(managed),
+        })
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut DLManagedTensorVersioned {
+        self.raw
+    }
+
+    fn release_ownership(&mut self) {
+        self.raw = std::ptr::null_mut();
+    }
+}
+
+impl Drop for ManagedDLPackTensor {
+    fn drop(&mut self) {
+        if self.raw.is_null() {
+            return;
+        }
+        // SAFETY: `self.raw` is uniquely owned by this wrapper and not transferred.
+        unsafe {
+            free_borrowed_dlpack_tensor(self.raw);
+        }
+        self.raw = std::ptr::null_mut();
+    }
+}
+
+unsafe extern "C" fn borrowed_dlpack_tensor_deleter(raw: *mut DLManagedTensorVersioned) {
+    // SAFETY: called by TVM-FFI when it owns this DLManagedTensorVersioned.
+    unsafe {
+        free_borrowed_dlpack_tensor(raw);
+    }
+}
+
+unsafe fn free_borrowed_dlpack_tensor(raw: *mut DLManagedTensorVersioned) {
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: pointer must have originated from `Box::into_raw` in `ManagedDLPackTensor`.
+    let managed = unsafe { Box::from_raw(raw) };
+    if !managed.manager_ctx.is_null() {
+        // SAFETY: manager_ctx is allocated as `BorrowedDLPackTensorContext`.
+        let _ = unsafe { Box::from_raw(managed.manager_ctx.cast::<BorrowedDLPackTensorContext>()) };
+    }
+}
+
+unsafe fn push_quant_scale_tensor_arg<'a>(
+    runtime: &'a FlashInferRuntime,
+    tensor: &DLTensor,
+    args: &mut Vec<TVMFFIAny>,
+    guards: &mut Vec<RawObjectDecRefGuard<'a>>,
+) -> Result<(), FlashInferError> {
+    let mut managed = ManagedDLPackTensor::from_dltensor(tensor)?;
+    // SAFETY: arguments follow TVM-FFI C API contract.
+    let tensor_obj =
+        unsafe { runtime.tensor_from_dlpack_versioned(managed.as_mut_ptr(), 1, false)? };
+    managed.release_ownership();
+    args.push(any_tensor_object(tensor_obj));
+    guards.push(RawObjectDecRefGuard::new(runtime, tensor_obj));
+    Ok(())
 }
 
 struct StreamRestoreGuard<'a> {
@@ -1059,6 +1734,12 @@ where
     W2: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtr<T>,
     O: cudarc::driver::DeviceSlice<T> + cudarc::driver::DevicePtrMut<T>,
 {
+    if dtype == DType::F8E4M3FN {
+        return Err(FlashInferError::invalid_argument(
+            "fused_moe_cudarc does not support fp8 quantization; use fused_moe_cudarc_fp8_per_tensor or fused_moe_cudarc_deepseek_fp8_block_scale",
+        ));
+    }
+
     let fc1_inter_size = if options.activation.is_gated() {
         inter_size.checked_mul(2).ok_or_else(|| {
             FlashInferError::invalid_argument("inter_size * 2 overflow for gated activation")
@@ -1220,15 +1901,555 @@ where
     fused_moe(&params)
 }
 
+#[cfg(feature = "cudarc")]
+pub fn fused_moe_cudarc_fp8_per_tensor<I, S, W1, W2, O, Q1, Q2, Q3, Q4>(
+    stream: &cudarc::driver::CudaStream,
+    input: &I,
+    token_selected_experts: &S,
+    fc1_expert_weights: &W1,
+    fc2_expert_weights: &W2,
+    out: &mut O,
+    fc1_dequant: &Q1,
+    fc2_quant: &Q2,
+    fc2_dequant: &Q3,
+    fc1_input_dequant: &Q4,
+    num_tokens: usize,
+    num_experts_on_rank: usize,
+    top_k: usize,
+    hidden_size: usize,
+    inter_size: usize,
+    output_dtype: DType,
+    backend: FusedMoeBackend,
+    options: FusedMoeCudarcOptions,
+) -> Result<(), FlashInferError>
+where
+    I: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtr<u8>,
+    S: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    W1: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtr<u8>,
+    W2: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtr<u8>,
+    O: cudarc::driver::DeviceSlice<u16> + cudarc::driver::DevicePtrMut<u16>,
+    Q1: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtr<f32>,
+    Q2: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtr<f32>,
+    Q3: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtr<f32>,
+    Q4: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtr<f32>,
+{
+    if output_dtype != DType::F16 && output_dtype != DType::BF16 {
+        return Err(FlashInferError::invalid_argument(
+            "fp8 per-tensor fused_moe requires output_dtype to be F16 or BF16",
+        ));
+    }
+
+    let fc1_inter_size = if options.activation.is_gated() {
+        inter_size.checked_mul(2).ok_or_else(|| {
+            FlashInferError::invalid_argument("inter_size * 2 overflow for gated activation")
+        })?
+    } else {
+        inter_size
+    };
+
+    let input_expected = num_tokens
+        .checked_mul(hidden_size)
+        .ok_or_else(|| FlashInferError::invalid_argument("num_tokens * hidden_size overflow"))?;
+    let out_expected = input_expected;
+    let topk_expected = num_tokens
+        .checked_mul(top_k)
+        .ok_or_else(|| FlashInferError::invalid_argument("num_tokens * top_k overflow"))?;
+    let fc1_expected = num_experts_on_rank
+        .checked_mul(fc1_inter_size)
+        .and_then(|v| v.checked_mul(hidden_size))
+        .ok_or_else(|| {
+            FlashInferError::invalid_argument(
+                "num_experts_on_rank * fc1_inter_size * hidden_size overflow",
+            )
+        })?;
+    let fc2_expected = num_experts_on_rank
+        .checked_mul(hidden_size)
+        .and_then(|v| v.checked_mul(inter_size))
+        .ok_or_else(|| {
+            FlashInferError::invalid_argument(
+                "num_experts_on_rank * hidden_size * inter_size overflow",
+            )
+        })?;
+
+    if input.len() != input_expected {
+        return Err(FlashInferError::invalid_argument(format!(
+            "input length ({}) must equal num_tokens * hidden_size ({input_expected})",
+            input.len()
+        )));
+    }
+    if out.len() != out_expected {
+        return Err(FlashInferError::invalid_argument(format!(
+            "out length ({}) must equal num_tokens * hidden_size ({out_expected})",
+            out.len()
+        )));
+    }
+    if token_selected_experts.len() != topk_expected {
+        return Err(FlashInferError::invalid_argument(format!(
+            "token_selected_experts length ({}) must equal num_tokens * top_k ({topk_expected})",
+            token_selected_experts.len()
+        )));
+    }
+    if fc1_expert_weights.len() != fc1_expected {
+        return Err(FlashInferError::invalid_argument(format!(
+            "fc1_expert_weights length ({}) must equal expected ({fc1_expected})",
+            fc1_expert_weights.len()
+        )));
+    }
+    if fc2_expert_weights.len() != fc2_expected {
+        return Err(FlashInferError::invalid_argument(format!(
+            "fc2_expert_weights length ({}) must equal expected ({fc2_expected})",
+            fc2_expert_weights.len()
+        )));
+    }
+    if fc1_dequant.len() != num_experts_on_rank {
+        return Err(FlashInferError::invalid_argument(format!(
+            "fc1_dequant length ({}) must equal num_experts_on_rank ({num_experts_on_rank})",
+            fc1_dequant.len()
+        )));
+    }
+    if fc2_dequant.len() != num_experts_on_rank {
+        return Err(FlashInferError::invalid_argument(format!(
+            "fc2_dequant length ({}) must equal num_experts_on_rank ({num_experts_on_rank})",
+            fc2_dequant.len()
+        )));
+    }
+    if fc2_quant.len() != 1 && fc2_quant.len() != num_experts_on_rank {
+        return Err(FlashInferError::invalid_argument(format!(
+            "fc2_quant length ({}) must be 1 or num_experts_on_rank ({num_experts_on_rank})",
+            fc2_quant.len()
+        )));
+    }
+    if fc1_input_dequant.len() != 1 {
+        return Err(FlashInferError::invalid_argument(format!(
+            "fc1_input_dequant length ({}) must be 1",
+            fc1_input_dequant.len()
+        )));
+    }
+
+    let (input_ptr, _input_sync) = input.device_ptr(stream);
+    let (token_selected_experts_ptr, _token_selected_experts_sync) =
+        token_selected_experts.device_ptr(stream);
+    let (fc1_expert_weights_ptr, _fc1_expert_weights_sync) = fc1_expert_weights.device_ptr(stream);
+    let (fc2_expert_weights_ptr, _fc2_expert_weights_sync) = fc2_expert_weights.device_ptr(stream);
+    let (out_ptr, _out_sync) = out.device_ptr_mut(stream);
+    let (fc1_dequant_ptr, _fc1_dequant_sync) = fc1_dequant.device_ptr(stream);
+    let (fc2_quant_ptr, _fc2_quant_sync) = fc2_quant.device_ptr(stream);
+    let (fc2_dequant_ptr, _fc2_dequant_sync) = fc2_dequant.device_ptr(stream);
+    let (fc1_input_dequant_ptr, _fc1_input_dequant_sync) = fc1_input_dequant.device_ptr(stream);
+
+    let num_tokens_i64 = i64::try_from(num_tokens)
+        .map_err(|_| FlashInferError::invalid_argument("num_tokens does not fit in i64"))?;
+    let num_experts_on_rank_i64 = i64::try_from(num_experts_on_rank).map_err(|_| {
+        FlashInferError::invalid_argument("num_experts_on_rank does not fit in i64")
+    })?;
+    let top_k_i64 = i64::try_from(top_k)
+        .map_err(|_| FlashInferError::invalid_argument("top_k does not fit in i64"))?;
+    let hidden_size_i64 = i64::try_from(hidden_size)
+        .map_err(|_| FlashInferError::invalid_argument("hidden_size does not fit in i64"))?;
+    let inter_size_i64 = i64::try_from(inter_size)
+        .map_err(|_| FlashInferError::invalid_argument("inter_size does not fit in i64"))?;
+    let fc1_inter_size_i64 = i64::try_from(fc1_inter_size)
+        .map_err(|_| FlashInferError::invalid_argument("fc1_inter_size does not fit in i64"))?;
+
+    let fc1_stride0 = fc1_inter_size_i64
+        .checked_mul(hidden_size_i64)
+        .ok_or_else(|| FlashInferError::invalid_argument("fc1 stride overflow"))?;
+    let fc2_stride0 = hidden_size_i64
+        .checked_mul(inter_size_i64)
+        .ok_or_else(|| FlashInferError::invalid_argument("fc2 stride overflow"))?;
+
+    let device_id = i32::try_from(stream.context().ordinal())
+        .map_err(|_| FlashInferError::invalid_argument("device id does not fit in i32"))?;
+
+    let fc2_quant_desc = if fc2_quant.len() == 1 {
+        FusedMoeFp8ActScaleDesc::Scalar(FusedMoeTensor0DF32Desc {
+            ptr: fc2_quant_ptr as usize as *const c_void,
+            device_id,
+        })
+    } else {
+        FusedMoeFp8ActScaleDesc::PerExpert(FusedMoeTensor1DF32Desc {
+            ptr: fc2_quant_ptr as usize as *const c_void,
+            len: num_experts_on_rank_i64,
+            stride: 1,
+            device_id,
+        })
+    };
+
+    let quantization = FusedMoeFp8PerTensorQuantParams {
+        fc1_dequant: FusedMoeTensor1DF32Desc {
+            ptr: fc1_dequant_ptr as usize as *const c_void,
+            len: num_experts_on_rank_i64,
+            stride: 1,
+            device_id,
+        },
+        fc2_quant: fc2_quant_desc,
+        fc2_dequant: FusedMoeTensor1DF32Desc {
+            ptr: fc2_dequant_ptr as usize as *const c_void,
+            len: num_experts_on_rank_i64,
+            stride: 1,
+            device_id,
+        },
+        fc1_input_dequant: FusedMoeTensor0DF32Desc {
+            ptr: fc1_input_dequant_ptr as usize as *const c_void,
+            device_id,
+        },
+    };
+
+    let params = FusedMoeParams::new(
+        FusedMoeTensor2DDesc {
+            ptr: out_ptr as usize as *const c_void,
+            rows: num_tokens_i64,
+            cols: hidden_size_i64,
+            stride_row: hidden_size_i64,
+            stride_col: 1,
+            dtype: output_dtype,
+            device_id,
+        },
+        FusedMoeTensor2DDesc {
+            ptr: input_ptr as usize as *const c_void,
+            rows: num_tokens_i64,
+            cols: hidden_size_i64,
+            stride_row: hidden_size_i64,
+            stride_col: 1,
+            dtype: DType::F8E4M3FN,
+            device_id,
+        },
+        FusedMoeTensor2DI32Desc {
+            ptr: token_selected_experts_ptr as usize as *const c_void,
+            rows: num_tokens_i64,
+            cols: top_k_i64,
+            stride_row: top_k_i64,
+            stride_col: 1,
+            device_id,
+        },
+        FusedMoeTensor3DDesc {
+            ptr: fc1_expert_weights_ptr as usize as *const c_void,
+            dim0: num_experts_on_rank_i64,
+            dim1: fc1_inter_size_i64,
+            dim2: hidden_size_i64,
+            stride0: fc1_stride0,
+            stride1: hidden_size_i64,
+            stride2: 1,
+            dtype: DType::F8E4M3FN,
+            device_id,
+        },
+        FusedMoeTensor3DDesc {
+            ptr: fc2_expert_weights_ptr as usize as *const c_void,
+            dim0: num_experts_on_rank_i64,
+            dim1: hidden_size_i64,
+            dim2: inter_size_i64,
+            stride0: fc2_stride0,
+            stride1: inter_size_i64,
+            stride2: 1,
+            dtype: DType::F8E4M3FN,
+            device_id,
+        },
+        backend,
+        stream.cu_stream().cast(),
+    )
+    .with_activation(options.activation)
+    .with_enable_pdl(options.enable_pdl)
+    .with_tensor_parallel(options.tp_size, options.tp_rank)
+    .with_expert_parallel(options.ep_size, options.ep_rank)
+    .with_enable_alltoall(options.enable_alltoall)
+    .with_fp8_per_tensor_quantization(quantization);
+
+    let params = if let Some([gemm1_profile_id, gemm2_profile_id]) = options.profile_ids {
+        params.with_profile_ids(gemm1_profile_id, gemm2_profile_id)
+    } else {
+        params
+    };
+
+    fused_moe(&params)
+}
+
+#[cfg(feature = "cudarc")]
+pub fn fused_moe_cudarc_deepseek_fp8_block_scale<I, S, W1, W2, O, Q1, Q2>(
+    stream: &cudarc::driver::CudaStream,
+    input: &I,
+    token_selected_experts: &S,
+    fc1_expert_weights: &W1,
+    fc2_expert_weights: &W2,
+    out: &mut O,
+    fc1_scales: &Q1,
+    fc2_scales: &Q2,
+    num_tokens: usize,
+    num_experts_on_rank: usize,
+    top_k: usize,
+    hidden_size: usize,
+    inter_size: usize,
+    backend: FusedMoeBackend,
+    options: FusedMoeCudarcOptions,
+) -> Result<(), FlashInferError>
+where
+    I: cudarc::driver::DeviceSlice<u16> + cudarc::driver::DevicePtr<u16>,
+    S: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    W1: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtr<u8>,
+    W2: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtr<u8>,
+    O: cudarc::driver::DeviceSlice<u16> + cudarc::driver::DevicePtrMut<u16>,
+    Q1: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtr<f32>,
+    Q2: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtr<f32>,
+{
+    let fc1_inter_size = if options.activation.is_gated() {
+        inter_size.checked_mul(2).ok_or_else(|| {
+            FlashInferError::invalid_argument("inter_size * 2 overflow for gated activation")
+        })?
+    } else {
+        inter_size
+    };
+
+    if hidden_size % 128 != 0 {
+        return Err(FlashInferError::invalid_argument(format!(
+            "hidden_size ({hidden_size}) must be divisible by 128 for deepseek fp8 block-scale",
+        )));
+    }
+    if inter_size % 128 != 0 {
+        return Err(FlashInferError::invalid_argument(format!(
+            "inter_size ({inter_size}) must be divisible by 128 for deepseek fp8 block-scale",
+        )));
+    }
+    if fc1_inter_size % 128 != 0 {
+        return Err(FlashInferError::invalid_argument(format!(
+            "fc1_inter_size ({fc1_inter_size}) must be divisible by 128 for deepseek fp8 block-scale",
+        )));
+    }
+
+    let input_expected = num_tokens
+        .checked_mul(hidden_size)
+        .ok_or_else(|| FlashInferError::invalid_argument("num_tokens * hidden_size overflow"))?;
+    let out_expected = input_expected;
+    let topk_expected = num_tokens
+        .checked_mul(top_k)
+        .ok_or_else(|| FlashInferError::invalid_argument("num_tokens * top_k overflow"))?;
+    let fc1_expected = num_experts_on_rank
+        .checked_mul(fc1_inter_size)
+        .and_then(|v| v.checked_mul(hidden_size))
+        .ok_or_else(|| {
+            FlashInferError::invalid_argument(
+                "num_experts_on_rank * fc1_inter_size * hidden_size overflow",
+            )
+        })?;
+    let fc2_expected = num_experts_on_rank
+        .checked_mul(hidden_size)
+        .and_then(|v| v.checked_mul(inter_size))
+        .ok_or_else(|| {
+            FlashInferError::invalid_argument(
+                "num_experts_on_rank * hidden_size * inter_size overflow",
+            )
+        })?;
+
+    let fc1_scales_expected = num_experts_on_rank
+        .checked_mul(fc1_inter_size / 128)
+        .and_then(|v| v.checked_mul(hidden_size / 128))
+        .ok_or_else(|| {
+            FlashInferError::invalid_argument(
+                "num_experts_on_rank * (fc1_inter_size/128) * (hidden_size/128) overflow",
+            )
+        })?;
+    let fc2_scales_expected = num_experts_on_rank
+        .checked_mul(hidden_size / 128)
+        .and_then(|v| v.checked_mul(inter_size / 128))
+        .ok_or_else(|| {
+            FlashInferError::invalid_argument(
+                "num_experts_on_rank * (hidden_size/128) * (inter_size/128) overflow",
+            )
+        })?;
+
+    if input.len() != input_expected {
+        return Err(FlashInferError::invalid_argument(format!(
+            "input length ({}) must equal num_tokens * hidden_size ({input_expected})",
+            input.len()
+        )));
+    }
+    if out.len() != out_expected {
+        return Err(FlashInferError::invalid_argument(format!(
+            "out length ({}) must equal num_tokens * hidden_size ({out_expected})",
+            out.len()
+        )));
+    }
+    if token_selected_experts.len() != topk_expected {
+        return Err(FlashInferError::invalid_argument(format!(
+            "token_selected_experts length ({}) must equal num_tokens * top_k ({topk_expected})",
+            token_selected_experts.len()
+        )));
+    }
+    if fc1_expert_weights.len() != fc1_expected {
+        return Err(FlashInferError::invalid_argument(format!(
+            "fc1_expert_weights length ({}) must equal expected ({fc1_expected})",
+            fc1_expert_weights.len()
+        )));
+    }
+    if fc2_expert_weights.len() != fc2_expected {
+        return Err(FlashInferError::invalid_argument(format!(
+            "fc2_expert_weights length ({}) must equal expected ({fc2_expected})",
+            fc2_expert_weights.len()
+        )));
+    }
+    if fc1_scales.len() != fc1_scales_expected {
+        return Err(FlashInferError::invalid_argument(format!(
+            "fc1_scales length ({}) must equal expected ({fc1_scales_expected})",
+            fc1_scales.len()
+        )));
+    }
+    if fc2_scales.len() != fc2_scales_expected {
+        return Err(FlashInferError::invalid_argument(format!(
+            "fc2_scales length ({}) must equal expected ({fc2_scales_expected})",
+            fc2_scales.len()
+        )));
+    }
+
+    let (input_ptr, _input_sync) = input.device_ptr(stream);
+    let (token_selected_experts_ptr, _token_selected_experts_sync) =
+        token_selected_experts.device_ptr(stream);
+    let (fc1_expert_weights_ptr, _fc1_expert_weights_sync) = fc1_expert_weights.device_ptr(stream);
+    let (fc2_expert_weights_ptr, _fc2_expert_weights_sync) = fc2_expert_weights.device_ptr(stream);
+    let (out_ptr, _out_sync) = out.device_ptr_mut(stream);
+    let (fc1_scales_ptr, _fc1_scales_sync) = fc1_scales.device_ptr(stream);
+    let (fc2_scales_ptr, _fc2_scales_sync) = fc2_scales.device_ptr(stream);
+
+    let num_tokens_i64 = i64::try_from(num_tokens)
+        .map_err(|_| FlashInferError::invalid_argument("num_tokens does not fit in i64"))?;
+    let num_experts_on_rank_i64 = i64::try_from(num_experts_on_rank).map_err(|_| {
+        FlashInferError::invalid_argument("num_experts_on_rank does not fit in i64")
+    })?;
+    let top_k_i64 = i64::try_from(top_k)
+        .map_err(|_| FlashInferError::invalid_argument("top_k does not fit in i64"))?;
+    let hidden_size_i64 = i64::try_from(hidden_size)
+        .map_err(|_| FlashInferError::invalid_argument("hidden_size does not fit in i64"))?;
+    let inter_size_i64 = i64::try_from(inter_size)
+        .map_err(|_| FlashInferError::invalid_argument("inter_size does not fit in i64"))?;
+    let fc1_inter_size_i64 = i64::try_from(fc1_inter_size)
+        .map_err(|_| FlashInferError::invalid_argument("fc1_inter_size does not fit in i64"))?;
+
+    let fc1_stride0 = fc1_inter_size_i64
+        .checked_mul(hidden_size_i64)
+        .ok_or_else(|| FlashInferError::invalid_argument("fc1 stride overflow"))?;
+    let fc2_stride0 = hidden_size_i64
+        .checked_mul(inter_size_i64)
+        .ok_or_else(|| FlashInferError::invalid_argument("fc2 stride overflow"))?;
+
+    let fc1_scale_dim1 = fc1_inter_size_i64 / 128;
+    let fc1_scale_dim2 = hidden_size_i64 / 128;
+    let fc2_scale_dim1 = hidden_size_i64 / 128;
+    let fc2_scale_dim2 = inter_size_i64 / 128;
+
+    let fc1_scale_stride2 = 1_i64;
+    let fc1_scale_stride1 = fc1_scale_dim2;
+    let fc1_scale_stride0 = fc1_scale_dim1
+        .checked_mul(fc1_scale_dim2)
+        .ok_or_else(|| FlashInferError::invalid_argument("fc1 scale stride overflow"))?;
+    let fc2_scale_stride2 = 1_i64;
+    let fc2_scale_stride1 = fc2_scale_dim2;
+    let fc2_scale_stride0 = fc2_scale_dim1
+        .checked_mul(fc2_scale_dim2)
+        .ok_or_else(|| FlashInferError::invalid_argument("fc2 scale stride overflow"))?;
+
+    let device_id = i32::try_from(stream.context().ordinal())
+        .map_err(|_| FlashInferError::invalid_argument("device id does not fit in i32"))?;
+
+    let quantization = FusedMoeDeepSeekFp8BlockScaleQuantParams {
+        fc1_scales: FusedMoeTensor3DF32Desc {
+            ptr: fc1_scales_ptr as usize as *const c_void,
+            dim0: num_experts_on_rank_i64,
+            dim1: fc1_scale_dim1,
+            dim2: fc1_scale_dim2,
+            stride0: fc1_scale_stride0,
+            stride1: fc1_scale_stride1,
+            stride2: fc1_scale_stride2,
+            device_id,
+        },
+        fc2_scales: FusedMoeTensor3DF32Desc {
+            ptr: fc2_scales_ptr as usize as *const c_void,
+            dim0: num_experts_on_rank_i64,
+            dim1: fc2_scale_dim1,
+            dim2: fc2_scale_dim2,
+            stride0: fc2_scale_stride0,
+            stride1: fc2_scale_stride1,
+            stride2: fc2_scale_stride2,
+            device_id,
+        },
+    };
+
+    let params = FusedMoeParams::new(
+        FusedMoeTensor2DDesc {
+            ptr: out_ptr as usize as *const c_void,
+            rows: num_tokens_i64,
+            cols: hidden_size_i64,
+            stride_row: hidden_size_i64,
+            stride_col: 1,
+            dtype: DType::BF16,
+            device_id,
+        },
+        FusedMoeTensor2DDesc {
+            ptr: input_ptr as usize as *const c_void,
+            rows: num_tokens_i64,
+            cols: hidden_size_i64,
+            stride_row: hidden_size_i64,
+            stride_col: 1,
+            dtype: DType::BF16,
+            device_id,
+        },
+        FusedMoeTensor2DI32Desc {
+            ptr: token_selected_experts_ptr as usize as *const c_void,
+            rows: num_tokens_i64,
+            cols: top_k_i64,
+            stride_row: top_k_i64,
+            stride_col: 1,
+            device_id,
+        },
+        FusedMoeTensor3DDesc {
+            ptr: fc1_expert_weights_ptr as usize as *const c_void,
+            dim0: num_experts_on_rank_i64,
+            dim1: fc1_inter_size_i64,
+            dim2: hidden_size_i64,
+            stride0: fc1_stride0,
+            stride1: hidden_size_i64,
+            stride2: 1,
+            dtype: DType::F8E4M3FN,
+            device_id,
+        },
+        FusedMoeTensor3DDesc {
+            ptr: fc2_expert_weights_ptr as usize as *const c_void,
+            dim0: num_experts_on_rank_i64,
+            dim1: hidden_size_i64,
+            dim2: inter_size_i64,
+            stride0: fc2_stride0,
+            stride1: inter_size_i64,
+            stride2: 1,
+            dtype: DType::F8E4M3FN,
+            device_id,
+        },
+        backend,
+        stream.cu_stream().cast(),
+    )
+    .with_activation(options.activation)
+    .with_enable_pdl(options.enable_pdl)
+    .with_tensor_parallel(options.tp_size, options.tp_rank)
+    .with_expert_parallel(options.ep_size, options.ep_rank)
+    .with_enable_alltoall(options.enable_alltoall)
+    .with_deepseek_fp8_block_scale_quantization(quantization);
+
+    let params = if let Some([gemm1_profile_id, gemm2_profile_id]) = options.profile_ids {
+        params.with_profile_ids(gemm1_profile_id, gemm2_profile_id)
+    } else {
+        params
+    };
+
+    fused_moe(&params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn valid_params() -> FusedMoeParams {
-        let ptr = std::ptr::NonNull::<u8>::dangling()
+    fn dummy_ptr() -> *const c_void {
+        std::ptr::NonNull::<u8>::dangling()
             .as_ptr()
-            .cast::<c_void>();
+            .cast::<c_void>()
+    }
 
+    fn valid_params() -> FusedMoeParams {
+        let ptr = dummy_ptr();
         FusedMoeParams::new(
             FusedMoeTensor2DDesc {
                 ptr,
@@ -1284,6 +2505,119 @@ mod tests {
         .with_activation(FusedMoeActivationType::Swiglu)
     }
 
+    fn valid_fp8_per_tensor_params() -> FusedMoeParams {
+        let ptr = dummy_ptr();
+        valid_params()
+            .with_fp8_per_tensor_quantization(FusedMoeFp8PerTensorQuantParams {
+                fc1_dequant: FusedMoeTensor1DF32Desc {
+                    ptr,
+                    len: 8,
+                    stride: 1,
+                    device_id: 0,
+                },
+                fc2_quant: FusedMoeFp8ActScaleDesc::PerExpert(FusedMoeTensor1DF32Desc {
+                    ptr,
+                    len: 8,
+                    stride: 1,
+                    device_id: 0,
+                }),
+                fc2_dequant: FusedMoeTensor1DF32Desc {
+                    ptr,
+                    len: 8,
+                    stride: 1,
+                    device_id: 0,
+                },
+                fc1_input_dequant: FusedMoeTensor0DF32Desc { ptr, device_id: 0 },
+            })
+            .with_activation(FusedMoeActivationType::Swiglu)
+            .with_enable_pdl(false)
+            .with_enable_alltoall(false)
+            .with_tensor_parallel(1, 0)
+            .with_expert_parallel(1, 0)
+            .with_profile_ids(0, 0)
+    }
+
+    fn valid_deepseek_fp8_block_scale_params() -> FusedMoeParams {
+        let ptr = dummy_ptr();
+        FusedMoeParams::new(
+            FusedMoeTensor2DDesc {
+                ptr,
+                rows: 4,
+                cols: 128,
+                stride_row: 128,
+                stride_col: 1,
+                dtype: DType::BF16,
+                device_id: 0,
+            },
+            FusedMoeTensor2DDesc {
+                ptr,
+                rows: 4,
+                cols: 128,
+                stride_row: 128,
+                stride_col: 1,
+                dtype: DType::BF16,
+                device_id: 0,
+            },
+            FusedMoeTensor2DI32Desc {
+                ptr,
+                rows: 4,
+                cols: 2,
+                stride_row: 2,
+                stride_col: 1,
+                device_id: 0,
+            },
+            FusedMoeTensor3DDesc {
+                ptr,
+                dim0: 8,
+                dim1: 512,
+                dim2: 128,
+                stride0: 512 * 128,
+                stride1: 128,
+                stride2: 1,
+                dtype: DType::F8E4M3FN,
+                device_id: 0,
+            },
+            FusedMoeTensor3DDesc {
+                ptr,
+                dim0: 8,
+                dim1: 128,
+                dim2: 256,
+                stride0: 128 * 256,
+                stride1: 256,
+                stride2: 1,
+                dtype: DType::F8E4M3FN,
+                device_id: 0,
+            },
+            FusedMoeBackend::Sm90,
+            std::ptr::null_mut(),
+        )
+        .with_activation(FusedMoeActivationType::Swiglu)
+        .with_deepseek_fp8_block_scale_quantization(
+            FusedMoeDeepSeekFp8BlockScaleQuantParams {
+                fc1_scales: FusedMoeTensor3DF32Desc {
+                    ptr,
+                    dim0: 8,
+                    dim1: 4,
+                    dim2: 1,
+                    stride0: 4,
+                    stride1: 1,
+                    stride2: 1,
+                    device_id: 0,
+                },
+                fc2_scales: FusedMoeTensor3DF32Desc {
+                    ptr,
+                    dim0: 8,
+                    dim1: 1,
+                    dim2: 2,
+                    stride0: 2,
+                    stride1: 2,
+                    stride2: 1,
+                    device_id: 0,
+                },
+            },
+        )
+    }
+
     #[test]
     fn validate_accepts_base_case() {
         let params = valid_params();
@@ -1312,6 +2646,116 @@ mod tests {
         params.fc2_expert_weights.device_id = 1;
         let err = params.validate().expect_err("expected device mismatch");
         assert!(err.to_string().contains("device mismatch"));
+    }
+
+    #[test]
+    fn validate_rejects_fp8_without_quantization() {
+        let mut params = valid_params();
+        params.input.dtype = DType::F8E4M3FN;
+        params.fc1_expert_weights.dtype = DType::F8E4M3FN;
+        params.fc2_expert_weights.dtype = DType::F8E4M3FN;
+        params.out.dtype = DType::BF16;
+        let err = params
+            .validate()
+            .expect_err("expected fp8 quantization error");
+        assert!(err.to_string().contains("requires explicit quantization"));
+    }
+
+    #[test]
+    fn validate_accepts_fp8_per_tensor() {
+        let mut params = valid_fp8_per_tensor_params();
+        params.input.dtype = DType::F8E4M3FN;
+        params.fc1_expert_weights.dtype = DType::F8E4M3FN;
+        params.fc2_expert_weights.dtype = DType::F8E4M3FN;
+        params.out.dtype = DType::BF16;
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_fp8_per_tensor_output_dtype() {
+        let mut params = valid_fp8_per_tensor_params();
+        params.input.dtype = DType::F8E4M3FN;
+        params.fc1_expert_weights.dtype = DType::F8E4M3FN;
+        params.fc2_expert_weights.dtype = DType::F8E4M3FN;
+        params.out.dtype = DType::F8E4M3FN;
+        let err = params.validate().expect_err("expected output dtype error");
+        assert!(err.to_string().contains("out dtype"));
+    }
+
+    #[test]
+    fn validate_rejects_fp8_per_tensor_bad_fc2_quant_len() {
+        let mut params = valid_fp8_per_tensor_params();
+        params.input.dtype = DType::F8E4M3FN;
+        params.fc1_expert_weights.dtype = DType::F8E4M3FN;
+        params.fc2_expert_weights.dtype = DType::F8E4M3FN;
+        params.out.dtype = DType::BF16;
+        params.quantization = Some(FusedMoeQuantization::Fp8PerTensor(
+            FusedMoeFp8PerTensorQuantParams {
+                fc1_dequant: FusedMoeTensor1DF32Desc {
+                    ptr: dummy_ptr(),
+                    len: 8,
+                    stride: 1,
+                    device_id: 0,
+                },
+                fc2_quant: FusedMoeFp8ActScaleDesc::PerExpert(FusedMoeTensor1DF32Desc {
+                    ptr: dummy_ptr(),
+                    len: 7,
+                    stride: 1,
+                    device_id: 0,
+                }),
+                fc2_dequant: FusedMoeTensor1DF32Desc {
+                    ptr: dummy_ptr(),
+                    len: 8,
+                    stride: 1,
+                    device_id: 0,
+                },
+                fc1_input_dequant: FusedMoeTensor0DF32Desc {
+                    ptr: dummy_ptr(),
+                    device_id: 0,
+                },
+            },
+        ));
+        let err = params
+            .validate()
+            .expect_err("expected fc2_quant shape error");
+        assert!(err.to_string().contains("quant.fc2_quant.len"));
+    }
+
+    #[test]
+    fn validate_accepts_deepseek_fp8_block_scale() {
+        let params = valid_deepseek_fp8_block_scale_params();
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_deepseek_non_sm90_backend() {
+        let mut params = valid_deepseek_fp8_block_scale_params();
+        params.backend = FusedMoeBackend::Sm100;
+        let err = params.validate().expect_err("expected backend validation");
+        assert!(err.to_string().contains("backend Sm90"));
+    }
+
+    #[test]
+    fn validate_rejects_deepseek_dtype_mismatch() {
+        let mut params = valid_deepseek_fp8_block_scale_params();
+        params.input.dtype = DType::F16;
+        let err = params.validate().expect_err("expected dtype validation");
+        assert!(err.to_string().contains("input/out dtype"));
+    }
+
+    #[test]
+    fn validate_rejects_deepseek_scale_shape_mismatch() {
+        let mut params = valid_deepseek_fp8_block_scale_params();
+        let Some(FusedMoeQuantization::DeepSeekFp8BlockScale(mut quant)) = params.quantization
+        else {
+            panic!("expected deepseek quantization")
+        };
+        quant.fc2_scales.dim2 = 3;
+        params.quantization = Some(FusedMoeQuantization::DeepSeekFp8BlockScale(quant));
+        let err = params
+            .validate()
+            .expect_err("expected deepseek scale mismatch");
+        assert!(err.to_string().contains("quant.fc2_scales"));
     }
 
     #[test]

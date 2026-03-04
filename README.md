@@ -11,6 +11,7 @@ Rust-first integration for calling precompiled FlashInfer kernels through TVM-FF
 - MHA batched ragged/paged prefill (`batch_prefill_with_kv_cache`) via on-demand JIT-cache module loading
 - MHA single decode (`single_decode_with_kv_cache`) via on-demand JIT-cache module loading
 - MHA batched paged decode (`batch_decode_with_kv_cache`) via on-demand JIT-cache module loading
+- CUTLASS fused MoE (`fused_moe_{90,100,103,120}`) via on-demand JIT-cache module loading
 - Paged KV append (`append_paged_kv_cache`) and paged MLA KV append (`append_paged_mla_kv_cache`) from `page.so`
 - Pure Rust TVM-FFI ABI packing and dynamic loading
 - Optional `cudarc` convenience wrappers
@@ -151,6 +152,63 @@ gdn_prefill_sm90_cudarc_with_options(
     None,         // alpha: Option<&A>
     None,         // beta: Option<&B>
     0.0,          // scale (0.0 means kernel default behavior)
+)?;
+```
+
+## API Example: Fused MoE FP8 (`cudarc`)
+
+Per-tensor FP8 mode:
+
+```rust
+use flashinfer_rs::{
+    DType, FusedMoeBackend, FusedMoeCudarcOptions, fused_moe_cudarc_fp8_per_tensor,
+};
+
+fused_moe_cudarc_fp8_per_tensor(
+    stream.as_ref(),
+    &input_fp8,             // DeviceSlice<u8>, shape [num_tokens, hidden_size]
+    &token_selected,        // DeviceSlice<i32>, shape [num_tokens, top_k]
+    &fc1_weights_fp8,       // DeviceSlice<u8>, shape [num_experts, fc1_inter, hidden_size]
+    &fc2_weights_fp8,       // DeviceSlice<u8>, shape [num_experts, hidden_size, inter_size]
+    &mut out_fp16_or_bf16,  // DeviceSliceMut<u16>, shape [num_tokens, hidden_size]
+    &fc1_dequant,           // DeviceSlice<f32>, len num_experts
+    &fc2_quant,             // DeviceSlice<f32>, len 1 or num_experts
+    &fc2_dequant,           // DeviceSlice<f32>, len num_experts
+    &fc1_input_dequant,     // DeviceSlice<f32>, len 1
+    num_tokens,
+    num_experts,
+    top_k,
+    hidden_size,
+    inter_size,
+    DType::BF16,            // output dtype: F16 or BF16
+    FusedMoeBackend::Sm120,
+    FusedMoeCudarcOptions::default(),
+)?;
+```
+
+DeepSeek FP8 block-scale mode:
+
+```rust
+use flashinfer_rs::{
+    FusedMoeBackend, FusedMoeCudarcOptions, fused_moe_cudarc_deepseek_fp8_block_scale,
+};
+
+fused_moe_cudarc_deepseek_fp8_block_scale(
+    stream.as_ref(),
+    &input_bf16,            // DeviceSlice<u16>
+    &token_selected,        // DeviceSlice<i32>
+    &fc1_weights_fp8,       // DeviceSlice<u8>
+    &fc2_weights_fp8,       // DeviceSlice<u8>
+    &mut out_bf16,          // DeviceSliceMut<u16>
+    &fc1_scales,            // DeviceSlice<f32>
+    &fc2_scales,            // DeviceSlice<f32>
+    num_tokens,
+    num_experts,
+    top_k,
+    hidden_size,            // must be divisible by 128
+    inter_size,             // must be divisible by 128
+    FusedMoeBackend::Sm90,  // strict DeepSeek mode backend
+    FusedMoeCudarcOptions::default(),
 )?;
 ```
 
