@@ -618,6 +618,8 @@ pub struct MhaBatchPrefillPlanParams {
     pub disable_split_kv: bool,
     /// Number of colocated CTAs for planning.
     pub num_colocated_ctas: i64,
+    /// Whether plan generation should support CUDA graph mode.
+    pub enable_cuda_graph: bool,
     /// CUDA stream (`cudaStream_t`) used for async launch.
     pub stream: *mut c_void,
 }
@@ -664,6 +666,7 @@ impl MhaBatchPrefillPlanParams {
             fixed_split_size: -1,
             disable_split_kv: false,
             num_colocated_ctas: 0,
+            enable_cuda_graph: false,
             stream,
         }
     }
@@ -705,6 +708,11 @@ impl MhaBatchPrefillPlanParams {
 
     pub fn with_num_colocated_ctas(mut self, num_colocated_ctas: i64) -> Self {
         self.num_colocated_ctas = num_colocated_ctas;
+        self
+    }
+
+    pub fn with_enable_cuda_graph(mut self, enable_cuda_graph: bool) -> Self {
+        self.enable_cuda_graph = enable_cuda_graph;
         self
     }
 
@@ -1081,7 +1089,7 @@ unsafe fn mha_batch_prefill_plan_with_runtime(
         any_i64(num_qo_heads),
         any_i64(num_kv_heads),
         any_i64(1), // page_size for ragged plan path
-        any_bool(false),
+        any_bool(params.enable_cuda_graph),
         any_i64(params.head_dim_qk),
         any_i64(params.head_dim_vo),
         any_bool(params.causal),
@@ -1713,6 +1721,7 @@ pub struct MhaBatchPrefillCudarcOptions {
     pub rope_theta: f64,
     pub use_fp16_qk_reduction: bool,
     pub enable_pdl: bool,
+    pub enable_cuda_graph: bool,
     pub fixed_split_size: i64,
     pub disable_split_kv: bool,
     pub num_colocated_ctas: i64,
@@ -1731,6 +1740,7 @@ impl Default for MhaBatchPrefillCudarcOptions {
             rope_theta: 1e4,
             use_fp16_qk_reduction: false,
             enable_pdl: false,
+            enable_cuda_graph: false,
             fixed_split_size: -1,
             disable_split_kv: false,
             num_colocated_ctas: 0,
@@ -1879,6 +1889,7 @@ where
     .with_fp16_qk_reduction(options.use_fp16_qk_reduction)
     .with_fixed_split_size(options.fixed_split_size)
     .with_disable_split_kv(options.disable_split_kv)
+    .with_enable_cuda_graph(options.enable_cuda_graph)
     .with_num_colocated_ctas(options.num_colocated_ctas);
 
     Ok(params)
@@ -2413,6 +2424,18 @@ mod tests {
     fn plan_validate_accepts_plan_only_metadata() {
         let params = valid_plan_params();
         assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn plan_params_enable_cuda_graph_defaults_false() {
+        let params = valid_plan_params();
+        assert!(!params.enable_cuda_graph);
+    }
+
+    #[test]
+    fn plan_params_enable_cuda_graph_setter() {
+        let params = valid_plan_params().with_enable_cuda_graph(true);
+        assert!(params.enable_cuda_graph);
     }
 
     #[test]
