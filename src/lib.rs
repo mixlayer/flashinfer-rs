@@ -60,15 +60,17 @@ pub use mha_prefill::{
 #[cfg(feature = "cudarc")]
 pub use mha_prefill::{MhaSinglePrefillCudarcOptions, mha_single_prefill_cudarc};
 pub use norm::{
-    DType, FusedQkRmsNormParams, GemmaFusedAddRmsNormParams, GemmaRmsNormParams, RmsNormParams,
-    Tensor1DDesc, Tensor2DDesc, Tensor3DDesc as NormTensor3DDesc, fused_qk_rmsnorm,
-    gemma_fused_add_rmsnorm, gemma_rmsnorm, qk_rmsnorm, rmsnorm,
+    DType, FusedAddRmsNormQuantParams, FusedQkRmsNormParams, GemmaFusedAddRmsNormParams,
+    GemmaRmsNormParams, RmsNormParams, RmsNormQuantParams, Tensor1DDesc, Tensor2DDesc,
+    Tensor3DDesc as NormTensor3DDesc, fused_add_rmsnorm_quant, fused_qk_rmsnorm,
+    gemma_fused_add_rmsnorm, gemma_rmsnorm, qk_rmsnorm, rmsnorm, rmsnorm_quant,
 };
 #[cfg(feature = "cudarc")]
 pub use norm::{
-    fused_qk_rmsnorm_cudarc, fused_qk_rmsnorm_cudarc_with_options, gemma_rmsnorm_cudarc,
+    fused_add_rmsnorm_quant_cudarc, fused_qk_rmsnorm_cudarc,
+    fused_qk_rmsnorm_cudarc_with_options, gemma_rmsnorm_cudarc,
     gemma_rmsnorm_cudarc_with_options, qk_rmsnorm_cudarc, rmsnorm_cudarc,
-    rmsnorm_cudarc_with_options,
+    rmsnorm_cudarc_with_options, rmsnorm_quant_cudarc,
 };
 pub use paged_kv_append::{
     PagedKvAppendParams, PagedMlaKvAppendParams, PagedMlaTensor2DDesc, append_paged_kv_cache,
