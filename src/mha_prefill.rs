@@ -695,6 +695,7 @@ fn dtype_filename(dtype: DType) -> &'static str {
     match dtype {
         DType::F16 => "f16",
         DType::BF16 => "bf16",
+        DType::F8E4M3 => panic!("F8E4M3 dtype is not supported for MHA prefill"),
     }
 }
 
@@ -714,6 +715,7 @@ fn dl_dtype_from_norm_dtype(dtype: DType) -> DLDataType {
             bits: 16,
             lanes: 1,
         },
+        DType::F8E4M3 => panic!("F8E4M3 dtype is not supported for MHA prefill"),
     }
 }
 

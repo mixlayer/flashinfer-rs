@@ -743,6 +743,7 @@ fn dl_dtype_from_dtype(dtype: DType) -> DLDataType {
             bits: 16,
             lanes: 1,
         },
+        DType::F8E4M3 => panic!("F8E4M3 dtype is not supported for fused MoE"),
     }
 }
 

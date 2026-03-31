@@ -18,6 +18,7 @@ pub const KDL_INT: u8 = 0;
 pub const KDL_UINT: u8 = 1;
 pub const KDL_FLOAT: u8 = 2;
 pub const KDL_BFLOAT: u8 = 4;
+pub const KDL_FLOAT8_E4M3FN: u8 = 10;
 
 pub type TVMFFIObjectHandle = *mut c_void;
 
