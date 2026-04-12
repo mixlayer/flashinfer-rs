@@ -150,6 +150,9 @@ gdn_prefill_sm90_cudarc_with_options(
     None,         // input_state: Option<&IS>
     None,         // alpha: Option<&A>
     None,         // beta: Option<&B>
+    None,         // state_checkpoints: Option<&mut SC>
+    None,         // checkpoint_cu_starts: Option<&CC>
+    0,            // checkpoint_every_n_tokens (0 disables checkpointing)
     0.0,          // scale (0.0 means kernel default behavior)
 )?;
 ```

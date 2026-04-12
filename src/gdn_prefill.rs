@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use crate::error::FlashInferError;
 use crate::ffi::{
     DLDataType, DLDevice, DLTensor, KDL_BFLOAT, KDL_CUDA, KDL_FLOAT, KDL_INT, KDL_UINT, TVMFFIAny,
-    any_dltensor_ptr, any_f64, any_none,
+    any_dltensor_ptr, any_f64, any_i64, any_none,
 };
 use crate::norm::DType;
 use crate::runtime::FlashInferRuntime;
@@ -61,6 +61,8 @@ pub struct Tensor4DF32Desc {
     pub device_id: i32,
 }
 
+const GDN_CHECKPOINT_BLOCK_SIZE_TOKENS: i64 = 64;
+
 #[derive(Debug, Clone, Copy)]
 pub struct GdnPrefillSm90Params {
     /// Output tensor, rank-3: `[packed_seq, num_sab_heads, head_size]`.
@@ -96,6 +98,29 @@ pub struct GdnPrefillSm90Params {
     pub scale: f64,
     /// Scratch/workspace buffer, rank-1 u8: `[workspace_bytes]`.
     pub workspace_buffer: Tensor1DU8Desc,
+    /// Optional intermediate state checkpoints, rank-4 f32:
+    /// `[total_checkpoints, num_sab_heads, head_size, head_size]`.
+    ///
+    /// Purpose: materialize recurrent KV state snapshots at fixed sequence boundaries so callers
+    /// can resume/reuse prefill state without replaying every token from the start.
+    ///
+    /// Required when `checkpoint_every_n_tokens > 0`; must be `None` when checkpointing is
+    /// disabled (`checkpoint_every_n_tokens == 0`).
+    pub state_checkpoints: Option<Tensor4DF32Desc>,
+    /// Optional checkpoint prefix offsets, rank-1 int64: `[num_seqs + 1]`.
+    ///
+    /// Purpose: maps each sequence's local checkpoint index into the flattened
+    /// `state_checkpoints` buffer via:
+    /// `global_checkpoint_idx = checkpoint_cu_starts[seq_idx] + local_checkpoint_idx`.
+    ///
+    /// Required when `checkpoint_every_n_tokens > 0`; must be `None` when checkpointing is
+    /// disabled (`checkpoint_every_n_tokens == 0`).
+    pub checkpoint_cu_starts: Option<Tensor1DI64Desc>,
+    /// Checkpoint cadence in tokens.
+    ///
+    /// `0` disables checkpointing. Positive values enable checkpoint writes and must be a
+    /// multiple of 64 (the kernel KV block size).
+    pub checkpoint_every_n_tokens: i64,
     /// CUDA stream (`cudaStream_t`) used for async launch.
     pub stream: *mut c_void,
 }
@@ -123,6 +148,9 @@ impl GdnPrefillSm90Params {
             beta: None,
             scale: 0.0,
             workspace_buffer,
+            state_checkpoints: None,
+            checkpoint_cu_starts: None,
+            checkpoint_every_n_tokens: 0,
             stream,
         }
     }
@@ -147,7 +175,53 @@ impl GdnPrefillSm90Params {
         self
     }
 
+    pub fn with_state_checkpointing(
+        mut self,
+        state_checkpoints: Tensor4DF32Desc,
+        checkpoint_cu_starts: Tensor1DI64Desc,
+        checkpoint_every_n_tokens: i64,
+    ) -> Self {
+        self.state_checkpoints = Some(state_checkpoints);
+        self.checkpoint_cu_starts = Some(checkpoint_cu_starts);
+        self.checkpoint_every_n_tokens = checkpoint_every_n_tokens;
+        self
+    }
+
+    pub fn with_checkpoint_every_n_tokens(mut self, checkpoint_every_n_tokens: i64) -> Self {
+        self.checkpoint_every_n_tokens = checkpoint_every_n_tokens;
+        self
+    }
+
     pub fn validate(&self) -> Result<(), FlashInferError> {
+        if self.checkpoint_every_n_tokens < 0 {
+            return Err(FlashInferError::invalid_argument(
+                "checkpoint_every_n_tokens must be non-negative",
+            ));
+        }
+        if self.checkpoint_every_n_tokens > i32::MAX as i64 {
+            return Err(FlashInferError::invalid_argument(
+                "checkpoint_every_n_tokens must fit in int32",
+            ));
+        }
+        let checkpointing_enabled = self.checkpoint_every_n_tokens > 0;
+        if checkpointing_enabled {
+            if self.checkpoint_every_n_tokens % GDN_CHECKPOINT_BLOCK_SIZE_TOKENS != 0 {
+                return Err(FlashInferError::invalid_argument(format!(
+                    "checkpoint_every_n_tokens ({}) must be a multiple of {GDN_CHECKPOINT_BLOCK_SIZE_TOKENS}",
+                    self.checkpoint_every_n_tokens
+                )));
+            }
+            if self.state_checkpoints.is_none() || self.checkpoint_cu_starts.is_none() {
+                return Err(FlashInferError::invalid_argument(
+                    "state_checkpoints and checkpoint_cu_starts must both be provided when checkpoint_every_n_tokens > 0",
+                ));
+            }
+        } else if self.state_checkpoints.is_some() || self.checkpoint_cu_starts.is_some() {
+            return Err(FlashInferError::invalid_argument(
+                "state_checkpoints and checkpoint_cu_starts must be None when checkpoint_every_n_tokens == 0",
+            ));
+        }
+
         check_non_null(self.output.ptr, "output")?;
         check_non_null(self.output_state.ptr, "output_state")?;
         check_non_null(self.q.ptr, "q")?;
@@ -362,6 +436,41 @@ impl GdnPrefillSm90Params {
             }
         }
 
+        if let Some(state_checkpoints) = self.state_checkpoints {
+            check_non_null(state_checkpoints.ptr, "state_checkpoints")?;
+            check_contiguous_4d_allow_zero_dim0(
+                "state_checkpoints",
+                state_checkpoints.dim0,
+                state_checkpoints.dim1,
+                state_checkpoints.dim2,
+                state_checkpoints.dim3,
+                state_checkpoints.stride0,
+                state_checkpoints.stride1,
+                state_checkpoints.stride2,
+                state_checkpoints.stride3,
+            )?;
+            if state_checkpoints.dim1 != num_sab_heads
+                || state_checkpoints.dim2 != head_size
+                || state_checkpoints.dim3 != head_size
+            {
+                return Err(FlashInferError::invalid_argument(
+                    "state_checkpoints shape must be [total_checkpoints, num_sab_heads, head_size, head_size]",
+                ));
+            }
+        }
+
+        if let Some(checkpoint_cu_starts) = self.checkpoint_cu_starts {
+            check_non_null(checkpoint_cu_starts.ptr, "checkpoint_cu_starts")?;
+            check_contiguous_1d("checkpoint_cu_starts", checkpoint_cu_starts.stride)?;
+            if checkpoint_cu_starts.len != num_seqs + 1 {
+                return Err(FlashInferError::invalid_argument(format!(
+                    "checkpoint_cu_starts length ({}) must equal num_seqs + 1 ({})",
+                    checkpoint_cu_starts.len,
+                    num_seqs + 1
+                )));
+            }
+        }
+
         let device_id = self.q.device_id;
         if self.output.device_id != device_id
             || self.output_state.device_id != device_id
@@ -395,6 +504,22 @@ impl GdnPrefillSm90Params {
             if beta.device_id != device_id {
                 return Err(FlashInferError::invalid_argument(
                     "beta must be on the same CUDA device",
+                ));
+            }
+        }
+
+        if let Some(state_checkpoints) = self.state_checkpoints {
+            if state_checkpoints.device_id != device_id {
+                return Err(FlashInferError::invalid_argument(
+                    "state_checkpoints must be on the same CUDA device",
+                ));
+            }
+        }
+
+        if let Some(checkpoint_cu_starts) = self.checkpoint_cu_starts {
+            if checkpoint_cu_starts.device_id != device_id {
+                return Err(FlashInferError::invalid_argument(
+                    "checkpoint_cu_starts must be on the same CUDA device",
                 ));
             }
         }
@@ -505,7 +630,6 @@ where
             "workspace_buffer length must be positive",
         ));
     }
-
     let num_sab_heads = num_q_heads.max(num_v_heads);
     let num_seqs = cu_seqlens.len() - 1;
 
@@ -689,7 +813,7 @@ where
 
 #[cfg(feature = "cudarc")]
 #[allow(clippy::too_many_arguments)]
-pub fn gdn_prefill_sm90_cudarc_with_options<T, O, OS, Q, K, V, C, W, IS, A, B>(
+pub fn gdn_prefill_sm90_cudarc_with_options<T, O, OS, Q, K, V, C, W, IS, A, B, SC, CC>(
     stream: &cudarc::driver::CudaStream,
     output: &mut O,
     output_state: &mut OS,
@@ -707,6 +831,9 @@ pub fn gdn_prefill_sm90_cudarc_with_options<T, O, OS, Q, K, V, C, W, IS, A, B>(
     input_state: Option<&IS>,
     alpha: Option<&A>,
     beta: Option<&B>,
+    state_checkpoints: Option<&mut SC>,
+    checkpoint_cu_starts: Option<&CC>,
+    checkpoint_every_n_tokens: i64,
     scale: f64,
 ) -> Result<(), FlashInferError>
 where
@@ -720,6 +847,8 @@ where
     IS: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtr<f32>,
     A: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtr<f32>,
     B: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtr<f32>,
+    SC: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtrMut<f32>,
+    CC: cudarc::driver::DeviceSlice<i64> + cudarc::driver::DevicePtr<i64>,
 {
     if packed_seq == 0 || num_q_heads == 0 || num_k_heads == 0 || num_v_heads == 0 || head_size == 0
     {
@@ -736,6 +865,33 @@ where
     if workspace_len == 0 {
         return Err(FlashInferError::invalid_argument(
             "workspace_buffer length must be positive",
+        ));
+    }
+    if checkpoint_every_n_tokens < 0 {
+        return Err(FlashInferError::invalid_argument(
+            "checkpoint_every_n_tokens must be non-negative",
+        ));
+    }
+    if checkpoint_every_n_tokens > i32::MAX as i64 {
+        return Err(FlashInferError::invalid_argument(
+            "checkpoint_every_n_tokens must fit in int32",
+        ));
+    }
+    let checkpointing_enabled = checkpoint_every_n_tokens > 0;
+    if checkpointing_enabled {
+        if checkpoint_every_n_tokens % GDN_CHECKPOINT_BLOCK_SIZE_TOKENS != 0 {
+            return Err(FlashInferError::invalid_argument(format!(
+                "checkpoint_every_n_tokens ({checkpoint_every_n_tokens}) must be a multiple of {GDN_CHECKPOINT_BLOCK_SIZE_TOKENS}"
+            )));
+        }
+        if state_checkpoints.is_none() || checkpoint_cu_starts.is_none() {
+            return Err(FlashInferError::invalid_argument(
+                "state_checkpoints and checkpoint_cu_starts must both be provided when checkpoint_every_n_tokens > 0",
+            ));
+        }
+    } else if state_checkpoints.is_some() || checkpoint_cu_starts.is_some() {
+        return Err(FlashInferError::invalid_argument(
+            "state_checkpoints and checkpoint_cu_starts must be None when checkpoint_every_n_tokens == 0",
         ));
     }
 
@@ -766,6 +922,11 @@ where
     let expected_alpha_beta = packed_seq
         .checked_mul(num_sab_heads)
         .ok_or_else(|| FlashInferError::invalid_argument("alpha/beta size overflow"))?;
+    let checkpoint_stride = num_sab_heads
+        .checked_mul(head_size)
+        .and_then(|v| v.checked_mul(head_size))
+        .ok_or_else(|| FlashInferError::invalid_argument("checkpoint size overflow"))?;
+    let mut total_checkpoints = None;
 
     if q.len() != expected_q {
         return Err(FlashInferError::invalid_argument(format!(
@@ -822,6 +983,24 @@ where
             )));
         }
     }
+    if let Some(state_checkpoints_tensor) = state_checkpoints.as_ref() {
+        let state_checkpoints_len = state_checkpoints_tensor.len();
+        if state_checkpoints_len % checkpoint_stride != 0 {
+            return Err(FlashInferError::invalid_argument(format!(
+                "state_checkpoints length ({state_checkpoints_len}) must be divisible by max(num_q_heads, num_v_heads) * head_size * head_size ({checkpoint_stride})",
+            )));
+        }
+        total_checkpoints = Some(state_checkpoints_len / checkpoint_stride);
+    }
+    if let Some(checkpoint_cu_starts_tensor) = checkpoint_cu_starts {
+        if checkpoint_cu_starts_tensor.len() != num_seqs + 1 {
+            return Err(FlashInferError::invalid_argument(format!(
+                "checkpoint_cu_starts length ({}) must equal cu_seqlens.len() ({})",
+                checkpoint_cu_starts_tensor.len(),
+                num_seqs + 1
+            )));
+        }
+    }
 
     let (output_ptr, _output_sync) = output.device_ptr_mut(stream);
     let (output_state_ptr, _output_state_sync) = output_state.device_ptr_mut(stream);
@@ -835,6 +1014,10 @@ where
         input_state.map(|input_state_tensor| input_state_tensor.device_ptr(stream));
     let alpha_device = alpha.map(|alpha_tensor| alpha_tensor.device_ptr(stream));
     let beta_device = beta.map(|beta_tensor| beta_tensor.device_ptr(stream));
+    let state_checkpoints_device = state_checkpoints
+        .map(|state_checkpoints_tensor| state_checkpoints_tensor.device_ptr_mut(stream));
+    let checkpoint_cu_starts_device = checkpoint_cu_starts
+        .map(|checkpoint_cu_starts_tensor| checkpoint_cu_starts_tensor.device_ptr(stream));
 
     let packed_seq_i64 = i64::try_from(packed_seq)
         .map_err(|_| FlashInferError::invalid_argument("packed_seq does not fit in i64"))?;
@@ -855,6 +1038,13 @@ where
     let workspace_len_i64 = i64::try_from(workspace_len).map_err(|_| {
         FlashInferError::invalid_argument("workspace_buffer length does not fit in i64")
     })?;
+    let total_checkpoints_i64 = total_checkpoints
+        .map(|v| {
+            i64::try_from(v).map_err(|_| {
+                FlashInferError::invalid_argument("total checkpoints do not fit in i64")
+            })
+        })
+        .transpose()?;
     let device_id = i32::try_from(stream.context().ordinal())
         .map_err(|_| FlashInferError::invalid_argument("device id does not fit in i32"))?;
 
@@ -983,6 +1173,47 @@ where
             stride_col: 1,
             device_id,
         });
+    }
+    if checkpointing_enabled {
+        let (state_checkpoints_ptr, _state_checkpoints_sync) = state_checkpoints_device
+            .ok_or_else(|| {
+                FlashInferError::invalid_argument(
+                    "state_checkpoints pointer is required when checkpointing is enabled",
+                )
+            })?;
+        let total_checkpoints_i64 = total_checkpoints_i64.ok_or_else(|| {
+            FlashInferError::invalid_argument(
+                "state_checkpoints shape metadata is required when checkpointing is enabled",
+            )
+        })?;
+        let (checkpoint_cu_starts_ptr, _checkpoint_cu_starts_sync) = checkpoint_cu_starts_device
+            .ok_or_else(|| {
+                FlashInferError::invalid_argument(
+                    "checkpoint_cu_starts pointer is required when checkpointing is enabled",
+                )
+            })?;
+
+        params = params.with_state_checkpointing(
+            Tensor4DF32Desc {
+                ptr: state_checkpoints_ptr as usize as *const c_void,
+                dim0: total_checkpoints_i64,
+                dim1: num_sab_heads_i64,
+                dim2: head_size_i64,
+                dim3: head_size_i64,
+                stride0: output_state_stride0,
+                stride1: output_state_stride1,
+                stride2: head_size_i64,
+                stride3: 1,
+                device_id,
+            },
+            Tensor1DI64Desc {
+                ptr: checkpoint_cu_starts_ptr as usize as *const c_void,
+                len: num_seqs_i64 + 1,
+                stride: 1,
+                device_id,
+            },
+            checkpoint_every_n_tokens,
+        );
     }
 
     gdn_prefill_sm90(&params)
@@ -1194,6 +1425,54 @@ unsafe fn gdn_prefill_sm90_with_runtime(
         }
     });
 
+    let mut state_checkpoints_shape = [0_i64; 4];
+    let mut state_checkpoints_strides = [0_i64; 4];
+    let state_checkpoints_tensor = params.state_checkpoints.map(|state_checkpoints| {
+        state_checkpoints_shape = [
+            state_checkpoints.dim0,
+            state_checkpoints.dim1,
+            state_checkpoints.dim2,
+            state_checkpoints.dim3,
+        ];
+        state_checkpoints_strides = [
+            state_checkpoints.stride0,
+            state_checkpoints.stride1,
+            state_checkpoints.stride2,
+            state_checkpoints.stride3,
+        ];
+        DLTensor {
+            data: state_checkpoints.ptr.cast_mut(),
+            device: DLDevice {
+                device_type: KDL_CUDA,
+                device_id: state_checkpoints.device_id,
+            },
+            ndim: 4,
+            dtype: dl_dtype_f32(),
+            shape: state_checkpoints_shape.as_mut_ptr(),
+            strides: state_checkpoints_strides.as_mut_ptr(),
+            byte_offset: 0,
+        }
+    });
+
+    let mut checkpoint_cu_starts_shape = [0_i64; 1];
+    let mut checkpoint_cu_starts_strides = [0_i64; 1];
+    let checkpoint_cu_starts_tensor = params.checkpoint_cu_starts.map(|checkpoint_cu_starts| {
+        checkpoint_cu_starts_shape = [checkpoint_cu_starts.len];
+        checkpoint_cu_starts_strides = [checkpoint_cu_starts.stride];
+        DLTensor {
+            data: checkpoint_cu_starts.ptr.cast_mut(),
+            device: DLDevice {
+                device_type: KDL_CUDA,
+                device_id: checkpoint_cu_starts.device_id,
+            },
+            ndim: 1,
+            dtype: dl_dtype_i64(),
+            shape: checkpoint_cu_starts_shape.as_mut_ptr(),
+            strides: checkpoint_cu_starts_strides.as_mut_ptr(),
+            byte_offset: 0,
+        }
+    });
+
     let input_state_any = input_state_tensor.as_ref().map_or_else(any_none, |tensor| {
         any_dltensor_ptr(tensor as *const DLTensor)
     });
@@ -1203,8 +1482,18 @@ unsafe fn gdn_prefill_sm90_with_runtime(
     let beta_any = beta_tensor.as_ref().map_or_else(any_none, |tensor| {
         any_dltensor_ptr(tensor as *const DLTensor)
     });
+    let state_checkpoints_any = state_checkpoints_tensor
+        .as_ref()
+        .map_or_else(any_none, |tensor| {
+            any_dltensor_ptr(tensor as *const DLTensor)
+        });
+    let checkpoint_cu_starts_any = checkpoint_cu_starts_tensor
+        .as_ref()
+        .map_or_else(any_none, |tensor| {
+            any_dltensor_ptr(tensor as *const DLTensor)
+        });
 
-    let args: [TVMFFIAny; 11] = [
+    let args: [TVMFFIAny; 14] = [
         any_dltensor_ptr(&output_tensor),
         any_dltensor_ptr(&output_state_tensor),
         any_dltensor_ptr(&q_tensor),
@@ -1216,6 +1505,9 @@ unsafe fn gdn_prefill_sm90_with_runtime(
         beta_any,
         any_f64(params.scale),
         any_dltensor_ptr(&workspace_tensor),
+        state_checkpoints_any,
+        checkpoint_cu_starts_any,
+        any_i64(params.checkpoint_every_n_tokens),
     ];
     let mut result = any_none();
 
@@ -1436,6 +1728,48 @@ fn check_contiguous_4d(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn check_contiguous_4d_allow_zero_dim0(
+    name: &str,
+    dim0: i64,
+    dim1: i64,
+    dim2: i64,
+    dim3: i64,
+    stride0: i64,
+    stride1: i64,
+    stride2: i64,
+    stride3: i64,
+) -> Result<(), FlashInferError> {
+    if dim0 < 0 || dim1 <= 0 || dim2 <= 0 || dim3 <= 0 {
+        return Err(FlashInferError::invalid_argument(format!(
+            "{name} dimensions must satisfy dim0 >= 0 and dim1..dim3 > 0"
+        )));
+    }
+
+    let expected_stride2 = dim3;
+    let expected_stride1 = dim2.checked_mul(dim3).ok_or_else(|| {
+        FlashInferError::invalid_argument(format!("{name} stride computation overflow"))
+    })?;
+    let expected_stride0 = dim1
+        .checked_mul(dim2)
+        .and_then(|v| v.checked_mul(dim3))
+        .ok_or_else(|| {
+            FlashInferError::invalid_argument(format!("{name} stride computation overflow"))
+        })?;
+
+    if stride3 != 1
+        || stride2 != expected_stride2
+        || stride1 != expected_stride1
+        || stride0 != expected_stride0
+    {
+        return Err(FlashInferError::invalid_argument(format!(
+            "{name} must be contiguous; expected strides [{expected_stride0}, {expected_stride1}, {expected_stride2}, 1], got [{stride0}, {stride1}, {stride2}, {stride3}]"
+        )));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1518,6 +1852,40 @@ mod tests {
         )
     }
 
+    fn valid_checkpoint_desc() -> Tensor4DF32Desc {
+        Tensor4DF32Desc {
+            ptr: non_null(),
+            dim0: 0,
+            dim1: 4,
+            dim2: 64,
+            dim3: 64,
+            stride0: 16384,
+            stride1: 4096,
+            stride2: 64,
+            stride3: 1,
+            device_id: 0,
+        }
+    }
+
+    fn valid_checkpoint_cu_starts_desc() -> Tensor1DI64Desc {
+        Tensor1DI64Desc {
+            ptr: non_null(),
+            len: 3,
+            stride: 1,
+            device_id: 0,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_checkpoint_config_with_zero_total_checkpoints() {
+        let params = valid_params().with_state_checkpointing(
+            valid_checkpoint_desc(),
+            valid_checkpoint_cu_starts_desc(),
+            64,
+        );
+        assert!(params.validate().is_ok());
+    }
+
     #[test]
     fn validate_rejects_bad_head_ratio() {
         let mut params = valid_params();
@@ -1553,5 +1921,73 @@ mod tests {
             device_id: 0,
         });
         assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_checkpoint_interval_without_tensors() {
+        let params = valid_params().with_checkpoint_every_n_tokens(64);
+        let err = params
+            .validate()
+            .expect_err("expected missing checkpoint tensor failure");
+        assert!(err.to_string().contains("must both be provided"));
+    }
+
+    #[test]
+    fn validate_rejects_non_multiple_checkpoint_interval() {
+        let params = valid_params().with_state_checkpointing(
+            valid_checkpoint_desc(),
+            valid_checkpoint_cu_starts_desc(),
+            96,
+        );
+        let err = params
+            .validate()
+            .expect_err("expected checkpoint interval multiple failure");
+        assert!(err.to_string().contains("multiple of 64"));
+    }
+
+    #[test]
+    fn validate_rejects_spurious_checkpoint_tensors_when_disabled() {
+        let params = valid_params()
+            .with_state_checkpointing(
+                valid_checkpoint_desc(),
+                valid_checkpoint_cu_starts_desc(),
+                64,
+            )
+            .with_checkpoint_every_n_tokens(0);
+        let err = params
+            .validate()
+            .expect_err("expected spurious checkpoint tensor failure");
+        assert!(err.to_string().contains("must be None"));
+    }
+
+    #[test]
+    fn validate_rejects_checkpoint_cu_starts_length_mismatch() {
+        let mut checkpoint_cu_starts = valid_checkpoint_cu_starts_desc();
+        checkpoint_cu_starts.len = 4;
+        let params = valid_params().with_state_checkpointing(
+            valid_checkpoint_desc(),
+            checkpoint_cu_starts,
+            64,
+        );
+        let err = params
+            .validate()
+            .expect_err("expected checkpoint cu_starts length mismatch");
+        assert!(err.to_string().contains("checkpoint_cu_starts length"));
+    }
+
+    #[test]
+    fn validate_rejects_checkpoint_shape_mismatch() {
+        let mut checkpoint_desc = valid_checkpoint_desc();
+        checkpoint_desc.dim1 = 3;
+        checkpoint_desc.stride0 = 3 * 64 * 64;
+        let params = valid_params().with_state_checkpointing(
+            checkpoint_desc,
+            valid_checkpoint_cu_starts_desc(),
+            64,
+        );
+        let err = params
+            .validate()
+            .expect_err("expected checkpoint shape mismatch");
+        assert!(err.to_string().contains("state_checkpoints shape"));
     }
 }

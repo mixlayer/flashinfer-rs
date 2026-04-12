@@ -150,6 +150,12 @@ pub struct FusedMoeParams {
     pub ep_rank: i64,
     /// Whether to enable alltoall in expert-parallel flow.
     pub enable_alltoall: bool,
+    /// Whether `input_sf` uses swizzled block-scale layout.
+    ///
+    /// Purpose: tells CUTLASS fused MoE how to interpret activation scaling-factor memory when
+    /// block-scaled quantization is active. `true` means scales are pre-swizzled for kernel
+    /// access; `false` means linear layout (e.g. post-communication layouts).
+    pub swizzled_input_sf: bool,
     /// Optional CUTLASS profile ids as `[gemm1_profile_id, gemm2_profile_id]`.
     ///
     /// If omitted, FlashInfer host code selects defaults.
@@ -185,6 +191,7 @@ impl FusedMoeParams {
             ep_size: 1,
             ep_rank: 0,
             enable_alltoall: false,
+            swizzled_input_sf: true,
             profile_ids: None,
             stream,
         }
@@ -229,6 +236,11 @@ impl FusedMoeParams {
 
     pub fn with_enable_alltoall(mut self, enable_alltoall: bool) -> Self {
         self.enable_alltoall = enable_alltoall;
+        self
+    }
+
+    pub fn with_swizzled_input_sf(mut self, swizzled_input_sf: bool) -> Self {
+        self.swizzled_input_sf = swizzled_input_sf;
         self
     }
 
@@ -460,7 +472,7 @@ unsafe fn fused_moe_with_runtime(
             .map(|any| AnyObjectDecRefGuard::new(runtime, any));
         let profile_ids_any = profile_ids_owned.as_ref().copied().unwrap_or_else(any_none);
 
-        let mut run_args: [TVMFFIAny; 24] = [
+        let mut run_args: [TVMFFIAny; 25] = [
             any_dltensor_ptr(&out_tensor),
             any_dltensor_ptr(&input_tensor),
             any_dltensor_ptr(&token_selected_experts_tensor),
@@ -474,6 +486,7 @@ unsafe fn fused_moe_with_runtime(
             any_none(), // swiglu_alpha
             any_none(), // swiglu_beta
             any_none(), // swiglu_limit
+            any_bool(params.swizzled_input_sf),
             any_i64(params.tp_size),
             any_i64(params.tp_rank),
             any_i64(params.ep_size),
@@ -1016,6 +1029,10 @@ pub struct FusedMoeCudarcOptions {
     pub ep_size: i64,
     pub ep_rank: i64,
     pub enable_alltoall: bool,
+    /// Whether block-scale `input_sf` tensors are passed in swizzled layout.
+    ///
+    /// Keep `true` for native kernel-prepared scales; set `false` for linear layouts.
+    pub swizzled_input_sf: bool,
     pub profile_ids: Option<[i64; 2]>,
 }
 
@@ -1030,6 +1047,7 @@ impl Default for FusedMoeCudarcOptions {
             ep_size: 1,
             ep_rank: 0,
             enable_alltoall: false,
+            swizzled_input_sf: true,
             profile_ids: None,
         }
     }
@@ -1209,7 +1227,8 @@ where
     .with_enable_pdl(options.enable_pdl)
     .with_tensor_parallel(options.tp_size, options.tp_rank)
     .with_expert_parallel(options.ep_size, options.ep_rank)
-    .with_enable_alltoall(options.enable_alltoall);
+    .with_enable_alltoall(options.enable_alltoall)
+    .with_swizzled_input_sf(options.swizzled_input_sf);
 
     let params = if let Some([gemm1_profile_id, gemm2_profile_id]) = options.profile_ids {
         params.with_profile_ids(gemm1_profile_id, gemm2_profile_id)
@@ -1318,5 +1337,17 @@ mod tests {
     fn with_profile_ids_sets_profile_ids() {
         let params = valid_params().with_profile_ids(7, 11);
         assert_eq!(params.profile_ids, Some([7, 11]));
+    }
+
+    #[test]
+    fn swizzled_input_sf_defaults_true() {
+        let params = valid_params();
+        assert!(params.swizzled_input_sf);
+    }
+
+    #[test]
+    fn with_swizzled_input_sf_sets_flag() {
+        let params = valid_params().with_swizzled_input_sf(false);
+        assert!(!params.swizzled_input_sf);
     }
 }

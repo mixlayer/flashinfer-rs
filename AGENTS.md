@@ -78,6 +78,12 @@ This file documents the expected process for adding new FlashInfer kernel bindin
   - kernel launch returns success for a valid tiny case
   - no panic on error path (decoded TVM-FFI errors where applicable)
 
+GPU test execution note (Codex sandbox):
+
+- Commands that need real CUDA devices (`cargo test ...` with `FLASHINFER_RS_RUN_GPU_TESTS=1`, `nvidia-smi`, runtime kernel launches) must run outside the default sandbox.
+- Inside sandbox, GPU checks may fail with `CUDA_ERROR_NO_DEVICE` or `nvidia-smi` driver-communication errors even when host GPUs are present.
+- For GPU validation, request escalated command execution and rerun the exact command outside sandbox before concluding there is a device/runtime bug.
+
 ## How symbol matching is done in practice here
 
 - Start from wheel member names to identify the exact module URI or fixed path.
@@ -159,4 +165,5 @@ Practical implication for Rust bindings:
 - [ ] `cudarc` wrapper added.
 - [ ] Unit tests added/updated.
 - [ ] Wheel launch smoke test added/updated for ABI regression coverage.
+- [ ] GPU-required commands/tests run outside sandbox (or explicitly documented as not executed).
 - [ ] Docs (`README.md` and/or `docs/flashinfer-rs-integration.md`) updated.
