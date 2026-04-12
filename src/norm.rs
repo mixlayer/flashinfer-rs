@@ -286,9 +286,7 @@ pub fn gemma_rmsnorm(params: &GemmaRmsNormParams) -> Result<(), FlashInferError>
     unsafe { gemma_rmsnorm_with_runtime(runtime, params) }
 }
 
-pub fn gemma_fused_add_rmsnorm(
-    params: &GemmaFusedAddRmsNormParams,
-) -> Result<(), FlashInferError> {
+pub fn gemma_fused_add_rmsnorm(params: &GemmaFusedAddRmsNormParams) -> Result<(), FlashInferError> {
     params.validate()?;
     let runtime = FlashInferRuntime::global()?;
     // SAFETY: all FFI preconditions are validated by `params.validate` and runtime initialization.

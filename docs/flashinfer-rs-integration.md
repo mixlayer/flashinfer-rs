@@ -180,6 +180,31 @@ In `flashinfer-rs`, this is exposed as:
 
 If `profile_ids` is omitted, Rust passes `None` and FlashInfer host code uses its default tactic selection path.
 
+`flashinfer-rs` also exposes the `swizzled_input_sf` boolean argument used by recent CUTLASS fused-MoE ABI variants:
+
+- `FusedMoeParams::with_swizzled_input_sf(swizzled)`
+- `FusedMoeCudarcOptions { swizzled_input_sf: swizzled, .. }`
+
+When block-scale `input_sf` tensors are swizzled for kernel access, keep this `true` (default). Set `false` for linear scale layouts.
+
+## GDN Prefill State Checkpointing
+Recent `gdn_prefill` ABI variants include optional checkpoint outputs:
+
+- `state_checkpoints`: rank-4 f32 tensor `[total_checkpoints, num_sab_heads, head_size, head_size]`
+- `checkpoint_cu_starts`: rank-1 i64 tensor `[num_seqs + 1]`
+- `checkpoint_every_n_tokens`: int64 cadence (`0` disables checkpointing)
+
+In `flashinfer-rs` this is surfaced via:
+
+- Core params: `GdnPrefillSm90Params::with_state_checkpointing(...)`
+- Cudarc wrapper: `gdn_prefill_sm90_cudarc_with_options(..., state_checkpoints, checkpoint_cu_starts, checkpoint_every_n_tokens, scale)`
+
+Validation rules in Rust:
+
+- `checkpoint_every_n_tokens` must be `>= 0` and fit in `int32`
+- when enabled (`> 0`), cadence must be a multiple of 64 and both checkpoint tensors are required
+- when disabled (`== 0`), checkpoint tensors must be omitted
+
 ## Runtime configuration knobs
 Environment variables accepted by `flashinfer-rs`:
 
