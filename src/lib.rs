@@ -12,11 +12,17 @@ pub mod runtime;
 
 pub use error::FlashInferError;
 pub use fused_moe::{
-    FusedMoeActivationType, FusedMoeBackend, FusedMoeParams, FusedMoeTensor2DDesc,
-    FusedMoeTensor2DF32Desc, FusedMoeTensor2DI32Desc, FusedMoeTensor3DDesc, fused_moe,
+    FusedMoeActivationType, FusedMoeBackend, FusedMoeDeepSeekFp8BlockScaleQuantParams,
+    FusedMoeFp8ActScaleDesc, FusedMoeFp8PerTensorQuantParams, FusedMoeParams, FusedMoeQuantization,
+    FusedMoeTensor0DF32Desc, FusedMoeTensor1DF32Desc, FusedMoeTensor2DDesc,
+    FusedMoeTensor2DF32Desc, FusedMoeTensor2DI32Desc, FusedMoeTensor3DDesc,
+    FusedMoeTensor3DF32Desc, fused_moe,
 };
 #[cfg(feature = "cudarc")]
-pub use fused_moe::{FusedMoeCudarcOptions, fused_moe_cudarc};
+pub use fused_moe::{
+    FusedMoeCudarcOptions, fused_moe_cudarc, fused_moe_cudarc_deepseek_fp8_block_scale,
+    fused_moe_cudarc_fp8_per_tensor,
+};
 pub use gdn_prefill::{
     GdnPrefillSm90Params, Tensor1DI64Desc, Tensor1DU8Desc, Tensor2DF32Desc, Tensor3DDesc,
     Tensor4DF32Desc, gdn_prefill_sm90,

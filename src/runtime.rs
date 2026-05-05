@@ -50,6 +50,8 @@ type TVMFFIFunctionCallFn =
     unsafe extern "C" fn(TVMFFIObjectHandle, *mut TVMFFIAny, i32, *mut TVMFFIAny) -> i32;
 type TVMFFIStringFromByteArrayFn =
     unsafe extern "C" fn(*const TVMFFIByteArray, *mut TVMFFIAny) -> i32;
+type TVMFFITensorFromDLPackVersionedFn =
+    unsafe extern "C" fn(*mut DLManagedTensorVersioned, i32, i32, *mut TVMFFIObjectHandle) -> i32;
 type TVMFFISafeCallFn =
     unsafe extern "C" fn(*mut c_void, *const TVMFFIAny, i32, *mut TVMFFIAny) -> i32;
 type CudaMallocFn = unsafe extern "C" fn(*mut *mut c_void, usize) -> i32;
@@ -166,6 +168,7 @@ pub struct FlashInferRuntime {
     tvmffi_function_get_global: TVMFFIFunctionGetGlobalFn,
     tvmffi_function_call: TVMFFIFunctionCallFn,
     tvmffi_string_from_byte_array: TVMFFIStringFromByteArrayFn,
+    tvmffi_tensor_from_dlpack_versioned: TVMFFITensorFromDLPackVersionedFn,
     tvm_ffi_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gemma_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gemma_fused_add_rmsnorm: TVMFFISafeCallFn,
@@ -557,6 +560,34 @@ impl FlashInferRuntime {
         Err(self.decode_raised_error(code))
     }
 
+    pub(crate) unsafe fn tensor_from_dlpack_versioned(
+        &self,
+        from: *mut DLManagedTensorVersioned,
+        require_alignment: i32,
+        require_contiguous: bool,
+    ) -> Result<TVMFFIObjectHandle, FlashInferError> {
+        let mut out: TVMFFIObjectHandle = std::ptr::null_mut();
+        let require_contiguous_i32 = if require_contiguous { 1 } else { 0 };
+        // SAFETY: symbol pointer and argument layout match C API.
+        let code = unsafe {
+            (self.tvmffi_tensor_from_dlpack_versioned)(
+                from,
+                require_alignment,
+                require_contiguous_i32,
+                &mut out as *mut _,
+            )
+        };
+        if code != 0 {
+            return Err(self.decode_raised_error(code));
+        }
+        if out.is_null() {
+            return Err(FlashInferError::invalid_argument(
+                "TVMFFITensorFromDLPackVersioned returned a null tensor object",
+            ));
+        }
+        Ok(out)
+    }
+
     pub(crate) unsafe fn object_dec_ref(&self, obj: TVMFFIObjectHandle) {
         if obj.is_null() {
             return;
@@ -931,6 +962,15 @@ impl FlashInferRuntime {
             )?
         };
 
+        let tvmffi_tensor_from_dlpack_versioned: TVMFFITensorFromDLPackVersionedFn = unsafe {
+            resolve_symbol(
+                &tvmffi_lib,
+                &artifacts.tvmffi_so_path,
+                b"TVMFFITensorFromDLPackVersioned\0",
+                "TVMFFITensorFromDLPackVersioned",
+            )?
+        };
+
         let tvm_ffi_gemma_rmsnorm: TVMFFISafeCallFn = unsafe {
             resolve_symbol(
                 &norm_lib,
@@ -1031,6 +1071,7 @@ impl FlashInferRuntime {
             tvmffi_function_get_global,
             tvmffi_function_call,
             tvmffi_string_from_byte_array,
+            tvmffi_tensor_from_dlpack_versioned,
             tvm_ffi_rmsnorm,
             tvm_ffi_gemma_rmsnorm,
             tvm_ffi_gemma_fused_add_rmsnorm,

@@ -59,6 +59,7 @@ The Rust integration calls the exported TVM-FFI host wrapper:
 - `__tvm_ffi_plan`, `__tvm_ffi_ragged_run`, and `__tvm_ffi_paged_run` (for `batch_prefill_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_run` (for `single_decode_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_plan` and `__tvm_ffi_run` (for `batch_decode_with_kv_cache` JIT-cache modules)
+- `__tvm_ffi_init` (for `fused_moe_{90,100,103,120}` JIT-cache modules; `run_moe` resolved from returned module)
 
 This wrapper handles argument decoding, validation, stream lookup, and dispatch to the correct kernel implementation.
 
@@ -179,6 +180,38 @@ In `flashinfer-rs`, this is exposed as:
 - `FusedMoeCudarcOptions { profile_ids: Some([gemm1, gemm2]), .. }`
 
 If `profile_ids` is omitted, Rust passes `None` and FlashInfer host code uses its default tactic selection path.
+
+## CUTLASS Fused MoE FP8 Modes
+`flashinfer-rs` now exposes two explicit FP8 quantization modes for `fused_moe`:
+
+1. FP8 per-tensor quantization (`FusedMoeQuantization::Fp8PerTensor`)
+2. DeepSeek FP8 block-scale (`FusedMoeQuantization::DeepSeekFp8BlockScale`)
+
+FP8 per-tensor mode contract:
+
+- Input and expert weights dtype must be `DType::F8E4M3FN`.
+- Output dtype must be `DType::F16` or `DType::BF16`.
+- `quant_scales` ordering passed to `run_moe` is:
+  1. `fc1_dequant` (`[num_experts_on_rank]`, f32)
+  2. `fc2_quant` (scalar f32 or `[num_experts_on_rank]`, f32)
+  3. `fc2_dequant` (`[num_experts_on_rank]`, f32)
+  4. `fc1_input_dequant` (scalar f32)
+
+DeepSeek FP8 block-scale contract (strict parity mode):
+
+- Backend must be `FusedMoeBackend::Sm90`.
+- Input/output dtype must be `DType::BF16`.
+- Expert weights dtype must be `DType::F8E4M3FN`.
+- `hidden_size` and `inter_size` must be divisible by 128.
+- `quant_scales` ordering passed to `run_moe` is:
+  1. `fc1_scales`: `[num_experts_on_rank, fc1_expert_weights.dim1 / 128, hidden_size / 128]` (f32)
+  2. `fc2_scales`: `[num_experts_on_rank, hidden_size / 128, inter_size / 128]` (f32)
+
+Notes:
+
+- Rust sets `use_deepseek_fp8_block_scale=true` only for the DeepSeek mode.
+- Rust keeps `use_w4_group_scaling=false`, `use_mxfp8_act_scaling=false`, and `use_packed_weights=false`.
+- CUDA-version-specific DeepSeek gating (for example, CUDA 12.8 requirements in upstream kernels) is not pre-checked in Rust and is surfaced by runtime kernel errors.
 
 ## Runtime configuration knobs
 Environment variables accepted by `flashinfer-rs`:

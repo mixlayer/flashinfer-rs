@@ -11,6 +11,7 @@ fn decode(bits: u16, dtype: DType) -> f32 {
     match dtype {
         DType::F16 => half::f16::from_bits(bits).to_f32(),
         DType::BF16 => half::bf16::from_bits(bits).to_f32(),
+        DType::F8E4M3FN => panic!("gemma_rmsnorm tests do not support fp8"),
     }
 }
 
@@ -18,6 +19,7 @@ fn encode(value: f32, dtype: DType) -> u16 {
     match dtype {
         DType::F16 => half::f16::from_f32(value).to_bits(),
         DType::BF16 => half::bf16::from_f32(value).to_bits(),
+        DType::F8E4M3FN => panic!("gemma_rmsnorm tests do not support fp8"),
     }
 }
 
@@ -103,6 +105,7 @@ fn run_case(dtype: DType, rows: usize, cols: usize, eps: f64) {
         let tol = match dtype {
             DType::F16 => 0.03,
             DType::BF16 => 0.06,
+            DType::F8E4M3FN => panic!("gemma_rmsnorm tests do not support fp8"),
         } + rel_bound;
         if abs_err > max_abs {
             max_abs = abs_err;

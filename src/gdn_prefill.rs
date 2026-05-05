@@ -2,8 +2,8 @@ use std::ffi::c_void;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    DLDataType, DLDevice, DLTensor, KDL_BFLOAT, KDL_CUDA, KDL_FLOAT, KDL_INT, KDL_UINT, TVMFFIAny,
-    any_dltensor_ptr, any_f64, any_none,
+    DLDataType, DLDevice, DLTensor, KDL_BFLOAT, KDL_CUDA, KDL_FLOAT, KDL_FLOAT8_E4M3FN, KDL_INT,
+    KDL_UINT, TVMFFIAny, any_dltensor_ptr, any_f64, any_none,
 };
 use crate::norm::DType;
 use crate::runtime::FlashInferRuntime;
@@ -1289,6 +1289,11 @@ fn dl_dtype_from_norm_dtype(dtype: DType) -> DLDataType {
         DType::BF16 => DLDataType {
             code: KDL_BFLOAT,
             bits: 16,
+            lanes: 1,
+        },
+        DType::F8E4M3FN => DLDataType {
+            code: KDL_FLOAT8_E4M3FN,
+            bits: 8,
             lanes: 1,
         },
     }

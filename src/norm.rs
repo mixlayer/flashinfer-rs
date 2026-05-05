@@ -2,8 +2,8 @@ use std::ffi::c_void;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    DLDataType, DLDevice, DLTensor, KDL_BFLOAT, KDL_CUDA, KDL_FLOAT, TVMFFIAny, any_bool,
-    any_dltensor_ptr, any_f64, any_none,
+    DLDataType, DLDevice, DLTensor, KDL_BFLOAT, KDL_CUDA, KDL_FLOAT, KDL_FLOAT8_E4M3FN, TVMFFIAny,
+    any_bool, any_dltensor_ptr, any_f64, any_none,
 };
 use crate::runtime::FlashInferRuntime;
 
@@ -11,6 +11,7 @@ use crate::runtime::FlashInferRuntime;
 pub enum DType {
     F16,
     BF16,
+    F8E4M3FN,
 }
 
 impl DType {
@@ -24,6 +25,11 @@ impl DType {
             DType::BF16 => DLDataType {
                 code: KDL_BFLOAT,
                 bits: 16,
+                lanes: 1,
+            },
+            DType::F8E4M3FN => DLDataType {
+                code: KDL_FLOAT8_E4M3FN,
+                bits: 8,
                 lanes: 1,
             },
         }
@@ -1322,6 +1328,14 @@ mod tests {
             1e-6,
             std::ptr::null_mut(),
         )
+    }
+
+    #[test]
+    fn dtype_fp8_maps_to_expected_dlpack_code() {
+        let dtype = DType::F8E4M3FN.as_dl_dtype();
+        assert_eq!(dtype.code, KDL_FLOAT8_E4M3FN);
+        assert_eq!(dtype.bits, 8);
+        assert_eq!(dtype.lanes, 1);
     }
 
     #[test]
