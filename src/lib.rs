@@ -6,6 +6,7 @@ pub mod mha_batch_prefill;
 pub mod mha_batch_prefill_paged;
 pub mod mha_decode;
 pub mod mha_prefill;
+pub mod mla_batch_paged;
 pub mod norm;
 pub mod paged_kv_append;
 pub mod runtime;
@@ -62,6 +63,10 @@ pub use mha_decode::{
 pub use mha_prefill::{
     MhaMaskMode, MhaPosEncodingMode, MhaQkvLayout, MhaSinglePrefillParams, MhaTensor1DF32Desc,
     MhaTensor1DU8Desc, MhaTensor2DF32Desc, MhaTensor3DDesc, mha_single_prefill,
+};
+pub use mla_batch_paged::{
+    MlaBackend, MlaBatchPagedAttentionParams, MlaBatchPagedAttentionPlan,
+    MlaBatchPagedAttentionPlanParams, MlaTensor3DDesc, mla_batch_paged_plan, mla_batch_paged_run,
 };
 #[cfg(feature = "cudarc")]
 pub use mha_prefill::{MhaSinglePrefillCudarcOptions, mha_single_prefill_cudarc};
