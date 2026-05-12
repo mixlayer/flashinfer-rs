@@ -130,6 +130,16 @@ struct LoadedFusedMoeKernel {
 }
 
 #[derive(Clone, Copy)]
+struct Fp4QuantizationKernelFns {
+    block_scale_interleave: TVMFFISafeCallFn,
+}
+
+struct LoadedFp4QuantizationKernel {
+    _lib: Library,
+    fns: Fp4QuantizationKernelFns,
+}
+
+#[derive(Clone, Copy)]
 struct BatchPrefillKernelFns {
     plan: TVMFFISafeCallFn,
     ragged_run: TVMFFISafeCallFn,
@@ -192,6 +202,7 @@ pub struct FlashInferRuntime {
     batch_decode_kernel_cache: Mutex<HashMap<String, LoadedBatchDecodeKernel>>,
     batch_mla_kernel_cache: Mutex<HashMap<String, LoadedBatchMlaKernel>>,
     fused_moe_kernel_cache: Mutex<HashMap<String, LoadedFusedMoeKernel>>,
+    fp4_quantization_kernel_cache: Mutex<HashMap<String, LoadedFp4QuantizationKernel>>,
 }
 
 static GLOBAL_RUNTIME: OnceLock<FlashInferRuntime> = OnceLock::new();
@@ -766,6 +777,73 @@ impl FlashInferRuntime {
         Ok(init)
     }
 
+    /// Load and cache the flashinfer fp4_quantization_{sm} module (separate
+    /// JIT cache entry from fused_moe). Exposes the
+    /// `__tvm_ffi_block_scale_interleave_sm100` symbol used to convert
+    /// modelopt's unswizzled per-group FP8 weight scales into the
+    /// CUTLASS-tile-friendly swizzled layout the NVFP4 fused-MoE kernel
+    /// requires.
+    unsafe fn resolve_fp4_quantization_kernel(
+        &self,
+        kernel_uri: &str,
+    ) -> Result<Fp4QuantizationKernelFns, FlashInferError> {
+        let mut cache = self.fp4_quantization_kernel_cache.lock().map_err(|_| {
+            FlashInferError::invalid_argument("fp4 quantization cache lock is poisoned")
+        })?;
+
+        if let Some(kernel) = cache.get(kernel_uri) {
+            return Ok(kernel.fns);
+        }
+
+        let kernel_path =
+            extract_jit_kernel(&self.jit_cache_wheel_path, &self.artifact_dir, kernel_uri)?;
+
+        let kernel_lib =
+            unsafe { Library::open(Some(&kernel_path), libc::RTLD_NOW | libc::RTLD_LOCAL) }
+                .map_err(|e| FlashInferError::LibraryLoad {
+                    library: kernel_path.clone(),
+                    message: e.to_string(),
+                })?;
+
+        let block_scale_interleave: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_block_scale_interleave_sm100\0",
+                "__tvm_ffi_block_scale_interleave_sm100",
+            )?
+        };
+
+        let fns = Fp4QuantizationKernelFns {
+            block_scale_interleave,
+        };
+        cache.insert(
+            kernel_uri.to_string(),
+            LoadedFp4QuantizationKernel {
+                _lib: kernel_lib,
+                fns,
+            },
+        );
+        Ok(fns)
+    }
+
+    pub(crate) unsafe fn call_block_scale_interleave(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_fp4_quantization_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.block_scale_interleave)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
     unsafe fn resolve_batch_prefill_kernel(
         &self,
         kernel_uri: &str,
@@ -1180,6 +1258,7 @@ impl FlashInferRuntime {
             batch_decode_kernel_cache: Mutex::new(HashMap::new()),
             batch_mla_kernel_cache: Mutex::new(HashMap::new()),
             fused_moe_kernel_cache: Mutex::new(HashMap::new()),
+            fp4_quantization_kernel_cache: Mutex::new(HashMap::new()),
         })
     }
 

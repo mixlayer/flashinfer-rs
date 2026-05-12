@@ -1,5 +1,6 @@
 pub mod error;
 mod ffi;
+pub mod fp4_quantization;
 pub mod fused_moe;
 pub mod gdn_prefill;
 pub mod mha_batch_prefill;
@@ -12,12 +13,16 @@ pub mod paged_kv_append;
 pub mod runtime;
 
 pub use error::FlashInferError;
+pub use fp4_quantization::{
+    BlockScaleInterleaveParams, Fp4QuantizationBackend, block_scale_interleave,
+    swizzled_layout_size,
+};
 pub use fused_moe::{
     FusedMoeActivationType, FusedMoeBackend, FusedMoeDeepSeekFp8BlockScaleQuantParams,
-    FusedMoeFp8ActScaleDesc, FusedMoeFp8PerTensorQuantParams, FusedMoeParams, FusedMoeQuantization,
-    FusedMoeTensor0DF32Desc, FusedMoeTensor1DF32Desc, FusedMoeTensor2DDesc,
-    FusedMoeTensor2DF32Desc, FusedMoeTensor2DI32Desc, FusedMoeTensor3DDesc,
-    FusedMoeTensor3DF32Desc, fused_moe,
+    FusedMoeFp8ActScaleDesc, FusedMoeFp8PerTensorQuantParams, FusedMoeInt4GroupScaleQuantParams,
+    FusedMoeNvfp4QuantParams, FusedMoeParams, FusedMoeQuantization, FusedMoeTensor0DF32Desc,
+    FusedMoeTensor1DF32Desc, FusedMoeTensor2DDesc, FusedMoeTensor2DF32Desc, FusedMoeTensor2DI32Desc,
+    FusedMoeTensor3DDesc, FusedMoeTensor3DF32Desc, fused_moe,
 };
 #[cfg(feature = "cudarc")]
 pub use fused_moe::{

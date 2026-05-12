@@ -4,8 +4,8 @@ use crate::error::FlashInferError;
 use crate::ffi::{
     DLDataType, DLDevice, DLManagedTensorVersioned, DLPACK_MAJOR_VERSION, DLPACK_MINOR_VERSION,
     DLPackVersion, DLTensor, KDL_BFLOAT, KDL_CUDA, KDL_FLOAT, KDL_FLOAT8_E4M3FN, KDL_INT,
-    TVMFFIAny, any_bool, any_dltensor_ptr, any_dtype, any_i64, any_none, any_object_handle,
-    any_tensor_object,
+    KDL_UINT, TVMFFIAny, any_bool, any_dltensor_ptr, any_dtype, any_i64, any_none,
+    any_object_handle, any_tensor_object,
 };
 use crate::norm::DType;
 use crate::runtime::FlashInferRuntime;
@@ -168,10 +168,92 @@ pub struct FusedMoeDeepSeekFp8BlockScaleQuantParams {
     pub fc2_scales: FusedMoeTensor3DF32Desc,
 }
 
+/// Quantization parameters for grouped INT4 (W4) MoE.
+///
+/// Maps to FlashInfer's `isInt4Quant()` quant-scales array (8 entries). Slots
+/// that are `None` are emitted as zero-`numel` placeholder tensors, which the
+/// C++ binding interprets as `nullptr` and the kernel substitutes with
+/// sensible defaults (alpha=1.0, no zero-points, internal per-token FP8 quant
+/// scales when `use_w4_group_scaling=true`).
+///
+/// Cross-reference: `flashinfer/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu::getQuantParams`,
+/// `Expecting 8 quant scales for INT4 quantization`.
+#[derive(Debug, Clone, Copy)]
+pub struct FusedMoeInt4GroupScaleQuantParams {
+    /// FC1 per-group weight dequant scales, rank-3:
+    /// `[num_experts_on_rank, fc1_inter_size, hidden_size / group_size]`.
+    ///
+    /// Stored as the activation dtype (BF16/F16) per upstream contract; the
+    /// kernel re-interprets the underlying bytes.
+    pub fc1_weight_scales: FusedMoeTensor3DDesc,
+    /// FC2 per-group weight dequant scales, rank-3:
+    /// `[num_experts_on_rank, hidden_size, inter_size / group_size]`.
+    pub fc2_weight_scales: FusedMoeTensor3DDesc,
+    /// Optional FC1 pre-quant activation scales (W4AFP8 path), rank-2:
+    /// `[num_experts_on_rank, hidden_size]`, activation dtype.
+    pub fc1_act_scales: Option<FusedMoeTensor2DDesc>,
+    /// Optional FC2 pre-quant activation scales, rank-2:
+    /// `[num_experts_on_rank, inter_size, 1]` or `[num_experts_on_rank, inter_size]`,
+    /// activation dtype.
+    pub fc2_act_scales: Option<FusedMoeTensor2DDesc>,
+    /// Optional FC1 per-group weight zero points (asymmetric quant), rank-3
+    /// same shape as `fc1_weight_scales`.
+    pub fc1_weight_zeros: Option<FusedMoeTensor3DDesc>,
+    /// Optional FC2 per-group weight zero points, rank-3, same shape as
+    /// `fc2_weight_scales`.
+    pub fc2_weight_zeros: Option<FusedMoeTensor3DDesc>,
+    /// Optional FC1 per-expert alpha (= `weight_scale_2 * input_scale_max`),
+    /// rank-1 f32: `[num_experts_on_rank]`.
+    pub fc1_alpha: Option<FusedMoeTensor1DF32Desc>,
+    /// Optional FC2 per-expert alpha, rank-1 f32: `[num_experts_on_rank]`.
+    pub fc2_alpha: Option<FusedMoeTensor1DF32Desc>,
+}
+
+/// Quantization parameters for NVFP4 fused MoE.
+///
+/// Maps to FlashInfer's `isNvfp4Quant()` quant-scales array (6 entries) in
+/// `flashinfer/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu::getQuantParams`
+/// (`isNvfp4Quant()` branch):
+///   [0] fc1_act_global   (rank-0 F32)            — `1 / amax_fc1_input * (E4M3_MAX*E2M1_MAX)`
+///   [1] fc1_weight_block (rank-3 FP8 E4M3)       — swizzled `[E, round_up(2n,128), round_up(k/16,4)]`
+///   [2] fc1_global       (rank-1 F32 `[E]`)      — `1 / (fc1_act_global * weight_scale_2_fc1)`
+///   [3] fc2_act_global   (rank-0 F32)            — for FC2 input (= FC1 output post-SwiGLU)
+///   [4] fc2_weight_block (rank-3 FP8 E4M3)       — swizzled `[E, round_up(k,128), round_up(n/16,4)]`
+///   [5] fc2_global       (rank-1 F32 `[E]`)
+///
+/// Weight tensors themselves are FP4 E2M1 packed (16 nibbles per int64 element);
+/// the descriptor on `FusedMoeParams::fc1/fc2_expert_weights` must use
+/// `dim2 = in / 16` and the binding sets `mWeightDtype = dl_int64` via the
+/// `Nvfp4` variant of this enum.
+#[derive(Debug, Clone, Copy)]
+pub struct FusedMoeNvfp4QuantParams {
+    pub fc1_act_global: FusedMoeTensor0DF32Desc,
+    pub fc1_weight_block: FusedMoeTensor3DDesc,
+    pub fc1_global: FusedMoeTensor1DF32Desc,
+    pub fc2_act_global: FusedMoeTensor0DF32Desc,
+    pub fc2_weight_block: FusedMoeTensor3DDesc,
+    pub fc2_global: FusedMoeTensor1DF32Desc,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum FusedMoeQuantization {
     Fp8PerTensor(FusedMoeFp8PerTensorQuantParams),
     DeepSeekFp8BlockScale(FusedMoeDeepSeekFp8BlockScaleQuantParams),
+    /// Grouped INT4 weights with optional FP8 activation pre-quant.
+    ///
+    /// - W4A16 (BF16 activations, INT4 weights): set
+    ///   `use_w4_group_scaling=false`, `use_packed_weights=true`,
+    ///   leave act-scales / alpha as `None`.
+    /// - W4AFP8 (BF16->FP8 prequant, INT4 weights): set
+    ///   `use_w4_group_scaling=true`, `use_packed_weights=true`,
+    ///   leave act-scales / alpha as `None` to let the kernel derive them
+    ///   from per-token statistics, or supply explicit scales for parity with
+    ///   trained quant configs.
+    Int4GroupScale(FusedMoeInt4GroupScaleQuantParams),
+    /// NVFP4 (FP4 E2M1 weights + FP8 E4M3 block scales + F32 per-tensor scales,
+    /// BF16/F16 activations). Requires Blackwell (SM100/SM103/SM120). Weight
+    /// tensors are passed as `int64` storage (16 FP4 nibbles per element).
+    Nvfp4(FusedMoeNvfp4QuantParams),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -219,6 +301,13 @@ pub struct FusedMoeParams {
     pub profile_ids: Option<[i64; 2]>,
     /// Optional quantization mode/scales consumed by CUTLASS fused MoE.
     pub quantization: Option<FusedMoeQuantization>,
+    /// Whether expert weight tensors are bit-packed (e.g. INT4 packed
+    /// 2 nibbles per byte, surfaced to flashinfer as `dl_uint8`).
+    ///
+    /// Required to be `true` for the INT4 (`Int4GroupScale`) variant; the
+    /// flag is also forwarded to the C++ binding via `use_packed_weights`
+    /// in `init`.
+    pub use_packed_weights: bool,
     /// CUDA stream (`cudaStream_t`) used for async launch.
     pub stream: *mut c_void,
 }
@@ -252,6 +341,7 @@ impl FusedMoeParams {
             enable_alltoall: false,
             profile_ids: None,
             quantization: None,
+            use_packed_weights: false,
             stream,
         }
     }
@@ -324,6 +414,31 @@ impl FusedMoeParams {
         self
     }
 
+    /// Configure grouped INT4 quantization. Implies `use_packed_weights=true`.
+    pub fn with_int4_group_scale_quantization(
+        mut self,
+        quantization: FusedMoeInt4GroupScaleQuantParams,
+    ) -> Self {
+        self.quantization = Some(FusedMoeQuantization::Int4GroupScale(quantization));
+        self.use_packed_weights = true;
+        self
+    }
+
+    /// Configure NVFP4 (W4FP4) quantization for Blackwell. The caller must
+    /// pass `fc1/fc2_expert_weights` with `dim2 = in / 16` (storage as
+    /// `int64`, 16 FP4 nibbles per element). Pre-swizzled weight block scales
+    /// are required (see `flashinfer::block_scale_interleave_sm100`).
+    pub fn with_nvfp4_quantization(mut self, quantization: FusedMoeNvfp4QuantParams) -> Self {
+        self.quantization = Some(FusedMoeQuantization::Nvfp4(quantization));
+        self.use_packed_weights = false;
+        self
+    }
+
+    pub fn with_packed_weights(mut self, use_packed_weights: bool) -> Self {
+        self.use_packed_weights = use_packed_weights;
+        self
+    }
+
     pub fn validate(&self) -> Result<(), FlashInferError> {
         validate_fused_moe(self)
     }
@@ -390,6 +505,42 @@ unsafe fn fused_moe_with_runtime(
         )
     });
 
+    let use_deepseek_fp8_block_scale = matches!(
+        params.quantization,
+        Some(FusedMoeQuantization::DeepSeekFp8BlockScale(_))
+    );
+    let use_w4_group_scaling = matches!(
+        params.quantization,
+        Some(FusedMoeQuantization::Int4GroupScale(_))
+    );
+    let use_nvfp4 = matches!(params.quantization, Some(FusedMoeQuantization::Nvfp4(_)));
+    let use_packed_weights = params.use_packed_weights;
+
+    // Weight-dtype selection mirrors the host-side dispatch in
+    // `flashinfer_cutlass_fused_moe_binding.cu::isInt4Quant()` /
+    // `isNvfp4Quant()`:
+    //
+    //   - Grouped INT4 / packed: `mWeightDtype == dl_uint8` (2 nibbles per
+    //     byte; kernel template uses `cutlass::uint4b_t`).
+    //   - NVFP4: `mWeightDtype == dl_int64` (16 FP4 E2M1 nibbles per int64
+    //     element; kernel template uses `__nv_fp4_e2m1`).
+    //   - Otherwise: native weight dtype.
+    let weight_dl_dtype = if use_nvfp4 {
+        DLDataType {
+            code: KDL_INT,
+            bits: 64,
+            lanes: 1,
+        }
+    } else if use_w4_group_scaling || use_packed_weights {
+        DLDataType {
+            code: KDL_UINT,
+            bits: 8,
+            lanes: 1,
+        }
+    } else {
+        dl_dtype_from_dtype(params.fc1_expert_weights.dtype)
+    };
+
     let mut fc1_expert_weights_shape = [
         params.fc1_expert_weights.dim0,
         params.fc1_expert_weights.dim1,
@@ -400,9 +551,9 @@ unsafe fn fused_moe_with_runtime(
         params.fc1_expert_weights.stride1,
         params.fc1_expert_weights.stride2,
     ];
-    let fc1_expert_weights_tensor = tensor_3d(
+    let fc1_expert_weights_tensor = tensor_3d_with_dl_dtype(
         params.fc1_expert_weights.ptr,
-        params.fc1_expert_weights.dtype,
+        weight_dl_dtype,
         params.fc1_expert_weights.device_id,
         &mut fc1_expert_weights_shape,
         &mut fc1_expert_weights_strides,
@@ -430,9 +581,9 @@ unsafe fn fused_moe_with_runtime(
         params.fc2_expert_weights.stride1,
         params.fc2_expert_weights.stride2,
     ];
-    let fc2_expert_weights_tensor = tensor_3d(
+    let fc2_expert_weights_tensor = tensor_3d_with_dl_dtype(
         params.fc2_expert_weights.ptr,
-        params.fc2_expert_weights.dtype,
+        weight_dl_dtype,
         params.fc2_expert_weights.device_id,
         &mut fc2_expert_weights_shape,
         &mut fc2_expert_weights_strides,
@@ -450,19 +601,14 @@ unsafe fn fused_moe_with_runtime(
         )
     });
 
-    let use_deepseek_fp8_block_scale = matches!(
-        params.quantization,
-        Some(FusedMoeQuantization::DeepSeekFp8BlockScale(_))
-    );
-
     let init_args: [TVMFFIAny; 7] = [
         any_dtype(dl_dtype_from_dtype(params.input.dtype)),
-        any_dtype(dl_dtype_from_dtype(params.fc1_expert_weights.dtype)),
+        any_dtype(weight_dl_dtype),
         any_dtype(dl_dtype_from_dtype(params.out.dtype)),
         any_bool(use_deepseek_fp8_block_scale),
-        any_bool(false), // use_w4_group_scaling
-        any_bool(false), // use_mxfp8_act_scaling
-        any_bool(false), // use_packed_weights
+        any_bool(use_w4_group_scaling),
+        any_bool(false), // use_mxfp8_act_scaling (TODO expose)
+        any_bool(use_packed_weights),
     ];
     let mut module_result_view = any_none();
 
@@ -694,6 +840,384 @@ unsafe fn fused_moe_with_runtime(
                         )?
                     };
                 }
+                FusedMoeQuantization::Int4GroupScale(quant) => {
+                    // Emit the 8-entry quant scales array expected by
+                    // `flashinfer_cutlass_fused_moe_binding.cu::getQuantParams`
+                    // (`isInt4Quant()` branch):
+                    //   [0] fc1_weight_scales (3-D, BF16/F16)
+                    //   [1] fc2_weight_scales (3-D, BF16/F16)
+                    //   [2] fc1_act_scales    (optional, 2-D, BF16/F16)
+                    //   [3] fc2_act_scales    (optional, 2-D, BF16/F16)
+                    //   [4] fc1_weight_zeros  (optional, 3-D, BF16/F16)
+                    //   [5] fc2_weight_zeros  (optional, 3-D, BF16/F16)
+                    //   [6] fc1_alpha         (optional, 1-D, F32)
+                    //   [7] fc2_alpha         (optional, 1-D, F32)
+                    //
+                    // Optional slots are passed as zero-`numel` rank-1
+                    // placeholders; the C++ binding treats `numel() == 0` as
+                    // nullptr.
+                    let fc1_w_dev = quant.fc1_weight_scales.device_id;
+                    let fc2_w_dev = quant.fc2_weight_scales.device_id;
+                    let fc1_w_dtype = quant.fc1_weight_scales.dtype;
+                    let fc2_w_dtype = quant.fc2_weight_scales.dtype;
+
+                    let mut fc1_ws_shape = [
+                        quant.fc1_weight_scales.dim0,
+                        quant.fc1_weight_scales.dim1,
+                        quant.fc1_weight_scales.dim2,
+                    ];
+                    let mut fc1_ws_strides = [
+                        quant.fc1_weight_scales.stride0,
+                        quant.fc1_weight_scales.stride1,
+                        quant.fc1_weight_scales.stride2,
+                    ];
+                    let fc1_ws_tensor = tensor_3d(
+                        quant.fc1_weight_scales.ptr,
+                        fc1_w_dtype,
+                        fc1_w_dev,
+                        &mut fc1_ws_shape,
+                        &mut fc1_ws_strides,
+                    );
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc1_ws_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let mut fc2_ws_shape = [
+                        quant.fc2_weight_scales.dim0,
+                        quant.fc2_weight_scales.dim1,
+                        quant.fc2_weight_scales.dim2,
+                    ];
+                    let mut fc2_ws_strides = [
+                        quant.fc2_weight_scales.stride0,
+                        quant.fc2_weight_scales.stride1,
+                        quant.fc2_weight_scales.stride2,
+                    ];
+                    let fc2_ws_tensor = tensor_3d(
+                        quant.fc2_weight_scales.ptr,
+                        fc2_w_dtype,
+                        fc2_w_dev,
+                        &mut fc2_ws_shape,
+                        &mut fc2_ws_strides,
+                    );
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc2_ws_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let mut fc1_as_shape = [0_i64, 0_i64];
+                    let mut fc1_as_strides = [0_i64, 0_i64];
+                    let fc1_act_tensor = quant.fc1_act_scales.map(|desc| {
+                        tensor_2d(
+                            desc.ptr,
+                            desc.dtype,
+                            desc.device_id,
+                            &mut fc1_as_shape,
+                            &mut fc1_as_strides,
+                        )
+                    });
+                    let mut fc1_as_empty_shape = [0_i64];
+                    let mut fc1_as_empty_strides = [1_i64];
+                    let fc1_as_placeholder =
+                        empty_placeholder_tensor(fc1_w_dtype, fc1_w_dev, &mut fc1_as_empty_shape, &mut fc1_as_empty_strides);
+                    let fc1_as_ref = fc1_act_tensor.as_ref().unwrap_or(&fc1_as_placeholder);
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            fc1_as_ref,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let mut fc2_as_shape = [0_i64, 0_i64];
+                    let mut fc2_as_strides = [0_i64, 0_i64];
+                    let fc2_act_tensor = quant.fc2_act_scales.map(|desc| {
+                        tensor_2d(
+                            desc.ptr,
+                            desc.dtype,
+                            desc.device_id,
+                            &mut fc2_as_shape,
+                            &mut fc2_as_strides,
+                        )
+                    });
+                    let mut fc2_as_empty_shape = [0_i64];
+                    let mut fc2_as_empty_strides = [1_i64];
+                    let fc2_as_placeholder =
+                        empty_placeholder_tensor(fc2_w_dtype, fc2_w_dev, &mut fc2_as_empty_shape, &mut fc2_as_empty_strides);
+                    let fc2_as_ref = fc2_act_tensor.as_ref().unwrap_or(&fc2_as_placeholder);
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            fc2_as_ref,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let mut fc1_wz_shape = [0_i64, 0_i64, 0_i64];
+                    let mut fc1_wz_strides = [0_i64, 0_i64, 0_i64];
+                    let fc1_wz_tensor = quant.fc1_weight_zeros.map(|desc| {
+                        tensor_3d(
+                            desc.ptr,
+                            desc.dtype,
+                            desc.device_id,
+                            &mut fc1_wz_shape,
+                            &mut fc1_wz_strides,
+                        )
+                    });
+                    let mut fc1_wz_empty_shape = [0_i64];
+                    let mut fc1_wz_empty_strides = [1_i64];
+                    let fc1_wz_placeholder = empty_placeholder_tensor(
+                        fc1_w_dtype,
+                        fc1_w_dev,
+                        &mut fc1_wz_empty_shape,
+                        &mut fc1_wz_empty_strides,
+                    );
+                    let fc1_wz_ref = fc1_wz_tensor.as_ref().unwrap_or(&fc1_wz_placeholder);
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            fc1_wz_ref,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let mut fc2_wz_shape = [0_i64, 0_i64, 0_i64];
+                    let mut fc2_wz_strides = [0_i64, 0_i64, 0_i64];
+                    let fc2_wz_tensor = quant.fc2_weight_zeros.map(|desc| {
+                        tensor_3d(
+                            desc.ptr,
+                            desc.dtype,
+                            desc.device_id,
+                            &mut fc2_wz_shape,
+                            &mut fc2_wz_strides,
+                        )
+                    });
+                    let mut fc2_wz_empty_shape = [0_i64];
+                    let mut fc2_wz_empty_strides = [1_i64];
+                    let fc2_wz_placeholder = empty_placeholder_tensor(
+                        fc2_w_dtype,
+                        fc2_w_dev,
+                        &mut fc2_wz_empty_shape,
+                        &mut fc2_wz_empty_strides,
+                    );
+                    let fc2_wz_ref = fc2_wz_tensor.as_ref().unwrap_or(&fc2_wz_placeholder);
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            fc2_wz_ref,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let mut fc1_alpha_shape = [0_i64];
+                    let mut fc1_alpha_strides = [1_i64];
+                    let fc1_alpha_tensor = match quant.fc1_alpha {
+                        Some(desc) => tensor_1d_f32(
+                            desc.ptr,
+                            desc.device_id,
+                            &mut fc1_alpha_shape,
+                            &mut fc1_alpha_strides,
+                            desc.len,
+                            desc.stride,
+                        ),
+                        None => tensor_1d_f32(
+                            std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+                            fc1_w_dev,
+                            &mut fc1_alpha_shape,
+                            &mut fc1_alpha_strides,
+                            0,
+                            1,
+                        ),
+                    };
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc1_alpha_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let mut fc2_alpha_shape = [0_i64];
+                    let mut fc2_alpha_strides = [1_i64];
+                    let fc2_alpha_tensor = match quant.fc2_alpha {
+                        Some(desc) => tensor_1d_f32(
+                            desc.ptr,
+                            desc.device_id,
+                            &mut fc2_alpha_shape,
+                            &mut fc2_alpha_strides,
+                            desc.len,
+                            desc.stride,
+                        ),
+                        None => tensor_1d_f32(
+                            std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+                            fc2_w_dev,
+                            &mut fc2_alpha_shape,
+                            &mut fc2_alpha_strides,
+                            0,
+                            1,
+                        ),
+                    };
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc2_alpha_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+                }
+                FusedMoeQuantization::Nvfp4(quant) => {
+                    // Emit the 6-entry quant scales array expected by
+                    // `flashinfer_cutlass_fused_moe_binding.cu::getQuantParams`
+                    // (`isNvfp4Quant()` branch):
+                    //   [0] fc1_act_global    (rank-0 F32)
+                    //   [1] fc1_weight_block  (rank-3 FP8 E4M3, pre-swizzled)
+                    //   [2] fc1_global        (rank-1 F32 [E])
+                    //   [3] fc2_act_global    (rank-0 F32)
+                    //   [4] fc2_weight_block  (rank-3 FP8 E4M3, pre-swizzled)
+                    //   [5] fc2_global        (rank-1 F32 [E])
+
+                    let fc1_act_global_tensor =
+                        tensor_0d_f32(quant.fc1_act_global.ptr, quant.fc1_act_global.device_id);
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc1_act_global_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let mut fc1_wb_shape = [
+                        quant.fc1_weight_block.dim0,
+                        quant.fc1_weight_block.dim1,
+                        quant.fc1_weight_block.dim2,
+                    ];
+                    let mut fc1_wb_strides = [
+                        quant.fc1_weight_block.stride0,
+                        quant.fc1_weight_block.stride1,
+                        quant.fc1_weight_block.stride2,
+                    ];
+                    // The upstream FlashInfer NVFP4 binding
+                    // (`flashinfer_cutlass_fused_moe_binding.cu::
+                    // getQuantParams::isNvfp4Quant`) hard-checks
+                    // `fc1_weight_block.dtype() == dl_int32` (4 packed FP8
+                    // E4M3 bytes per int32 element). The caller-side dim2 /
+                    // strides on this descriptor are already in *int32*
+                    // element units; we override the DLPack dtype here so
+                    // the metadata matches what the kernel expects while
+                    // the underlying device buffer is unchanged.
+                    let nvfp4_block_scale_dl_dtype = DLDataType {
+                        code: KDL_INT,
+                        bits: 32,
+                        lanes: 1,
+                    };
+                    let fc1_wb_tensor = tensor_3d_with_dl_dtype(
+                        quant.fc1_weight_block.ptr,
+                        nvfp4_block_scale_dl_dtype,
+                        quant.fc1_weight_block.device_id,
+                        &mut fc1_wb_shape,
+                        &mut fc1_wb_strides,
+                    );
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc1_wb_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let mut fc1_global_shape = [quant.fc1_global.len];
+                    let mut fc1_global_strides = [quant.fc1_global.stride];
+                    let fc1_global_tensor = tensor_1d_f32(
+                        quant.fc1_global.ptr,
+                        quant.fc1_global.device_id,
+                        &mut fc1_global_shape,
+                        &mut fc1_global_strides,
+                        quant.fc1_global.len,
+                        quant.fc1_global.stride,
+                    );
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc1_global_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let fc2_act_global_tensor =
+                        tensor_0d_f32(quant.fc2_act_global.ptr, quant.fc2_act_global.device_id);
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc2_act_global_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let mut fc2_wb_shape = [
+                        quant.fc2_weight_block.dim0,
+                        quant.fc2_weight_block.dim1,
+                        quant.fc2_weight_block.dim2,
+                    ];
+                    let mut fc2_wb_strides = [
+                        quant.fc2_weight_block.stride0,
+                        quant.fc2_weight_block.stride1,
+                        quant.fc2_weight_block.stride2,
+                    ];
+                    // See fc1_weight_block comment above — same dl_int32 dtype
+                    // override applies to fc2.
+                    let fc2_wb_tensor = tensor_3d_with_dl_dtype(
+                        quant.fc2_weight_block.ptr,
+                        nvfp4_block_scale_dl_dtype,
+                        quant.fc2_weight_block.device_id,
+                        &mut fc2_wb_shape,
+                        &mut fc2_wb_strides,
+                    );
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc2_wb_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+
+                    let mut fc2_global_shape = [quant.fc2_global.len];
+                    let mut fc2_global_strides = [quant.fc2_global.stride];
+                    let fc2_global_tensor = tensor_1d_f32(
+                        quant.fc2_global.ptr,
+                        quant.fc2_global.device_id,
+                        &mut fc2_global_shape,
+                        &mut fc2_global_strides,
+                        quant.fc2_global.len,
+                        quant.fc2_global.stride,
+                    );
+                    unsafe {
+                        push_quant_scale_tensor_arg(
+                            runtime,
+                            &fc2_global_tensor,
+                            &mut scale_args,
+                            &mut quant_tensor_guards,
+                        )?
+                    };
+                }
             }
 
             // SAFETY: function is resolved from global table; caller owns reference and must decref.
@@ -850,10 +1374,32 @@ fn validate_fused_moe(params: &FusedMoeParams) -> Result<(), FlashInferError> {
         )));
     }
 
-    if params.fc1_expert_weights.dim2 != params.input.cols {
+    // For packed INT4 / W4 paths, weights are bit-packed (2 nibbles per byte).
+    // `inner_dim_multiplier` matches the C++ binding's `mInnerDimMultiplier`
+    // for the active quantization mode and converts byte-counts back into
+    // logical element counts for the shape contract.
+    //
+    // Cross-reference: `flashinfer_cutlass_fused_moe_binding.cu::runMoe`:
+    //   `int64_t inter_size = fc2_expert_weights.size(2) * mInnerDimMultiplier;`
+    let inner_dim_multiplier: i64 = match params.quantization {
+        Some(FusedMoeQuantization::Int4GroupScale(_)) => 2,
+        Some(FusedMoeQuantization::Nvfp4(_)) => 16,
+        _ => 1,
+    };
+
+    let expected_fc1_dim2 = params
+        .input
+        .cols
+        .checked_div(inner_dim_multiplier)
+        .ok_or_else(|| {
+            FlashInferError::invalid_argument(
+                "input.cols not divisible by INT4 inner dim multiplier",
+            )
+        })?;
+    if params.fc1_expert_weights.dim2 != expected_fc1_dim2 {
         return Err(FlashInferError::invalid_argument(format!(
-            "shape mismatch: fc1_expert_weights.dim2 ({}) must match input.cols ({})",
-            params.fc1_expert_weights.dim2, params.input.cols
+            "shape mismatch: fc1_expert_weights.dim2 ({}) must equal input.cols / inner_dim_multiplier ({expected_fc1_dim2})",
+            params.fc1_expert_weights.dim2
         )));
     }
 
@@ -864,16 +1410,21 @@ fn validate_fused_moe(params: &FusedMoeParams) -> Result<(), FlashInferError> {
         )));
     }
 
+    let logical_fc2_dim2 = params
+        .fc2_expert_weights
+        .dim2
+        .checked_mul(inner_dim_multiplier)
+        .ok_or_else(|| {
+            FlashInferError::invalid_argument(
+                "fc2_expert_weights.dim2 * inner_dim_multiplier overflow",
+            )
+        })?;
     let expected_fc1_dim1 = if params.activation.is_gated() {
-        params
-            .fc2_expert_weights
-            .dim2
-            .checked_mul(2)
-            .ok_or_else(|| {
-                FlashInferError::invalid_argument("fc2_expert_weights.dim2 * 2 overflow")
-            })?
+        logical_fc2_dim2.checked_mul(2).ok_or_else(|| {
+            FlashInferError::invalid_argument("logical_fc2_dim2 * 2 overflow")
+        })?
     } else {
-        params.fc2_expert_weights.dim2
+        logical_fc2_dim2
     };
 
     if params.fc1_expert_weights.dim1 != expected_fc1_dim1 {
@@ -909,6 +1460,12 @@ fn validate_fused_moe(params: &FusedMoeParams) -> Result<(), FlashInferError> {
         }
         Some(FusedMoeQuantization::DeepSeekFp8BlockScale(quant)) => {
             validate_deepseek_fp8_block_scale_quantization(params, quant)?;
+        }
+        Some(FusedMoeQuantization::Int4GroupScale(quant)) => {
+            validate_int4_group_scale_quantization(params, quant)?;
+        }
+        Some(FusedMoeQuantization::Nvfp4(quant)) => {
+            validate_nvfp4_quantization(params, quant)?;
         }
     }
 
@@ -1189,6 +1746,157 @@ fn validate_deepseek_fp8_block_scale_quantization(
     Ok(())
 }
 
+fn validate_int4_group_scale_quantization(
+    params: &FusedMoeParams,
+    quant: FusedMoeInt4GroupScaleQuantParams,
+) -> Result<(), FlashInferError> {
+    check_non_null(quant.fc1_weight_scales.ptr, "quant.fc1_weight_scales")?;
+    check_non_null(quant.fc2_weight_scales.ptr, "quant.fc2_weight_scales")?;
+    check_positive("quant.fc1_weight_scales.dim0", quant.fc1_weight_scales.dim0)?;
+    check_positive("quant.fc1_weight_scales.dim1", quant.fc1_weight_scales.dim1)?;
+    check_positive("quant.fc1_weight_scales.dim2", quant.fc1_weight_scales.dim2)?;
+    check_positive("quant.fc2_weight_scales.dim0", quant.fc2_weight_scales.dim0)?;
+    check_positive("quant.fc2_weight_scales.dim1", quant.fc2_weight_scales.dim1)?;
+    check_positive("quant.fc2_weight_scales.dim2", quant.fc2_weight_scales.dim2)?;
+    check_last_contiguous_3d("quant.fc1_weight_scales", quant.fc1_weight_scales.stride2)?;
+    check_last_contiguous_3d("quant.fc2_weight_scales", quant.fc2_weight_scales.stride2)?;
+
+    // Weight scales must live on the same device as the inputs.
+    if quant.fc1_weight_scales.device_id != params.input.device_id
+        || quant.fc2_weight_scales.device_id != params.input.device_id
+    {
+        return Err(FlashInferError::invalid_argument(
+            "device mismatch: int4 group-wise weight scales must be on same device as input",
+        ));
+    }
+
+    // Scales are interpreted as the activation dtype (BF16 or F16). FP8 is
+    // not a valid scale dtype.
+    if quant.fc1_weight_scales.dtype == DType::F8E4M3FN
+        || quant.fc2_weight_scales.dtype == DType::F8E4M3FN
+    {
+        return Err(FlashInferError::invalid_argument(
+            "int4 group-wise weight scales must be BF16 or F16 (not F8E4M3FN)",
+        ));
+    }
+
+    // Activations are BF16 or F16; out matches input dtype. Weight dtype on
+    // the descriptor is informational; the FFI overrides it to `dl_uint8`.
+    if params.input.dtype == DType::F8E4M3FN || params.out.dtype == DType::F8E4M3FN {
+        return Err(FlashInferError::invalid_argument(
+            "int4 group-wise fused_moe requires BF16/F16 input/out dtype",
+        ));
+    }
+    if params.input.dtype != params.out.dtype {
+        return Err(FlashInferError::invalid_argument(
+            "int4 group-wise fused_moe requires input/out dtype to match",
+        ));
+    }
+
+    if !params.use_packed_weights {
+        return Err(FlashInferError::invalid_argument(
+            "int4 group-wise fused_moe requires use_packed_weights=true",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_nvfp4_quantization(
+    params: &FusedMoeParams,
+    quant: FusedMoeNvfp4QuantParams,
+) -> Result<(), FlashInferError> {
+    check_non_null(quant.fc1_act_global.ptr, "quant.fc1_act_global")?;
+    check_non_null(quant.fc1_weight_block.ptr, "quant.fc1_weight_block")?;
+    check_non_null(quant.fc1_global.ptr, "quant.fc1_global")?;
+    check_non_null(quant.fc2_act_global.ptr, "quant.fc2_act_global")?;
+    check_non_null(quant.fc2_weight_block.ptr, "quant.fc2_weight_block")?;
+    check_non_null(quant.fc2_global.ptr, "quant.fc2_global")?;
+
+    check_positive("quant.fc1_weight_block.dim0", quant.fc1_weight_block.dim0)?;
+    check_positive("quant.fc1_weight_block.dim1", quant.fc1_weight_block.dim1)?;
+    check_positive("quant.fc1_weight_block.dim2", quant.fc1_weight_block.dim2)?;
+    check_positive("quant.fc2_weight_block.dim0", quant.fc2_weight_block.dim0)?;
+    check_positive("quant.fc2_weight_block.dim1", quant.fc2_weight_block.dim1)?;
+    check_positive("quant.fc2_weight_block.dim2", quant.fc2_weight_block.dim2)?;
+    check_positive("quant.fc1_global.len", quant.fc1_global.len)?;
+    check_positive("quant.fc2_global.len", quant.fc2_global.len)?;
+    check_last_contiguous_3d("quant.fc1_weight_block", quant.fc1_weight_block.stride2)?;
+    check_last_contiguous_3d("quant.fc2_weight_block", quant.fc2_weight_block.stride2)?;
+
+    let num_experts = params.fc1_expert_weights.dim0;
+    if quant.fc1_weight_block.dim0 != num_experts
+        || quant.fc2_weight_block.dim0 != num_experts
+        || quant.fc1_global.len != num_experts
+        || quant.fc2_global.len != num_experts
+    {
+        return Err(FlashInferError::invalid_argument(format!(
+            "nvfp4 quant scales must be sized per local expert (= {num_experts}): \
+             fc1_weight_block.dim0={}, fc2_weight_block.dim0={}, fc1_global.len={}, fc2_global.len={}",
+            quant.fc1_weight_block.dim0,
+            quant.fc2_weight_block.dim0,
+            quant.fc1_global.len,
+            quant.fc2_global.len
+        )));
+    }
+
+    // FP8 E4M3 block scales for weights — the on-disk dtype is what callers
+    // declare here. The fused-MoE NVFP4 kernel internally reinterprets the
+    // byte buffer as `dl_int32` (4 packed FP8 E4M3 bytes per i32 element),
+    // which we emit on the DLTensor side of the FFI (see the descriptor
+    // construction below). Callers just supply the FP8 dtype as a
+    // self-documenting tag.
+    if quant.fc1_weight_block.dtype != DType::F8E4M3FN
+        || quant.fc2_weight_block.dtype != DType::F8E4M3FN
+    {
+        return Err(FlashInferError::invalid_argument(
+            "nvfp4 weight block scales must be F8E4M3FN",
+        ));
+    }
+
+    // Activations and output are BF16 (or F16); FP8 activations would use
+    // the W4FP8 / WMxfp4-AMxfp8 path rather than NVFP4.
+    if params.input.dtype == DType::F8E4M3FN || params.out.dtype == DType::F8E4M3FN {
+        return Err(FlashInferError::invalid_argument(
+            "nvfp4 fused_moe requires BF16/F16 input/out (FP8 activations would route to W4FP8/MXFP4)",
+        ));
+    }
+    if params.input.dtype != params.out.dtype {
+        return Err(FlashInferError::invalid_argument(
+            "nvfp4 fused_moe requires input/out dtype to match",
+        ));
+    }
+
+    // The packed-weights flag is independent of NVFP4; the binding uses
+    // `mWeightDtype == dl_int64` to detect FP4 storage and we must NOT also
+    // set `use_packed_weights=true` (that flag is dedicated to the INT4
+    // path).
+    if params.use_packed_weights {
+        return Err(FlashInferError::invalid_argument(
+            "nvfp4 fused_moe must not set use_packed_weights=true (reserved for INT4 W4 path)",
+        ));
+    }
+
+    // Devices must match across all scale tensors.
+    let dev = params.input.device_id;
+    for (name, did) in [
+        ("fc1_act_global", quant.fc1_act_global.device_id),
+        ("fc1_weight_block", quant.fc1_weight_block.device_id),
+        ("fc1_global", quant.fc1_global.device_id),
+        ("fc2_act_global", quant.fc2_act_global.device_id),
+        ("fc2_weight_block", quant.fc2_weight_block.device_id),
+        ("fc2_global", quant.fc2_global.device_id),
+    ] {
+        if did != dev {
+            return Err(FlashInferError::invalid_argument(format!(
+                "device mismatch: nvfp4 scale `{name}` (device {did}) must be on same device as input (device {dev})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn optional_dltensor_any(tensor: Option<&DLTensor>) -> TVMFFIAny {
     match tensor {
         Some(tensor) => any_dltensor_ptr(tensor),
@@ -1244,6 +1952,43 @@ fn tensor_3d(
     shape: &mut [i64; 3],
     strides: &mut [i64; 3],
 ) -> DLTensor {
+    tensor_3d_with_dl_dtype(ptr, dl_dtype_from_dtype(dtype), device_id, shape, strides)
+}
+
+/// Build a rank-1 zero-`numel` placeholder `DLTensor` used to encode an
+/// `Optional<TensorView>` slot of the FlashInfer fused-moe `quant_scales`
+/// array as nullptr. The C++ binding checks `tensor.numel() > 0` before
+/// dereferencing.
+fn empty_placeholder_tensor(
+    dtype: DType,
+    device_id: i32,
+    shape: &mut [i64; 1],
+    strides: &mut [i64; 1],
+) -> DLTensor {
+    // Use a non-null dangling pointer to satisfy any non-null assertions in the
+    // FFI path while keeping `numel() == 0` to signal the nullptr semantic.
+    let placeholder_ptr = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+    DLTensor {
+        data: placeholder_ptr,
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id,
+        },
+        ndim: 1,
+        dtype: dl_dtype_from_dtype(dtype),
+        shape: shape.as_mut_ptr(),
+        strides: strides.as_mut_ptr(),
+        byte_offset: 0,
+    }
+}
+
+fn tensor_3d_with_dl_dtype(
+    ptr: *const c_void,
+    dtype: DLDataType,
+    device_id: i32,
+    shape: &mut [i64; 3],
+    strides: &mut [i64; 3],
+) -> DLTensor {
     DLTensor {
         data: ptr.cast_mut(),
         device: DLDevice {
@@ -1251,7 +1996,7 @@ fn tensor_3d(
             device_id,
         },
         ndim: 3,
-        dtype: dl_dtype_from_dtype(dtype),
+        dtype,
         shape: shape.as_mut_ptr(),
         strides: strides.as_mut_ptr(),
         byte_offset: 0,
