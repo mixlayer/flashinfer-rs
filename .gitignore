@@ -1,2 +1,6 @@
 /target
 *.whl
+.venv
+*.so
+*.o
+__pycache__
