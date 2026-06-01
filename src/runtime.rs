@@ -152,6 +152,17 @@ struct LoadedBatchDecodeKernel {
     fns: BatchDecodeKernelFns,
 }
 
+#[derive(Clone, Copy)]
+struct BatchMlaKernelFns {
+    plan: TVMFFISafeCallFn,
+    run: TVMFFISafeCallFn,
+}
+
+struct LoadedBatchMlaKernel {
+    _lib: Library,
+    fns: BatchMlaKernelFns,
+}
+
 pub struct FlashInferRuntime {
     resolved: ResolvedRuntimeConfig,
     jit_cache_wheel_path: PathBuf,
@@ -179,6 +190,7 @@ pub struct FlashInferRuntime {
     batch_prefill_kernel_cache: Mutex<HashMap<String, LoadedBatchPrefillKernel>>,
     single_decode_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
     batch_decode_kernel_cache: Mutex<HashMap<String, LoadedBatchDecodeKernel>>,
+    batch_mla_kernel_cache: Mutex<HashMap<String, LoadedBatchMlaKernel>>,
     fused_moe_kernel_cache: Mutex<HashMap<String, LoadedFusedMoeKernel>>,
 }
 
@@ -469,6 +481,40 @@ impl FlashInferRuntime {
         let fns = unsafe { self.resolve_batch_decode_kernel(kernel_uri)? };
         // SAFETY: symbol signature follows TVMFFISafeCallType.
         let code = unsafe { (fns.plan)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_batch_mla_plan(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_batch_mla_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.plan)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_batch_mla_run(
+        &self,
+        kernel_uri: &str,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let fns = unsafe { self.resolve_batch_mla_kernel(kernel_uri)? };
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (fns.run)(std::ptr::null_mut(), args, num_args, result) };
         if code == 0 {
             return Ok(());
         }
@@ -832,6 +878,56 @@ impl FlashInferRuntime {
         Ok(fns)
     }
 
+    unsafe fn resolve_batch_mla_kernel(
+        &self,
+        kernel_uri: &str,
+    ) -> Result<BatchMlaKernelFns, FlashInferError> {
+        let mut cache = self.batch_mla_kernel_cache.lock().map_err(|_| {
+            FlashInferError::invalid_argument("batch MLA cache lock is poisoned")
+        })?;
+
+        if let Some(kernel) = cache.get(kernel_uri) {
+            return Ok(kernel.fns);
+        }
+
+        let kernel_path =
+            extract_jit_kernel(&self.jit_cache_wheel_path, &self.artifact_dir, kernel_uri)?;
+
+        let kernel_lib =
+            unsafe { Library::open(Some(&kernel_path), libc::RTLD_NOW | libc::RTLD_LOCAL) }
+                .map_err(|e| FlashInferError::LibraryLoad {
+                    library: kernel_path.clone(),
+                    message: e.to_string(),
+                })?;
+
+        let plan: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_plan\0",
+                "__tvm_ffi_plan",
+            )?
+        };
+        let run: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_run\0",
+                "__tvm_ffi_run",
+            )?
+        };
+        let fns = BatchMlaKernelFns { plan, run };
+
+        cache.insert(
+            kernel_uri.to_string(),
+            LoadedBatchMlaKernel {
+                _lib: kernel_lib,
+                fns,
+            },
+        );
+        Ok(fns)
+    }
+
     unsafe fn load(resolved: ResolvedRuntimeConfig) -> Result<Self, FlashInferError> {
         let materialized_wheels = ensure_pinned_wheels_cached(&resolved.cache_dir)?;
         let artifacts = extract_artifacts(&resolved, &materialized_wheels)?;
@@ -1082,6 +1178,7 @@ impl FlashInferRuntime {
             batch_prefill_kernel_cache: Mutex::new(HashMap::new()),
             single_decode_kernel_cache: Mutex::new(HashMap::new()),
             batch_decode_kernel_cache: Mutex::new(HashMap::new()),
+            batch_mla_kernel_cache: Mutex::new(HashMap::new()),
             fused_moe_kernel_cache: Mutex::new(HashMap::new()),
         })
     }
