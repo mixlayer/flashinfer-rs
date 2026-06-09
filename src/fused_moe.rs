@@ -464,7 +464,7 @@ unsafe fn fused_moe_with_runtime(
         any_bool(false), // use_mxfp8_act_scaling
         any_bool(false), // use_packed_weights
     ];
-    let mut module_result_view = any_none();
+    let mut module_result_owned = any_none();
 
     // SAFETY: stream context API contract comes from tvm ffi and is validated on load.
     let previous_stream = unsafe { runtime.set_stream(params.input.device_id, params.stream)? };
@@ -478,12 +478,11 @@ unsafe fn fused_moe_with_runtime(
                 params.backend.kernel_uri(),
                 init_args.as_ptr(),
                 init_args.len() as i32,
-                &mut module_result_view as *mut _,
+                &mut module_result_owned as *mut _,
             )?;
         }
 
-        // SAFETY: result view is produced by TVM-FFI and copied to owned Any.
-        let module_result_owned = unsafe { runtime.any_view_to_owned(&module_result_view)? };
+        // TVM safe-call results are already owned Any values.
         let mut module_guard = AnyObjectDecRefGuard::new(runtime, &module_result_owned);
 
         // SAFETY: function is resolved from global table; caller owns reference and must decref.
@@ -498,7 +497,7 @@ unsafe fn fused_moe_with_runtime(
 
         let mut module_get_args: [TVMFFIAny; 3] =
             [module_result_owned, run_moe_name, any_bool(false)];
-        let mut run_moe_result_view = any_none();
+        let mut run_moe_result_owned = any_none();
 
         // SAFETY: invoking TVM Function object with ABI-packed args.
         unsafe {
@@ -506,12 +505,10 @@ unsafe fn fused_moe_with_runtime(
                 module_get_function_handle,
                 module_get_args.as_mut_ptr(),
                 module_get_args.len() as i32,
-                &mut run_moe_result_view as *mut _,
+                &mut run_moe_result_owned as *mut _,
             )?;
         }
 
-        // SAFETY: result view is produced by TVM-FFI and copied to owned Any.
-        let run_moe_result_owned = unsafe { runtime.any_view_to_owned(&run_moe_result_view)? };
         let mut run_moe_function_guard = AnyObjectDecRefGuard::new(runtime, &run_moe_result_owned);
 
         let run_moe_function_handle =
@@ -528,7 +525,7 @@ unsafe fn fused_moe_with_runtime(
                 let mut array_ctor_guard = RawObjectDecRefGuard::new(runtime, array_ctor_handle);
 
                 let mut profile_id_args = [any_i64(gemm1_profile_id), any_i64(gemm2_profile_id)];
-                let mut profile_ids_view = any_none();
+                let mut profile_ids_owned = any_none();
 
                 // SAFETY: invoking TVM Function object with ABI-packed args.
                 unsafe {
@@ -536,12 +533,10 @@ unsafe fn fused_moe_with_runtime(
                         array_ctor_handle,
                         profile_id_args.as_mut_ptr(),
                         profile_id_args.len() as i32,
-                        &mut profile_ids_view as *mut _,
+                        &mut profile_ids_owned as *mut _,
                     )?;
                 }
 
-                // SAFETY: result view is produced by TVM-FFI and copied to owned Any.
-                let profile_ids_owned = unsafe { runtime.any_view_to_owned(&profile_ids_view)? };
                 array_ctor_guard.release_now();
                 Some(profile_ids_owned)
             } else {
@@ -699,19 +694,17 @@ unsafe fn fused_moe_with_runtime(
             // SAFETY: function is resolved from global table; caller owns reference and must decref.
             let array_ctor_handle = unsafe { runtime.get_global_function(ARRAY_GLOBAL)? };
             let mut array_ctor_guard = RawObjectDecRefGuard::new(runtime, array_ctor_handle);
-            let mut quant_scales_view = any_none();
+            let mut quant_scales_owned = any_none();
             // SAFETY: invoking TVM Function object with ABI-packed args.
             unsafe {
                 runtime.call_function(
                     array_ctor_handle,
                     scale_args.as_mut_ptr(),
                     scale_args.len() as i32,
-                    &mut quant_scales_view as *mut _,
+                    &mut quant_scales_owned as *mut _,
                 )?;
             }
 
-            // SAFETY: result view is produced by TVM-FFI and copied to owned Any.
-            let quant_scales_owned = unsafe { runtime.any_view_to_owned(&quant_scales_view)? };
             array_ctor_guard.release_now();
             quant_scales_array_guard =
                 Some(AnyObjectDecRefGuard::new(runtime, &quant_scales_owned));
@@ -757,7 +750,9 @@ unsafe fn fused_moe_with_runtime(
                 &mut run_result as *mut _,
             )?;
         }
+        let mut run_result_guard = AnyObjectDecRefGuard::new(runtime, &run_result);
 
+        run_result_guard.release_now();
         if let Some(profile_ids_guard) = profile_ids_guard.as_mut() {
             profile_ids_guard.release_now();
         }

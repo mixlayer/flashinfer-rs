@@ -638,7 +638,11 @@ unsafe fn mla_batch_paged_plan_with_runtime(
 
     let mut kv_len_shape = [params.kv_len_host.len];
     let mut kv_len_strides = [params.kv_len_host.stride];
-    let kv_len_t = host_i32_dl_tensor(params.kv_len_host.ptr, &mut kv_len_shape, &mut kv_len_strides);
+    let kv_len_t = host_i32_dl_tensor(
+        params.kv_len_host.ptr,
+        &mut kv_len_shape,
+        &mut kv_len_strides,
+    );
 
     let mut float_ws_shape = [params.float_workspace.len];
     let mut float_ws_strides = [params.float_workspace.stride];
@@ -666,7 +670,7 @@ unsafe fn mla_batch_paged_plan_with_runtime(
         &mut pl_ws_strides,
     );
 
-    let mut plan_result_view = any_none();
+    let mut plan_result_any = any_none();
     // Order matches `BatchMLAPagedAttentionPlan(...)` in batch_mla_binding.cu:
     //   (float_ws, int_ws, page_locked_int_ws, qo_indptr, kv_indptr, kv_len,
     //    num_heads, head_dim_o, causal)
@@ -693,11 +697,11 @@ unsafe fn mla_batch_paged_plan_with_runtime(
                 &kernel_uri,
                 plan_args.as_ptr(),
                 plan_args.len() as i32,
-                &mut plan_result_view as *mut _,
+                &mut plan_result_any as *mut _,
             )?;
         }
-        // SAFETY: converts returned AnyView into owned Any so lifetime can cross calls safely.
-        let plan_result = unsafe { runtime.any_view_to_owned(&plan_result_view)? };
+        // TVM safe-call plan results are already owned Any values.
+        let plan_result = std::mem::replace(&mut plan_result_any, any_none());
         Ok(MlaBatchPagedAttentionPlan {
             runtime,
             plan_result,
@@ -837,11 +841,7 @@ unsafe fn mla_batch_paged_run_with_runtime(
     );
 
     let mut o_shape = [params.out.dim0, params.out.dim1, params.out.dim2];
-    let mut o_strides = [
-        params.out.stride0,
-        params.out.stride1,
-        params.out.stride2,
-    ];
+    let mut o_strides = [params.out.stride0, params.out.stride1, params.out.stride2];
     let o_t = device_3d_dl_tensor(
         params.out.ptr,
         params.out.device_id,
@@ -920,7 +920,11 @@ unsafe fn mla_batch_paged_run_with_runtime(
 
 // ---- DLTensor builders ----
 
-fn host_i32_dl_tensor(ptr: *const c_void, shape: &mut [i64; 1], strides: &mut [i64; 1]) -> DLTensor {
+fn host_i32_dl_tensor(
+    ptr: *const c_void,
+    shape: &mut [i64; 1],
+    strides: &mut [i64; 1],
+) -> DLTensor {
     DLTensor {
         data: ptr.cast_mut(),
         device: DLDevice {
