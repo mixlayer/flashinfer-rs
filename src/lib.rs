@@ -64,12 +64,12 @@ pub use mha_prefill::{
     MhaMaskMode, MhaPosEncodingMode, MhaQkvLayout, MhaSinglePrefillParams, MhaTensor1DF32Desc,
     MhaTensor1DU8Desc, MhaTensor2DF32Desc, MhaTensor3DDesc, mha_single_prefill,
 };
+#[cfg(feature = "cudarc")]
+pub use mha_prefill::{MhaSinglePrefillCudarcOptions, mha_single_prefill_cudarc};
 pub use mla_batch_paged::{
     MlaBackend, MlaBatchPagedAttentionParams, MlaBatchPagedAttentionPlan,
     MlaBatchPagedAttentionPlanParams, MlaTensor3DDesc, mla_batch_paged_plan, mla_batch_paged_run,
 };
-#[cfg(feature = "cudarc")]
-pub use mha_prefill::{MhaSinglePrefillCudarcOptions, mha_single_prefill_cudarc};
 pub use norm::{
     DType, FusedQkRmsNormParams, GemmaFusedAddRmsNormParams, GemmaRmsNormParams, RmsNormParams,
     Tensor1DDesc, Tensor2DDesc, Tensor3DDesc as NormTensor3DDesc, fused_qk_rmsnorm,

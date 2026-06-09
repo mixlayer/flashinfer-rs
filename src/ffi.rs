@@ -11,9 +11,11 @@ pub const KTVM_FFI_BOOL: i32 = 2;
 pub const KTVM_FFI_FLOAT: i32 = 3;
 pub const KTVM_FFI_DATA_TYPE: i32 = 5;
 pub const KTVM_FFI_DL_TENSOR_PTR: i32 = 7;
-pub const KTVM_FFI_OBJECT_RVALUE_REF: i32 = 10;
 pub const KTVM_FFI_STATIC_OBJECT_BEGIN: i32 = 64;
 pub const KTVM_FFI_TENSOR: i32 = 70;
+
+#[cfg(test)]
+const KTVM_FFI_OBJECT_RVALUE_REF: i32 = 10;
 
 pub const KDL_INT: u8 = 0;
 pub const KDL_UINT: u8 = 1;
@@ -212,9 +214,7 @@ pub fn any_tensor_object(handle: TVMFFIObjectHandle) -> TVMFFIAny {
 }
 
 pub fn any_object_handle(value: &TVMFFIAny) -> Option<TVMFFIObjectHandle> {
-    if value.type_index < KTVM_FFI_STATIC_OBJECT_BEGIN
-        && value.type_index != KTVM_FFI_OBJECT_RVALUE_REF
-    {
+    if value.type_index < KTVM_FFI_STATIC_OBJECT_BEGIN {
         return None;
     }
     // SAFETY: callers use this helper only for object-like `type_index` values.
@@ -343,5 +343,19 @@ mod tests {
         assert_eq!(packed.type_index, KTVM_FFI_TENSOR);
         let unpacked = any_object_handle(&packed).expect("tensor object handle");
         assert_eq!(unpacked, handle);
+    }
+
+    #[test]
+    fn rvalue_ref_is_not_direct_object_handle() {
+        let handle = 0x1234usize as TVMFFIObjectHandle;
+        let mut handle_slot = handle;
+        let packed = TVMFFIAny {
+            type_index: KTVM_FFI_OBJECT_RVALUE_REF,
+            tag: TVMFFIAnyTag { zero_padding: 0 },
+            value: TVMFFIAnyValue {
+                v_ptr: (&mut handle_slot as *mut TVMFFIObjectHandle).cast(),
+            },
+        };
+        assert!(any_object_handle(&packed).is_none());
     }
 }

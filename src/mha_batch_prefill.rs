@@ -1077,7 +1077,7 @@ unsafe fn mha_batch_prefill_plan_with_runtime(
         byte_offset: 0,
     };
 
-    let mut plan_result_view = any_none();
+    let mut plan_result_any = any_none();
     let plan_args: [TVMFFIAny; 19] = [
         any_dltensor_ptr(&float_workspace_tensor),
         any_dltensor_ptr(&int_workspace_tensor),
@@ -1111,12 +1111,12 @@ unsafe fn mha_batch_prefill_plan_with_runtime(
                 &kernel_uri,
                 plan_args.as_ptr(),
                 plan_args.len() as i32,
-                &mut plan_result_view as *mut _,
+                &mut plan_result_any as *mut _,
             )?;
         }
 
-        // SAFETY: converts returned AnyView into owned Any so lifetime can cross calls safely.
-        let plan_result = unsafe { runtime.any_view_to_owned(&plan_result_view)? };
+        // TVM safe-call plan results are already owned Any values.
+        let plan_result = std::mem::replace(&mut plan_result_any, any_none());
         Ok(MhaBatchPrefillPlan {
             runtime,
             plan_result,

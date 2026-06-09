@@ -43,7 +43,6 @@ type TVMFFIEnvSetDLPackManagedTensorAllocatorFn = unsafe extern "C" fn(
 type TVMFFIEnvGetStreamFn = unsafe extern "C" fn(i32, i32) -> *mut c_void;
 type TVMFFIErrorMoveFromRaisedFn = unsafe extern "C" fn(*mut TVMFFIObjectHandle);
 type TVMFFIObjectDecRefFn = unsafe extern "C" fn(TVMFFIObjectHandle) -> i32;
-type TVMFFIAnyViewToOwnedAnyFn = unsafe extern "C" fn(*const TVMFFIAny, *mut TVMFFIAny) -> i32;
 type TVMFFIFunctionGetGlobalFn =
     unsafe extern "C" fn(*const TVMFFIByteArray, *mut TVMFFIObjectHandle) -> i32;
 type TVMFFIFunctionCallFn =
@@ -175,7 +174,6 @@ pub struct FlashInferRuntime {
     tvmffi_env_set_stream: TVMFFIEnvSetStreamFn,
     tvmffi_error_move_from_raised: TVMFFIErrorMoveFromRaisedFn,
     tvmffi_object_dec_ref: TVMFFIObjectDecRefFn,
-    tvmffi_any_view_to_owned_any: TVMFFIAnyViewToOwnedAnyFn,
     tvmffi_function_get_global: TVMFFIFunctionGetGlobalFn,
     tvmffi_function_call: TVMFFIFunctionCallFn,
     tvmffi_string_from_byte_array: TVMFFIStringFromByteArrayFn,
@@ -538,21 +536,6 @@ impl FlashInferRuntime {
         Err(self.decode_raised_error(code))
     }
 
-    pub(crate) unsafe fn any_view_to_owned(
-        &self,
-        any_view: &TVMFFIAny,
-    ) -> Result<TVMFFIAny, FlashInferError> {
-        let mut owned = any_none();
-        // SAFETY: symbol pointer and arguments follow TVM-FFI C ABI.
-        let code = unsafe {
-            (self.tvmffi_any_view_to_owned_any)(any_view as *const _, &mut owned as *mut _)
-        };
-        if code == 0 {
-            return Ok(owned);
-        }
-        Err(self.decode_raised_error(code))
-    }
-
     pub(crate) unsafe fn get_global_function(
         &self,
         name: &str,
@@ -882,9 +865,10 @@ impl FlashInferRuntime {
         &self,
         kernel_uri: &str,
     ) -> Result<BatchMlaKernelFns, FlashInferError> {
-        let mut cache = self.batch_mla_kernel_cache.lock().map_err(|_| {
-            FlashInferError::invalid_argument("batch MLA cache lock is poisoned")
-        })?;
+        let mut cache = self
+            .batch_mla_kernel_cache
+            .lock()
+            .map_err(|_| FlashInferError::invalid_argument("batch MLA cache lock is poisoned"))?;
 
         if let Some(kernel) = cache.get(kernel_uri) {
             return Ok(kernel.fns);
@@ -1022,15 +1006,6 @@ impl FlashInferRuntime {
             )?
         };
 
-        let tvmffi_any_view_to_owned_any: TVMFFIAnyViewToOwnedAnyFn = unsafe {
-            resolve_symbol(
-                &tvmffi_lib,
-                &artifacts.tvmffi_so_path,
-                b"TVMFFIAnyViewToOwnedAny\0",
-                "TVMFFIAnyViewToOwnedAny",
-            )?
-        };
-
         let tvmffi_function_get_global: TVMFFIFunctionGetGlobalFn = unsafe {
             resolve_symbol(
                 &tvmffi_lib,
@@ -1163,7 +1138,6 @@ impl FlashInferRuntime {
             tvmffi_env_set_stream,
             tvmffi_error_move_from_raised,
             tvmffi_object_dec_ref,
-            tvmffi_any_view_to_owned_any,
             tvmffi_function_get_global,
             tvmffi_function_call,
             tvmffi_string_from_byte_array,

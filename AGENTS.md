@@ -78,6 +78,35 @@ This file documents the expected process for adding new FlashInfer kernel bindin
   - kernel launch returns success for a valid tiny case
   - no panic on error path (decoded TVM-FFI errors where applicable)
 
+## TVM-FFI Ownership and Drop Rules
+
+Be explicit about every `TVMFFIAny` and `TVMFFIObjectHandle` ownership transition. A small
+reference-counting mistake can turn repeated plan/init calls into process-lifetime leaks.
+
+- `TVMFFISafeCallFn` exports and `TVMFFIFunctionCall` write an owned `Any` into the `result`
+  slot. Initialize the slot with `any_none()`, pass it as the result pointer, then treat the
+  returned object ref as owned by Rust.
+- Do not call `TVMFFIAnyViewToOwnedAny` on a safe-call/function-call result. That API is for
+  genuine borrowed `AnyView` values; using it on an already-owned result creates another owned
+  ref and leaves the original result ref to leak.
+- Store owned plan/init results directly in the Rust owner that will drop them. For plan structs,
+  move the result `TVMFFIAny` into the plan and let `Drop` call `TVMFFIObjectDecRef` on that
+  exact value.
+- For temporary owned TVM objects, create a guard immediately after the successful call and before
+  the next fallible operation. This includes handles from `TVMFFIFunctionGetGlobal`, strings from
+  `TVMFFIStringFromByteArray`, tensors from `TVMFFITensorFromDLPackVersioned`, and objects returned
+  by TVM functions such as modules, functions, and arrays.
+- Guarding a `None`/POD result should be a no-op; guarding an object result must dec-ref exactly
+  once on all success and error paths.
+- Do not treat `kTVMFFIObjectRValueRef` as a direct `TVMFFIObjectHandle`. TVM stores rvalue refs
+  as an object-pointer slot that must be consumed by TVM's conversion machinery, not passed directly
+  to `TVMFFIObjectDecRef`.
+- If you must convert a borrowed `AnyView` to an owned `Any`, document why it is borrowed, use
+  `TVMFFIAnyViewToOwnedAny`, and ensure there is no separate original owned result that also needs
+  to be released.
+- When ownership crosses through DLPack, transfer only after `TVMFFITensorFromDLPackVersioned`
+  succeeds; the returned TVM tensor object's dec-ref should own the managed tensor deleter path.
+
 ## How symbol matching is done in practice here
 
 - Start from wheel member names to identify the exact module URI or fixed path.
@@ -114,6 +143,7 @@ Primary files to inspect:
 - Optional parameters often map to `None`/null tensor slots and must preserve positional ABI.
 - Keep stream restoration robust across both success and failure paths.
 - Re-check TVM-FFI type indices before adding new packed types.
+- Re-check TVM-FFI result ownership before adding conversions or `Drop` implementations.
 - Prefer on-demand loading for large variant spaces to avoid startup bloat.
 - Maintain feature parity: if core API is added, `cudarc` wrapper should be added in same change.
 - Never reuse a single params struct for both `plan` and `run`; define explicit plan-only and run-only param types.
@@ -154,6 +184,7 @@ Practical implication for Rust bindings:
 - [ ] ABI/order confirmed from submodule source and wrapper calls.
 - [ ] Field-level shape docs added/updated for all `*Params` struct fields.
 - [ ] Rust typed API + validation implemented.
+- [ ] TVM-FFI result ownership reviewed; every owned result/handle has exactly one release path.
 - [ ] Runtime loading strategy implemented (fixed vs lazy URI).
 - [ ] Runtime wheel cache/download path validated (SHA256 check + lock behavior, no async runtime introduced).
 - [ ] `cudarc` wrapper added.
