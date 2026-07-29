@@ -14,6 +14,7 @@ Rust-first integration for calling precompiled FlashInfer kernels through TVM-FF
 - CUTLASS fused MoE (`fused_moe_{90,100,103,120}`) via on-demand JIT-cache module loading
 - Paged KV append (`append_paged_kv_cache`) and paged MLA KV append (`append_paged_mla_kv_cache`) from `page.so`
 - Online softmax and logits/probability/top-k/top-p sampling from `sampling.so`
+- Optional row-independent Philox sampling APIs when the pinned artifact exports them
 - Pure Rust TVM-FFI ABI packing and dynamic loading
 - Optional `cudarc` convenience wrappers
 
@@ -87,6 +88,11 @@ let _rt = FlashInferRuntime::initialize(RuntimeConfig::default())?;
 ```
 
 3. Call kernels through typed APIs.
+
+`FlashInferRuntime::supports_row_rng_sampling()` reports whether the loaded
+artifact contains the coordinated per-row key/counter ABI. The official
+0.6.3 wheel does not; callers must retain their fallback until a matching
+source-built wheel is published and pinned.
 
 ## API Example: Gemma RMSNorm
 

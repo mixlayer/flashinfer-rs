@@ -353,6 +353,191 @@ impl TopKTopPSamplingParams {
     }
 }
 
+/// Arguments shared by row-independent logits and probability sampling kernels.
+#[derive(Debug, Clone, Copy)]
+pub struct RowRngSamplingParams {
+    /// Input logits or probabilities, contiguous FP32 `[source_rows, vocab_size]`.
+    pub input: SamplingTensor2DF32Desc,
+    /// Sampled token IDs, contiguous I32 `[output_rows]`.
+    pub output: SamplingTensor1DI32Desc,
+    /// Optional source-row mapping, contiguous I32 `[output_rows]`.
+    pub indices: Option<SamplingTensor1DI32Desc>,
+    /// Whether to use FlashInfer's deterministic reduction.
+    pub deterministic: bool,
+    /// Stable per-output-row Philox keys, contiguous U64 `[output_rows]`.
+    pub rng_keys: SamplingTensor1DU64Desc,
+    /// Logical per-output-row sample counters, contiguous U64 `[output_rows]`.
+    pub rng_counters: SamplingTensor1DU64Desc,
+    /// CUDA stream (`cudaStream_t`) used for the asynchronous launch.
+    pub stream: *mut c_void,
+}
+
+impl RowRngSamplingParams {
+    /// Constructs row-independent sampling parameters without source-row mapping.
+    pub fn new(
+        input: SamplingTensor2DF32Desc,
+        output: SamplingTensor1DI32Desc,
+        rng_keys: SamplingTensor1DU64Desc,
+        rng_counters: SamplingTensor1DU64Desc,
+        stream: *mut c_void,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            indices: None,
+            deterministic: true,
+            rng_keys,
+            rng_counters,
+            stream,
+        }
+    }
+
+    /// Sets the optional source-row mapping.
+    pub fn with_indices(mut self, indices: SamplingTensor1DI32Desc) -> Self {
+        self.indices = Some(indices);
+        self
+    }
+
+    /// Selects deterministic or non-deterministic FlashInfer reductions.
+    pub fn with_deterministic(mut self, deterministic: bool) -> Self {
+        self.deterministic = deterministic;
+        self
+    }
+
+    /// Validates shapes, layouts, devices, and exact per-output-row RNG lengths.
+    pub fn validate(&self) -> Result<(), FlashInferError> {
+        SamplingParams {
+            input: self.input,
+            output: self.output,
+            indices: self.indices,
+            deterministic: self.deterministic,
+            seed_arr: Some(self.rng_keys),
+            seed_val: 0,
+            offset_arr: Some(self.rng_counters),
+            offset_val: 0,
+            stream: self.stream,
+        }
+        .validate()?;
+        require_len(self.rng_keys.len, self.output.len, "rng_keys")?;
+        require_len(self.rng_counters.len, self.output.len, "rng_counters")
+    }
+}
+
+/// Arguments for row-independent top-k probability sampling.
+#[derive(Debug, Clone, Copy)]
+pub struct RowRngTopKSamplingParams {
+    /// Shared row-independent sampling arguments.
+    pub sampling: RowRngSamplingParams,
+    /// Optional per-source-row top-k values, contiguous I32 `[source_rows]`.
+    pub top_k: Option<SamplingTensor1DI32Desc>,
+    /// Scalar top-k value used when `top_k` is absent.
+    pub top_k_val: i64,
+}
+
+impl RowRngTopKSamplingParams {
+    /// Constructs scalar row-independent top-k parameters.
+    pub fn new(sampling: RowRngSamplingParams, top_k: i64) -> Self {
+        Self {
+            sampling,
+            top_k: None,
+            top_k_val: top_k,
+        }
+    }
+
+    /// Sets per-source-row top-k values.
+    pub fn with_top_k(mut self, top_k: SamplingTensor1DI32Desc) -> Self {
+        self.top_k = Some(top_k);
+        self
+    }
+
+    /// Validates shared and top-k-specific arguments.
+    pub fn validate(&self) -> Result<(), FlashInferError> {
+        self.sampling.validate()?;
+        validate_row_top_k(self.sampling, self.top_k, self.top_k_val)
+    }
+}
+
+/// Arguments for row-independent top-p probability sampling.
+#[derive(Debug, Clone, Copy)]
+pub struct RowRngTopPSamplingParams {
+    /// Shared row-independent sampling arguments.
+    pub sampling: RowRngSamplingParams,
+    /// Optional per-source-row top-p values, contiguous FP32 `[source_rows]`.
+    pub top_p: Option<SamplingTensor1DF32Desc>,
+    /// Scalar top-p value used when `top_p` is absent.
+    pub top_p_val: f64,
+}
+
+impl RowRngTopPSamplingParams {
+    /// Constructs scalar row-independent top-p parameters.
+    pub fn new(sampling: RowRngSamplingParams, top_p: f64) -> Self {
+        Self {
+            sampling,
+            top_p: None,
+            top_p_val: top_p,
+        }
+    }
+
+    /// Sets per-source-row top-p values.
+    pub fn with_top_p(mut self, top_p: SamplingTensor1DF32Desc) -> Self {
+        self.top_p = Some(top_p);
+        self
+    }
+
+    /// Validates shared and top-p-specific arguments.
+    pub fn validate(&self) -> Result<(), FlashInferError> {
+        self.sampling.validate()?;
+        validate_row_top_p(self.sampling, self.top_p, self.top_p_val)
+    }
+}
+
+/// Arguments for row-independent joint top-k/top-p probability sampling.
+#[derive(Debug, Clone, Copy)]
+pub struct RowRngTopKTopPSamplingParams {
+    /// Shared row-independent sampling arguments.
+    pub sampling: RowRngSamplingParams,
+    /// Optional per-source-row top-k values, contiguous I32 `[source_rows]`.
+    pub top_k: Option<SamplingTensor1DI32Desc>,
+    /// Scalar top-k value used when `top_k` is absent.
+    pub top_k_val: i64,
+    /// Optional per-source-row top-p values, contiguous FP32 `[source_rows]`.
+    pub top_p: Option<SamplingTensor1DF32Desc>,
+    /// Scalar top-p value used when `top_p` is absent.
+    pub top_p_val: f64,
+}
+
+impl RowRngTopKTopPSamplingParams {
+    /// Constructs scalar row-independent joint top-k/top-p parameters.
+    pub fn new(sampling: RowRngSamplingParams, top_k: i64, top_p: f64) -> Self {
+        Self {
+            sampling,
+            top_k: None,
+            top_k_val: top_k,
+            top_p: None,
+            top_p_val: top_p,
+        }
+    }
+
+    /// Sets per-source-row top-k values.
+    pub fn with_top_k(mut self, top_k: SamplingTensor1DI32Desc) -> Self {
+        self.top_k = Some(top_k);
+        self
+    }
+
+    /// Sets per-source-row top-p values.
+    pub fn with_top_p(mut self, top_p: SamplingTensor1DF32Desc) -> Self {
+        self.top_p = Some(top_p);
+        self
+    }
+
+    /// Validates shared and joint-filter arguments.
+    pub fn validate(&self) -> Result<(), FlashInferError> {
+        self.sampling.validate()?;
+        validate_row_top_k(self.sampling, self.top_k, self.top_k_val)?;
+        validate_row_top_p(self.sampling, self.top_p, self.top_p_val)
+    }
+}
+
 /// Computes online softmax from FP32 `[batch, vocab]` logits into caller-owned output.
 pub fn sampling_softmax(params: &SamplingSoftmaxParams) -> Result<(), FlashInferError> {
     params.validate()?;
@@ -409,6 +594,219 @@ pub fn top_k_top_p_sampling_from_probs(
             top_k_value: params.top_k_val,
             top_p: params.top_p,
             top_p_value: params.top_p_val,
+        },
+    )
+}
+
+/// Samples I32 token IDs from logits using per-output-row Philox state.
+pub fn sampling_from_logits_with_row_rng(
+    params: &RowRngSamplingParams,
+) -> Result<(), FlashInferError> {
+    params.validate()?;
+    invoke_row_rng_sampling(params, SamplingCall::Logits)
+}
+
+/// Samples I32 token IDs from probabilities using per-output-row Philox state.
+pub fn sampling_from_probs_with_row_rng(
+    params: &RowRngSamplingParams,
+) -> Result<(), FlashInferError> {
+    params.validate()?;
+    invoke_row_rng_sampling(params, SamplingCall::Probs)
+}
+
+/// Samples from probabilities with top-k filtering and per-output-row Philox state.
+pub fn top_k_sampling_from_probs_with_row_rng(
+    params: &RowRngTopKSamplingParams,
+) -> Result<(), FlashInferError> {
+    params.validate()?;
+    invoke_row_rng_sampling(
+        &params.sampling,
+        SamplingCall::TopK {
+            array: params.top_k,
+            value: params.top_k_val,
+        },
+    )
+}
+
+/// Samples from probabilities with top-p filtering and per-output-row Philox state.
+pub fn top_p_sampling_from_probs_with_row_rng(
+    params: &RowRngTopPSamplingParams,
+) -> Result<(), FlashInferError> {
+    params.validate()?;
+    invoke_row_rng_sampling(
+        &params.sampling,
+        SamplingCall::TopP {
+            array: params.top_p,
+            value: params.top_p_val,
+        },
+    )
+}
+
+/// Samples with joint top-k/top-p filtering and per-output-row Philox state.
+pub fn top_k_top_p_sampling_from_probs_with_row_rng(
+    params: &RowRngTopKTopPSamplingParams,
+) -> Result<(), FlashInferError> {
+    params.validate()?;
+    invoke_row_rng_sampling(
+        &params.sampling,
+        SamplingCall::TopKTopP {
+            top_k: params.top_k,
+            top_k_value: params.top_k_val,
+            top_p: params.top_p,
+            top_p_value: params.top_p_val,
+        },
+    )
+}
+
+/// Cudarc wrapper for direct-logit sampling with per-output-row Philox state.
+#[cfg(feature = "cudarc")]
+#[allow(clippy::too_many_arguments)]
+pub fn sampling_from_logits_with_row_rng_cudarc(
+    stream: &cudarc::driver::CudaStream,
+    input: &cudarc::driver::CudaSlice<f32>,
+    output: &mut cudarc::driver::CudaSlice<i32>,
+    rows: usize,
+    cols: usize,
+    indices: Option<&cudarc::driver::CudaSlice<i32>>,
+    rng_keys: &cudarc::driver::CudaSlice<u64>,
+    rng_counters: &cudarc::driver::CudaSlice<u64>,
+    deterministic: bool,
+) -> Result<(), FlashInferError> {
+    row_rng_sampling_cudarc(
+        stream,
+        input,
+        output,
+        rows,
+        cols,
+        indices,
+        rng_keys,
+        rng_counters,
+        deterministic,
+        CudarcSamplingCall::Logits,
+    )
+}
+
+/// Cudarc wrapper for probability sampling with per-output-row Philox state.
+#[cfg(feature = "cudarc")]
+#[allow(clippy::too_many_arguments)]
+pub fn sampling_from_probs_with_row_rng_cudarc(
+    stream: &cudarc::driver::CudaStream,
+    input: &cudarc::driver::CudaSlice<f32>,
+    output: &mut cudarc::driver::CudaSlice<i32>,
+    rows: usize,
+    cols: usize,
+    indices: Option<&cudarc::driver::CudaSlice<i32>>,
+    rng_keys: &cudarc::driver::CudaSlice<u64>,
+    rng_counters: &cudarc::driver::CudaSlice<u64>,
+    deterministic: bool,
+) -> Result<(), FlashInferError> {
+    row_rng_sampling_cudarc(
+        stream,
+        input,
+        output,
+        rows,
+        cols,
+        indices,
+        rng_keys,
+        rng_counters,
+        deterministic,
+        CudarcSamplingCall::Probs,
+    )
+}
+
+/// Cudarc wrapper for top-k probability sampling with per-output-row Philox state.
+#[cfg(feature = "cudarc")]
+#[allow(clippy::too_many_arguments)]
+pub fn top_k_sampling_from_probs_with_row_rng_cudarc(
+    stream: &cudarc::driver::CudaStream,
+    input: &cudarc::driver::CudaSlice<f32>,
+    output: &mut cudarc::driver::CudaSlice<i32>,
+    rows: usize,
+    cols: usize,
+    indices: Option<&cudarc::driver::CudaSlice<i32>>,
+    top_k: Option<&cudarc::driver::CudaSlice<i32>>,
+    top_k_val: i64,
+    rng_keys: &cudarc::driver::CudaSlice<u64>,
+    rng_counters: &cudarc::driver::CudaSlice<u64>,
+    deterministic: bool,
+) -> Result<(), FlashInferError> {
+    row_rng_sampling_cudarc(
+        stream,
+        input,
+        output,
+        rows,
+        cols,
+        indices,
+        rng_keys,
+        rng_counters,
+        deterministic,
+        CudarcSamplingCall::TopK { top_k, top_k_val },
+    )
+}
+
+/// Cudarc wrapper for top-p probability sampling with per-output-row Philox state.
+#[cfg(feature = "cudarc")]
+#[allow(clippy::too_many_arguments)]
+pub fn top_p_sampling_from_probs_with_row_rng_cudarc(
+    stream: &cudarc::driver::CudaStream,
+    input: &cudarc::driver::CudaSlice<f32>,
+    output: &mut cudarc::driver::CudaSlice<i32>,
+    rows: usize,
+    cols: usize,
+    indices: Option<&cudarc::driver::CudaSlice<i32>>,
+    top_p: Option<&cudarc::driver::CudaSlice<f32>>,
+    top_p_val: f64,
+    rng_keys: &cudarc::driver::CudaSlice<u64>,
+    rng_counters: &cudarc::driver::CudaSlice<u64>,
+    deterministic: bool,
+) -> Result<(), FlashInferError> {
+    row_rng_sampling_cudarc(
+        stream,
+        input,
+        output,
+        rows,
+        cols,
+        indices,
+        rng_keys,
+        rng_counters,
+        deterministic,
+        CudarcSamplingCall::TopP { top_p, top_p_val },
+    )
+}
+
+/// Cudarc wrapper for joint top-k/top-p sampling with per-output-row Philox state.
+#[cfg(feature = "cudarc")]
+#[allow(clippy::too_many_arguments)]
+pub fn top_k_top_p_sampling_from_probs_with_row_rng_cudarc(
+    stream: &cudarc::driver::CudaStream,
+    input: &cudarc::driver::CudaSlice<f32>,
+    output: &mut cudarc::driver::CudaSlice<i32>,
+    rows: usize,
+    cols: usize,
+    indices: Option<&cudarc::driver::CudaSlice<i32>>,
+    top_k: Option<&cudarc::driver::CudaSlice<i32>>,
+    top_k_val: i64,
+    top_p: Option<&cudarc::driver::CudaSlice<f32>>,
+    top_p_val: f64,
+    rng_keys: &cudarc::driver::CudaSlice<u64>,
+    rng_counters: &cudarc::driver::CudaSlice<u64>,
+    deterministic: bool,
+) -> Result<(), FlashInferError> {
+    row_rng_sampling_cudarc(
+        stream,
+        input,
+        output,
+        rows,
+        cols,
+        indices,
+        rng_keys,
+        rng_counters,
+        deterministic,
+        CudarcSamplingCall::TopKTopP {
+            top_k,
+            top_k_val,
+            top_p,
+            top_p_val,
         },
     )
 }
@@ -848,6 +1246,165 @@ fn sampling_cudarc(
     }
 }
 
+#[cfg(feature = "cudarc")]
+#[allow(clippy::too_many_arguments)]
+fn row_rng_sampling_cudarc(
+    stream: &cudarc::driver::CudaStream,
+    input: &cudarc::driver::CudaSlice<f32>,
+    output: &mut cudarc::driver::CudaSlice<i32>,
+    rows: usize,
+    cols: usize,
+    indices: Option<&cudarc::driver::CudaSlice<i32>>,
+    rng_keys: &cudarc::driver::CudaSlice<u64>,
+    rng_counters: &cudarc::driver::CudaSlice<u64>,
+    deterministic: bool,
+    call: CudarcSamplingCall<'_>,
+) -> Result<(), FlashInferError> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+    require_usize_len(input.len(), checked_elements(rows, cols)?, "input")?;
+    if output.is_empty() || output.len() > rows {
+        return invalid("output length must be in 1..=rows");
+    }
+    if let Some(indices) = indices {
+        require_usize_len(indices.len(), output.len(), "indices")?;
+    } else {
+        require_usize_len(output.len(), rows, "output")?;
+    }
+    require_usize_len(rng_keys.len(), output.len(), "rng_keys")?;
+    require_usize_len(rng_counters.len(), output.len(), "rng_counters")?;
+    if let Some(top_k) = match call {
+        CudarcSamplingCall::TopK { top_k, .. } | CudarcSamplingCall::TopKTopP { top_k, .. } => {
+            top_k
+        }
+        _ => None,
+    } {
+        require_usize_len(top_k.len(), rows, "top_k")?;
+    }
+    if let Some(top_p) = match call {
+        CudarcSamplingCall::TopP { top_p, .. } | CudarcSamplingCall::TopKTopP { top_p, .. } => {
+            top_p
+        }
+        _ => None,
+    } {
+        require_usize_len(top_p.len(), rows, "top_p")?;
+    }
+
+    let output_len = to_i64(output.len(), "output length")?;
+    let (input_ptr, _input_sync) = input.device_ptr(stream);
+    let (output_ptr, _output_sync) = output.device_ptr_mut(stream);
+    let indices_ptr = indices.map(|value| value.device_ptr(stream));
+    let (key_ptr, _key_sync) = rng_keys.device_ptr(stream);
+    let (counter_ptr, _counter_sync) = rng_counters.device_ptr(stream);
+    let top_k_ptr = match call {
+        CudarcSamplingCall::TopK { top_k, .. } | CudarcSamplingCall::TopKTopP { top_k, .. } => {
+            top_k.map(|value| value.device_ptr(stream))
+        }
+        _ => None,
+    };
+    let top_p_ptr = match call {
+        CudarcSamplingCall::TopP { top_p, .. } | CudarcSamplingCall::TopKTopP { top_p, .. } => {
+            top_p.map(|value| value.device_ptr(stream))
+        }
+        _ => None,
+    };
+
+    let device_id = cudarc_device_id(stream)?;
+    let rows_i64 = to_i64(rows, "rows")?;
+    let cols_i64 = to_i64(cols, "cols")?;
+    let mut params = RowRngSamplingParams::new(
+        SamplingTensor2DF32Desc {
+            ptr: raw_ptr(input_ptr),
+            rows: rows_i64,
+            cols: cols_i64,
+            stride_row: cols_i64,
+            stride_col: 1,
+            device_id,
+        },
+        SamplingTensor1DI32Desc {
+            ptr: raw_ptr(output_ptr),
+            len: output_len,
+            stride: 1,
+            device_id,
+        },
+        SamplingTensor1DU64Desc {
+            ptr: raw_ptr(key_ptr),
+            len: output_len,
+            stride: 1,
+            device_id,
+        },
+        SamplingTensor1DU64Desc {
+            ptr: raw_ptr(counter_ptr),
+            len: output_len,
+            stride: 1,
+            device_id,
+        },
+        stream.cu_stream().cast(),
+    )
+    .with_deterministic(deterministic);
+    if let Some((ptr, _sync)) = indices_ptr.as_ref() {
+        params = params.with_indices(SamplingTensor1DI32Desc {
+            ptr: raw_ptr(*ptr),
+            len: output_len,
+            stride: 1,
+            device_id,
+        });
+    }
+
+    match call {
+        CudarcSamplingCall::Logits => sampling_from_logits_with_row_rng(&params),
+        CudarcSamplingCall::Probs => sampling_from_probs_with_row_rng(&params),
+        CudarcSamplingCall::TopK { top_k_val, .. } => {
+            let mut filtered = RowRngTopKSamplingParams::new(params, top_k_val);
+            if let Some((ptr, _sync)) = top_k_ptr.as_ref() {
+                filtered = filtered.with_top_k(SamplingTensor1DI32Desc {
+                    ptr: raw_ptr(*ptr),
+                    len: rows_i64,
+                    stride: 1,
+                    device_id,
+                });
+            }
+            top_k_sampling_from_probs_with_row_rng(&filtered)
+        }
+        CudarcSamplingCall::TopP { top_p_val, .. } => {
+            let mut filtered = RowRngTopPSamplingParams::new(params, top_p_val);
+            if let Some((ptr, _sync)) = top_p_ptr.as_ref() {
+                filtered = filtered.with_top_p(SamplingTensor1DF32Desc {
+                    ptr: raw_ptr(*ptr),
+                    len: rows_i64,
+                    stride: 1,
+                    device_id,
+                });
+            }
+            top_p_sampling_from_probs_with_row_rng(&filtered)
+        }
+        CudarcSamplingCall::TopKTopP {
+            top_k_val,
+            top_p_val,
+            ..
+        } => {
+            let mut filtered = RowRngTopKTopPSamplingParams::new(params, top_k_val, top_p_val);
+            if let Some((ptr, _sync)) = top_k_ptr.as_ref() {
+                filtered = filtered.with_top_k(SamplingTensor1DI32Desc {
+                    ptr: raw_ptr(*ptr),
+                    len: rows_i64,
+                    stride: 1,
+                    device_id,
+                });
+            }
+            if let Some((ptr, _sync)) = top_p_ptr.as_ref() {
+                filtered = filtered.with_top_p(SamplingTensor1DF32Desc {
+                    ptr: raw_ptr(*ptr),
+                    len: rows_i64,
+                    stride: 1,
+                    device_id,
+                });
+            }
+            top_k_top_p_sampling_from_probs_with_row_rng(&filtered)
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum SamplingCall {
     Logits,
@@ -872,6 +1429,15 @@ fn invoke_sampling(params: &SamplingParams, call: SamplingCall) -> Result<(), Fl
     let runtime = FlashInferRuntime::global()?;
     // SAFETY: public entry points validate descriptors before reaching this call.
     unsafe { sampling_with_runtime(runtime, params, call) }
+}
+
+fn invoke_row_rng_sampling(
+    params: &RowRngSamplingParams,
+    call: SamplingCall,
+) -> Result<(), FlashInferError> {
+    let runtime = FlashInferRuntime::global()?;
+    // SAFETY: public entry points validate descriptors before reaching this call.
+    unsafe { row_rng_sampling_with_runtime(runtime, params, call) }
 }
 
 unsafe fn sampling_softmax_with_runtime(
@@ -1068,6 +1634,146 @@ unsafe fn sampling_with_runtime(
     combine_restore(call_result, guard.restore_now())
 }
 
+unsafe fn row_rng_sampling_with_runtime(
+    runtime: &FlashInferRuntime,
+    params: &RowRngSamplingParams,
+    call: SamplingCall,
+) -> Result<(), FlashInferError> {
+    let mut input_shape = [params.input.rows, params.input.cols];
+    let input = dl_tensor_2d(
+        params.input.ptr,
+        params.input.device_id,
+        dl_dtype(KDL_FLOAT, 32),
+        &mut input_shape,
+    );
+    let mut output_shape = [params.output.len];
+    let output = dl_tensor_1d(
+        params.output.ptr,
+        params.output.device_id,
+        dl_dtype(KDL_INT, 32),
+        &mut output_shape,
+    );
+    let mut indices_shape = [params.output.len];
+    let indices = params.indices.map(|desc| {
+        dl_tensor_1d(
+            desc.ptr,
+            desc.device_id,
+            dl_dtype(KDL_INT, 32),
+            &mut indices_shape,
+        )
+    });
+    let mut key_shape = [params.rng_keys.len];
+    let keys = dl_tensor_1d(
+        params.rng_keys.ptr,
+        params.rng_keys.device_id,
+        dl_dtype(KDL_UINT, 64),
+        &mut key_shape,
+    );
+    let mut counter_shape = [params.rng_counters.len];
+    let counters = dl_tensor_1d(
+        params.rng_counters.ptr,
+        params.rng_counters.device_id,
+        dl_dtype(KDL_UINT, 64),
+        &mut counter_shape,
+    );
+    let mut top_k_shape = [params.input.rows];
+    let mut top_p_shape = [params.input.rows];
+    let top_k_tensor = match call {
+        SamplingCall::TopK { array, .. } | SamplingCall::TopKTopP { top_k: array, .. } => array
+            .map(|desc| {
+                dl_tensor_1d(
+                    desc.ptr,
+                    desc.device_id,
+                    dl_dtype(KDL_INT, 32),
+                    &mut top_k_shape,
+                )
+            }),
+        _ => None,
+    };
+    let top_p_tensor = match call {
+        SamplingCall::TopP { array, .. } | SamplingCall::TopKTopP { top_p: array, .. } => array
+            .map(|desc| {
+                dl_tensor_1d(
+                    desc.ptr,
+                    desc.device_id,
+                    dl_dtype(KDL_FLOAT, 32),
+                    &mut top_p_shape,
+                )
+            }),
+        _ => None,
+    };
+
+    let mut args = Vec::with_capacity(10);
+    args.extend([
+        any_dltensor_ptr(&input),
+        any_dltensor_ptr(&output),
+        optional_tensor(indices.as_ref()),
+    ]);
+    match call {
+        SamplingCall::Logits | SamplingCall::Probs => {}
+        SamplingCall::TopK { value, .. } => {
+            args.push(optional_tensor(top_k_tensor.as_ref()));
+            args.push(any_i64(value));
+        }
+        SamplingCall::TopP { value, .. } => {
+            args.push(optional_tensor(top_p_tensor.as_ref()));
+            args.push(any_f64(value));
+        }
+        SamplingCall::TopKTopP {
+            top_k_value,
+            top_p_value,
+            ..
+        } => {
+            args.push(optional_tensor(top_k_tensor.as_ref()));
+            args.push(any_f64(top_k_value as f64));
+            args.push(optional_tensor(top_p_tensor.as_ref()));
+            args.push(any_f64(top_p_value));
+        }
+    }
+    args.extend([
+        any_bool(params.deterministic),
+        any_dltensor_ptr(&keys),
+        any_dltensor_ptr(&counters),
+    ]);
+
+    let mut result = any_none();
+    // SAFETY: stream context API contract comes from TVM-FFI and is validated on load.
+    let previous = unsafe { runtime.set_stream(params.input.device_id, params.stream)? };
+    let mut guard = StreamRestoreGuard::new(runtime, params.input.device_id, previous);
+    // SAFETY: argument order and scalar tags match the selected row-RNG export.
+    let call_result = unsafe {
+        match call {
+            SamplingCall::Logits => runtime.call_sampling_from_logits_with_row_rng(
+                args.as_ptr(),
+                args.len() as i32,
+                &mut result,
+            ),
+            SamplingCall::Probs => runtime.call_sampling_from_probs_with_row_rng(
+                args.as_ptr(),
+                args.len() as i32,
+                &mut result,
+            ),
+            SamplingCall::TopK { .. } => runtime.call_top_k_sampling_from_probs_with_row_rng(
+                args.as_ptr(),
+                args.len() as i32,
+                &mut result,
+            ),
+            SamplingCall::TopP { .. } => runtime.call_top_p_sampling_from_probs_with_row_rng(
+                args.as_ptr(),
+                args.len() as i32,
+                &mut result,
+            ),
+            SamplingCall::TopKTopP { .. } => runtime
+                .call_top_k_top_p_sampling_from_probs_with_row_rng(
+                    args.as_ptr(),
+                    args.len() as i32,
+                    &mut result,
+                ),
+        }
+    };
+    combine_restore(call_result, guard.restore_now())
+}
+
 fn dl_dtype(code: u8, bits: u8) -> DLDataType {
     DLDataType {
         code,
@@ -1197,6 +1903,36 @@ fn validate_source_f32(
         validate_f32_1d(desc, name)?;
         require_len(desc.len, sampling.input.rows, name)?;
         require_device(desc.device_id, sampling.input.device_id, name)?;
+    }
+    Ok(())
+}
+
+fn validate_row_top_k(
+    sampling: RowRngSamplingParams,
+    top_k: Option<SamplingTensor1DI32Desc>,
+    top_k_val: i64,
+) -> Result<(), FlashInferError> {
+    if top_k_val <= 0 || top_k_val > sampling.input.cols {
+        return invalid("top_k_val must be in 1..=vocab_size");
+    }
+    if let Some(top_k) = top_k {
+        validate_i32_1d(top_k, "top_k")?;
+        require_len(top_k.len, sampling.input.rows, "top_k")?;
+        require_device(top_k.device_id, sampling.input.device_id, "top_k")?;
+    }
+    Ok(())
+}
+
+fn validate_row_top_p(
+    sampling: RowRngSamplingParams,
+    top_p: Option<SamplingTensor1DF32Desc>,
+    top_p_val: f64,
+) -> Result<(), FlashInferError> {
+    validate_probability(top_p_val, "top_p_val")?;
+    if let Some(top_p) = top_p {
+        validate_f32_1d(top_p, "top_p")?;
+        require_len(top_p.len, sampling.input.rows, "top_p")?;
+        require_device(top_p.device_id, sampling.input.device_id, "top_p")?;
     }
     Ok(())
 }
@@ -1383,5 +2119,30 @@ mod tests {
             device_id: 0,
         });
         assert!(top_k.validate().is_err());
+    }
+
+    #[test]
+    fn row_rng_requires_one_key_and_counter_per_output() {
+        let legacy = sampling();
+        let mut params = RowRngSamplingParams::new(
+            legacy.input,
+            legacy.output,
+            SamplingTensor1DU64Desc {
+                ptr: ptr(),
+                len: 4,
+                stride: 1,
+                device_id: 0,
+            },
+            SamplingTensor1DU64Desc {
+                ptr: ptr(),
+                len: 4,
+                stride: 1,
+                device_id: 0,
+            },
+            std::ptr::null_mut(),
+        );
+        assert!(params.validate().is_ok());
+        params.rng_counters.len = 1;
+        assert!(params.validate().is_err());
     }
 }

@@ -109,6 +109,9 @@ pub enum FlashInferError {
 
     #[error("runtime has already been initialized with a different configuration")]
     RuntimeAlreadyInitialized,
+
+    #[error("pinned FlashInfer artifact does not provide capability `{capability}`")]
+    ArtifactCapabilityMissing { capability: &'static str },
 }
 
 impl FlashInferError {

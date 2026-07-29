@@ -193,6 +193,11 @@ pub struct FlashInferRuntime {
     tvm_ffi_top_k_sampling_from_probs: TVMFFISafeCallFn,
     tvm_ffi_top_p_sampling_from_probs: TVMFFISafeCallFn,
     tvm_ffi_top_k_top_p_sampling_from_probs: TVMFFISafeCallFn,
+    tvm_ffi_sampling_from_logits_with_row_rng: Option<TVMFFISafeCallFn>,
+    tvm_ffi_sampling_from_probs_with_row_rng: Option<TVMFFISafeCallFn>,
+    tvm_ffi_top_k_sampling_from_probs_with_row_rng: Option<TVMFFISafeCallFn>,
+    tvm_ffi_top_p_sampling_from_probs_with_row_rng: Option<TVMFFISafeCallFn>,
+    tvm_ffi_top_k_top_p_sampling_from_probs_with_row_rng: Option<TVMFFISafeCallFn>,
     single_prefill_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
     batch_prefill_kernel_cache: Mutex<HashMap<String, LoadedBatchPrefillKernel>>,
     single_decode_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
@@ -227,6 +232,21 @@ struct ManagedTensorContext {
 }
 
 impl FlashInferRuntime {
+    /// Returns whether the pinned sampling artifact exposes every row-RNG entry point.
+    pub fn supports_row_rng_sampling(&self) -> bool {
+        self.tvm_ffi_sampling_from_logits_with_row_rng.is_some()
+            && self.tvm_ffi_sampling_from_probs_with_row_rng.is_some()
+            && self
+                .tvm_ffi_top_k_sampling_from_probs_with_row_rng
+                .is_some()
+            && self
+                .tvm_ffi_top_p_sampling_from_probs_with_row_rng
+                .is_some()
+            && self
+                .tvm_ffi_top_k_top_p_sampling_from_probs_with_row_rng
+                .is_some()
+    }
+
     pub fn initialize(config: RuntimeConfig) -> Result<&'static Self, FlashInferError> {
         let resolved = config.resolve()?;
 
@@ -454,6 +474,81 @@ impl FlashInferRuntime {
                 result,
             )
         }
+    }
+
+    pub(crate) unsafe fn call_sampling_from_logits_with_row_rng(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        let function = self.tvm_ffi_sampling_from_logits_with_row_rng.ok_or(
+            FlashInferError::ArtifactCapabilityMissing {
+                capability: "row_rng_sampling",
+            },
+        )?;
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        unsafe { self.call_fixed(function, args, num_args, result) }
+    }
+
+    pub(crate) unsafe fn call_sampling_from_probs_with_row_rng(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        let function = self.tvm_ffi_sampling_from_probs_with_row_rng.ok_or(
+            FlashInferError::ArtifactCapabilityMissing {
+                capability: "row_rng_sampling",
+            },
+        )?;
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        unsafe { self.call_fixed(function, args, num_args, result) }
+    }
+
+    pub(crate) unsafe fn call_top_k_sampling_from_probs_with_row_rng(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        let function = self.tvm_ffi_top_k_sampling_from_probs_with_row_rng.ok_or(
+            FlashInferError::ArtifactCapabilityMissing {
+                capability: "row_rng_sampling",
+            },
+        )?;
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        unsafe { self.call_fixed(function, args, num_args, result) }
+    }
+
+    pub(crate) unsafe fn call_top_p_sampling_from_probs_with_row_rng(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        let function = self.tvm_ffi_top_p_sampling_from_probs_with_row_rng.ok_or(
+            FlashInferError::ArtifactCapabilityMissing {
+                capability: "row_rng_sampling",
+            },
+        )?;
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        unsafe { self.call_fixed(function, args, num_args, result) }
+    }
+
+    pub(crate) unsafe fn call_top_k_top_p_sampling_from_probs_with_row_rng(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        let function = self
+            .tvm_ffi_top_k_top_p_sampling_from_probs_with_row_rng
+            .ok_or(FlashInferError::ArtifactCapabilityMissing {
+                capability: "row_rng_sampling",
+            })?;
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        unsafe { self.call_fixed(function, args, num_args, result) }
     }
 
     unsafe fn call_fixed(
@@ -1260,6 +1355,36 @@ impl FlashInferRuntime {
                 "__tvm_ffi_top_k_top_p_sampling_from_probs",
             )?
         };
+        let tvm_ffi_sampling_from_logits_with_row_rng = unsafe {
+            resolve_optional_symbol(
+                &sampling_lib,
+                b"__tvm_ffi_sampling_from_logits_with_row_rng\0",
+            )
+        };
+        let tvm_ffi_sampling_from_probs_with_row_rng = unsafe {
+            resolve_optional_symbol(
+                &sampling_lib,
+                b"__tvm_ffi_sampling_from_probs_with_row_rng\0",
+            )
+        };
+        let tvm_ffi_top_k_sampling_from_probs_with_row_rng = unsafe {
+            resolve_optional_symbol(
+                &sampling_lib,
+                b"__tvm_ffi_top_k_sampling_from_probs_with_row_rng\0",
+            )
+        };
+        let tvm_ffi_top_p_sampling_from_probs_with_row_rng = unsafe {
+            resolve_optional_symbol(
+                &sampling_lib,
+                b"__tvm_ffi_top_p_sampling_from_probs_with_row_rng\0",
+            )
+        };
+        let tvm_ffi_top_k_top_p_sampling_from_probs_with_row_rng = unsafe {
+            resolve_optional_symbol(
+                &sampling_lib,
+                b"__tvm_ffi_top_k_top_p_sampling_from_probs_with_row_rng\0",
+            )
+        };
 
         let mut version = TVMFFIVersion {
             major: 0,
@@ -1320,6 +1445,11 @@ impl FlashInferRuntime {
             tvm_ffi_top_k_sampling_from_probs,
             tvm_ffi_top_p_sampling_from_probs,
             tvm_ffi_top_k_top_p_sampling_from_probs,
+            tvm_ffi_sampling_from_logits_with_row_rng,
+            tvm_ffi_sampling_from_probs_with_row_rng,
+            tvm_ffi_top_k_sampling_from_probs_with_row_rng,
+            tvm_ffi_top_p_sampling_from_probs_with_row_rng,
+            tvm_ffi_top_k_top_p_sampling_from_probs_with_row_rng,
             single_prefill_kernel_cache: Mutex::new(HashMap::new()),
             batch_prefill_kernel_cache: Mutex::new(HashMap::new()),
             single_decode_kernel_cache: Mutex::new(HashMap::new()),
@@ -1374,6 +1504,16 @@ unsafe fn resolve_symbol<T: Copy>(
             message: e.to_string(),
         })?;
     Ok(*symbol)
+}
+
+unsafe fn resolve_optional_symbol<T: Copy>(
+    lib: &Library,
+    symbol_bytes: &'static [u8],
+) -> Option<T> {
+    // SAFETY: caller provides the concrete symbol type and this function only copies fn ptr values.
+    unsafe { lib.get::<T>(symbol_bytes) }
+        .ok()
+        .map(|symbol| *symbol)
 }
 
 fn cuda_runtime_fns() -> Result<&'static CudaRuntimeFns, String> {

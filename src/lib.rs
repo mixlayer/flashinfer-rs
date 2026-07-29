@@ -90,15 +90,21 @@ pub use paged_kv_append::{
 pub use paged_kv_append::{append_paged_kv_cache_cudarc, append_paged_mla_kv_cache_cudarc};
 pub use runtime::{FlashInferRuntime, RuntimeConfig};
 pub use sampling::{
-    DEFAULT_SAMPLING_WORKSPACE_BYTES, SamplingParams, SamplingSoftmaxParams,
+    DEFAULT_SAMPLING_WORKSPACE_BYTES, RowRngSamplingParams, RowRngTopKSamplingParams,
+    RowRngTopKTopPSamplingParams, RowRngTopPSamplingParams, SamplingParams, SamplingSoftmaxParams,
     SamplingTensor1DF32Desc, SamplingTensor1DI32Desc, SamplingTensor1DU8Desc,
     SamplingTensor1DU64Desc, SamplingTensor2DF32Desc, TopKSamplingParams, TopKTopPSamplingParams,
-    TopPSamplingParams, sampling_from_logits, sampling_from_probs, sampling_softmax,
-    top_k_sampling_from_probs, top_k_top_p_sampling_from_probs, top_p_sampling_from_probs,
+    TopPSamplingParams, sampling_from_logits, sampling_from_logits_with_row_rng,
+    sampling_from_probs, sampling_from_probs_with_row_rng, sampling_softmax,
+    top_k_sampling_from_probs, top_k_sampling_from_probs_with_row_rng,
+    top_k_top_p_sampling_from_probs, top_k_top_p_sampling_from_probs_with_row_rng,
+    top_p_sampling_from_probs, top_p_sampling_from_probs_with_row_rng,
 };
 #[cfg(feature = "cudarc")]
 pub use sampling::{
-    sampling_from_logits_cudarc, sampling_from_probs_cudarc, sampling_softmax_cudarc,
-    top_k_sampling_from_probs_cudarc, top_k_top_p_sampling_from_probs_cudarc,
-    top_p_sampling_from_probs_cudarc,
+    sampling_from_logits_cudarc, sampling_from_logits_with_row_rng_cudarc,
+    sampling_from_probs_cudarc, sampling_from_probs_with_row_rng_cudarc, sampling_softmax_cudarc,
+    top_k_sampling_from_probs_cudarc, top_k_sampling_from_probs_with_row_rng_cudarc,
+    top_k_top_p_sampling_from_probs_cudarc, top_k_top_p_sampling_from_probs_with_row_rng_cudarc,
+    top_p_sampling_from_probs_cudarc, top_p_sampling_from_probs_with_row_rng_cudarc,
 };
