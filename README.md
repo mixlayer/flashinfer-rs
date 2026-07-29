@@ -13,6 +13,7 @@ Rust-first integration for calling precompiled FlashInfer kernels through TVM-FF
 - MHA batched paged decode (`batch_decode_with_kv_cache`) via on-demand JIT-cache module loading
 - CUTLASS fused MoE (`fused_moe_{90,100,103,120}`) via on-demand JIT-cache module loading
 - Paged KV append (`append_paged_kv_cache`) and paged MLA KV append (`append_paged_mla_kv_cache`) from `page.so`
+- Online softmax and logits/probability/top-k/top-p sampling from `sampling.so`
 - Pure Rust TVM-FFI ABI packing and dynamic loading
 - Optional `cudarc` convenience wrappers
 
@@ -463,10 +464,11 @@ FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test rmsnorm_gpu
 FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test mha_batch_prefill_gpu
 FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test mha_batch_prefill_paged_gpu
 FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test mha_decode_gpu
+FLASHINFER_RS_RUN_GPU_TESTS=1 cargo test --features cudarc --test sampling_gpu
 ```
 
 ## Additional Notes
 
 - Calls are asynchronous with respect to host execution (no implicit stream synchronize).
-- Dynamic loading order is: `libtvm_ffi.so` -> `norm.so` -> `gdn_prefill_sm90.so` -> on-demand MHA prefill/decode modules.
+- Fixed libraries load in this order: `libtvm_ffi.so`, `norm.so`, `gdn_prefill_sm90.so`, `page.so`, and `sampling.so`; specialized kernels load on demand.
 - Integration details: `docs/flashinfer-rs-integration.md`.

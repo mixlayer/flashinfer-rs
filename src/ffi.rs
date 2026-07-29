@@ -177,6 +177,14 @@ pub fn any_i64(value: i64) -> TVMFFIAny {
     }
 }
 
+pub fn any_u64(value: u64) -> TVMFFIAny {
+    TVMFFIAny {
+        type_index: KTVM_FFI_INT,
+        tag: TVMFFIAnyTag { zero_padding: 0 },
+        value: TVMFFIAnyValue { v_uint64: value },
+    }
+}
+
 pub fn any_f64(value: f64) -> TVMFFIAny {
     TVMFFIAny {
         type_index: KTVM_FFI_FLOAT,
@@ -281,6 +289,14 @@ mod tests {
         assert_eq!(packed.type_index, KTVM_FFI_INT);
         // SAFETY: field matches the value constructor.
         assert_eq!(unsafe { packed.value.v_int64 }, 123);
+    }
+
+    #[test]
+    fn pack_u64_sets_expected_type_and_value() {
+        let packed = any_u64(u64::MAX);
+        assert_eq!(packed.type_index, KTVM_FFI_INT);
+        // SAFETY: field matches the value constructor.
+        assert_eq!(unsafe { packed.value.v_uint64 }, u64::MAX);
     }
 
     #[test]
