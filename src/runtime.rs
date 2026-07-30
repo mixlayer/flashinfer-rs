@@ -4,11 +4,13 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use fs2::FileExt;
 use libloading::os::unix::Library;
 use sha2::{Digest, Sha256};
+use std::os::unix::fs::PermissionsExt;
 use zip::ZipArchive;
 
 use crate::error::FlashInferError;
@@ -30,6 +32,7 @@ const FLASHINFER_PAGE_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/page/pag
 const FLASHINFER_SAMPLING_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/sampling/sampling.so";
 const TVMFFI_SO_MEMBER: &str = "tvm_ffi/lib/libtvm_ffi.so";
 const WHEEL_CACHE_DIR_NAME: &str = "wheels";
+const SHA256SUM_PROGRAM: &str = "sha256sum";
 
 const EXPECTED_TVMFFI_MAJOR: u32 = 0;
 const EXPECTED_TVMFFI_MINOR: u32 = 1;
@@ -226,6 +229,7 @@ pub struct FlashInferRuntime {
 }
 
 static GLOBAL_RUNTIME: OnceLock<FlashInferRuntime> = OnceLock::new();
+static HOST_SHA256SUM: OnceLock<Option<PathBuf>> = OnceLock::new();
 static RUNTIME_INIT_LOCK: Mutex<()> = Mutex::new(());
 static CUDA_RUNTIME_FNS: OnceLock<Result<CudaRuntimeFns, String>> = OnceLock::new();
 static TVM_ENV_GET_STREAM_FN: OnceLock<Option<TVMFFIEnvGetStreamFn>> = OnceLock::new();
@@ -2081,7 +2085,6 @@ fn write_wheel_from_reader<R: Read>(
         let _ = fs::remove_file(&temp_path);
     }
 
-    let mut hasher = Sha256::new();
     {
         let mut out =
             File::create(&temp_path).map_err(|e| FlashInferError::EmbeddedWheelCache {
@@ -2109,7 +2112,6 @@ fn write_wheel_from_reader<R: Read>(
                     path: output_path.to_path_buf(),
                     source: e,
                 })?;
-            hasher.update(chunk);
         }
         out.sync_all()
             .map_err(|e| FlashInferError::EmbeddedWheelCache {
@@ -2119,7 +2121,13 @@ fn write_wheel_from_reader<R: Read>(
             })?;
     }
 
-    let found = format!("{:x}", hasher.finalize());
+    let found = match sha256_file_hex(&temp_path, wheel.logical_name) {
+        Ok(found) => found,
+        Err(err) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(err);
+        }
+    };
     if found != wheel.sha256_hex {
         let _ = fs::remove_file(&temp_path);
         return Err(FlashInferError::EmbeddedWheelChecksumMismatch {
@@ -2226,6 +2234,89 @@ fn artifact_hash() -> String {
 }
 
 fn sha256_file_hex(path: &Path, wheel: &'static str) -> Result<String, FlashInferError> {
+    // Hashing the ~1.8 GiB JIT-cache wheel with `sha2` takes over 100 seconds
+    // in debug builds. Prefer the host's optimized `sha256sum` executable so
+    // non-release test and development builds do not pay that cost.
+    if let Some(program) = host_sha256sum() {
+        return sha256_file_hex_with_command(program, path, wheel);
+    }
+    sha256_file_hex_rust(path, wheel)
+}
+
+fn host_sha256sum() -> Option<&'static Path> {
+    HOST_SHA256SUM
+        .get_or_init(|| {
+            env::var_os("PATH")
+                .as_deref()
+                .and_then(|path| find_executable_in_path(SHA256SUM_PROGRAM, path))
+        })
+        .as_deref()
+}
+
+fn find_executable_in_path(program: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    env::split_paths(path).find_map(|directory| {
+        let candidate = directory.join(program);
+        let metadata = candidate.metadata().ok()?;
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            Some(candidate)
+        } else {
+            None
+        }
+    })
+}
+
+fn sha256_file_hex_with_command(
+    program: &Path,
+    path: &Path,
+    wheel: &'static str,
+) -> Result<String, FlashInferError> {
+    let output = Command::new(program)
+        .arg("--")
+        .arg(path)
+        .output()
+        .map_err(|e| FlashInferError::EmbeddedWheelCache {
+            wheel,
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(FlashInferError::EmbeddedWheelCache {
+            wheel,
+            path: path.to_path_buf(),
+            source: io::Error::other(format!(
+                "`{}` failed with status {}: {}",
+                program.display(),
+                output.status,
+                stderr.trim()
+            )),
+        });
+    }
+    parse_sha256sum_output(&output.stdout).map_err(|e| FlashInferError::EmbeddedWheelCache {
+        wheel,
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
+
+fn parse_sha256sum_output(output: &[u8]) -> io::Result<String> {
+    let digest = output
+        .split(|byte| byte.is_ascii_whitespace())
+        .next()
+        .filter(|digest| !digest.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "sha256sum returned no digest")
+        })?;
+    if digest.len() != 64 || !digest.iter().all(u8::is_ascii_hexdigit) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sha256sum returned an invalid SHA-256 digest",
+        ));
+    }
+    Ok(String::from_utf8_lossy(digest).to_ascii_lowercase())
+}
+
+fn sha256_file_hex_rust(path: &Path, wheel: &'static str) -> Result<String, FlashInferError> {
     let mut file = File::open(path).map_err(|e| FlashInferError::EmbeddedWheelCache {
         wheel,
         path: path.to_path_buf(),
@@ -2409,6 +2500,7 @@ mod tests {
         any_f64, any_none,
     };
     use std::io::Cursor;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -2440,6 +2532,98 @@ mod tests {
         hasher.update(PINNED_APACHE_TVM_FFI_WHEEL_SHA256.as_bytes());
         let expected = format!("{:x}", hasher.finalize());
         assert_eq!(artifact_hash(), expected);
+    }
+
+    #[test]
+    fn parse_sha256sum_output_accepts_and_normalizes_digest() {
+        let uppercase =
+            b"ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789  wheel.whl\n";
+        assert_eq!(
+            parse_sha256sum_output(uppercase).expect("parse digest"),
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
+    }
+
+    #[test]
+    fn parse_sha256sum_output_rejects_invalid_digest() {
+        assert!(parse_sha256sum_output(b"not-a-digest  wheel.whl\n").is_err());
+        assert!(parse_sha256sum_output(b"").is_err());
+    }
+
+    #[test]
+    fn find_executable_in_path_requires_executable_file() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let program = tmpdir.path().join(SHA256SUM_PROGRAM);
+        fs::write(&program, b"#!/bin/sh\nexit 0\n").expect("write program");
+
+        let mut permissions = fs::metadata(&program).expect("metadata").permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&program, permissions).expect("set non-executable");
+        assert_eq!(
+            find_executable_in_path(SHA256SUM_PROGRAM, tmpdir.path().as_os_str()),
+            None
+        );
+
+        let mut permissions = fs::metadata(&program).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).expect("set executable");
+        assert_eq!(
+            find_executable_in_path(SHA256SUM_PROGRAM, tmpdir.path().as_os_str()),
+            Some(program)
+        );
+    }
+
+    #[test]
+    fn command_and_rust_sha256_paths_match() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let wheel_path = tmpdir.path().join("wheel with spaces.whl");
+        let bytes = b"wheel-hash-test";
+        fs::write(&wheel_path, bytes).expect("write wheel");
+        let expected = sha256_bytes_hex(bytes);
+
+        let program = tmpdir.path().join("mock-sha256sum");
+        fs::write(
+            &program,
+            format!("#!/bin/sh\nprintf '%s  %s\\n' '{expected}' \"$2\"\n"),
+        )
+        .expect("write mock sha256sum");
+        let mut permissions = fs::metadata(&program).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).expect("set executable");
+
+        assert_eq!(
+            sha256_file_hex_with_command(&program, &wheel_path, "test_wheel")
+                .expect("command hash"),
+            expected
+        );
+        assert_eq!(
+            sha256_file_hex_rust(&wheel_path, "test_wheel").expect("Rust hash"),
+            expected
+        );
+    }
+
+    #[test]
+    fn sha256sum_command_failure_is_not_silently_ignored() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let wheel_path = tmpdir.path().join("wheel.whl");
+        fs::write(&wheel_path, b"wheel").expect("write wheel");
+
+        let program = tmpdir.path().join("failing-sha256sum");
+        fs::write(&program, b"#!/bin/sh\necho failed >&2\nexit 17\n")
+            .expect("write mock sha256sum");
+        let mut permissions = fs::metadata(&program).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).expect("set executable");
+
+        let error = sha256_file_hex_with_command(&program, &wheel_path, "test_wheel")
+            .expect_err("command failure");
+        match error {
+            FlashInferError::EmbeddedWheelCache { source, .. } => {
+                assert!(source.to_string().contains("status"));
+                assert!(source.to_string().contains("failed"));
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
     }
 
     #[test]
