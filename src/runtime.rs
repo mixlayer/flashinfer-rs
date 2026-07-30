@@ -27,6 +27,7 @@ const FLASHINFER_NORM_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/norm/nor
 const FLASHINFER_GDN_PREFILL_SM90_SO_SUFFIX: &str =
     "flashinfer_jit_cache/jit_cache/gdn_prefill_sm90/gdn_prefill_sm90.so";
 const FLASHINFER_PAGE_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/page/page.so";
+const FLASHINFER_SAMPLING_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/sampling/sampling.so";
 const TVMFFI_SO_MEMBER: &str = "tvm_ffi/lib/libtvm_ffi.so";
 const WHEEL_CACHE_DIR_NAME: &str = "wheels";
 
@@ -102,6 +103,7 @@ struct ExtractedArtifacts {
     norm_so_path: PathBuf,
     gdn_prefill_sm90_so_path: PathBuf,
     page_so_path: PathBuf,
+    sampling_so_path: PathBuf,
     tvmffi_so_path: PathBuf,
 }
 
@@ -162,6 +164,35 @@ struct LoadedBatchMlaKernel {
     fns: BatchMlaKernelFns,
 }
 
+#[derive(Clone, Copy)]
+struct SamplingKernelFns {
+    softmax: TVMFFISafeCallFn,
+    sampling_from_probs: TVMFFISafeCallFn,
+    sampling_from_logits: TVMFFISafeCallFn,
+    top_p_sampling_from_probs: TVMFFISafeCallFn,
+    top_k_sampling_from_probs: TVMFFISafeCallFn,
+    min_p_sampling_from_probs: TVMFFISafeCallFn,
+    top_k_top_p_sampling_from_probs: TVMFFISafeCallFn,
+    top_p_renorm_probs: TVMFFISafeCallFn,
+    top_k_renorm_probs: TVMFFISafeCallFn,
+    top_k_mask_logits: TVMFFISafeCallFn,
+    _chain_speculative_sampling: TVMFFISafeCallFn,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SamplingKernel {
+    Softmax,
+    SamplingFromProbs,
+    SamplingFromLogits,
+    TopPSamplingFromProbs,
+    TopKSamplingFromProbs,
+    MinPSamplingFromProbs,
+    TopKTopPSamplingFromProbs,
+    TopPRenormProbs,
+    TopKRenormProbs,
+    TopKMaskLogits,
+}
+
 pub struct FlashInferRuntime {
     resolved: ResolvedRuntimeConfig,
     jit_cache_wheel_path: PathBuf,
@@ -170,6 +201,7 @@ pub struct FlashInferRuntime {
     _norm_lib: Library,
     _gdn_prefill_sm90_lib: Library,
     _page_lib: Library,
+    _sampling_lib: Library,
     _tvmffi_get_version: TVMFFIGetVersionFn,
     tvmffi_env_set_stream: TVMFFIEnvSetStreamFn,
     tvmffi_error_move_from_raised: TVMFFIErrorMoveFromRaisedFn,
@@ -184,6 +216,7 @@ pub struct FlashInferRuntime {
     tvm_ffi_gdn_prefill: TVMFFISafeCallFn,
     tvm_ffi_append_paged_kv_cache: TVMFFISafeCallFn,
     tvm_ffi_append_paged_mla_kv_cache: TVMFFISafeCallFn,
+    sampling_fns: SamplingKernelFns,
     single_prefill_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
     batch_prefill_kernel_cache: Mutex<HashMap<String, LoadedBatchPrefillKernel>>,
     single_decode_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
@@ -360,6 +393,35 @@ impl FlashInferRuntime {
         let code = unsafe {
             (self.tvm_ffi_append_paged_mla_kv_cache)(std::ptr::null_mut(), args, num_args, result)
         };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_sampling(
+        &self,
+        kernel: SamplingKernel,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        let function = match kernel {
+            SamplingKernel::Softmax => self.sampling_fns.softmax,
+            SamplingKernel::SamplingFromProbs => self.sampling_fns.sampling_from_probs,
+            SamplingKernel::SamplingFromLogits => self.sampling_fns.sampling_from_logits,
+            SamplingKernel::TopPSamplingFromProbs => self.sampling_fns.top_p_sampling_from_probs,
+            SamplingKernel::TopKSamplingFromProbs => self.sampling_fns.top_k_sampling_from_probs,
+            SamplingKernel::MinPSamplingFromProbs => self.sampling_fns.min_p_sampling_from_probs,
+            SamplingKernel::TopKTopPSamplingFromProbs => {
+                self.sampling_fns.top_k_top_p_sampling_from_probs
+            }
+            SamplingKernel::TopPRenormProbs => self.sampling_fns.top_p_renorm_probs,
+            SamplingKernel::TopKRenormProbs => self.sampling_fns.top_k_renorm_probs,
+            SamplingKernel::TopKMaskLogits => self.sampling_fns.top_k_mask_logits,
+        };
+        // SAFETY: every symbol has TVMFFISafeCallType and arguments are validated by callers.
+        let code = unsafe { function(std::ptr::null_mut(), args, num_args, result) };
         if code == 0 {
             return Ok(());
         }
@@ -960,6 +1022,17 @@ impl FlashInferRuntime {
             message: e.to_string(),
         })?;
 
+        let sampling_lib = unsafe {
+            Library::open(
+                Some(&artifacts.sampling_so_path),
+                libc::RTLD_NOW | libc::RTLD_LOCAL,
+            )
+        }
+        .map_err(|e| FlashInferError::LibraryLoad {
+            library: artifacts.sampling_so_path.clone(),
+            message: e.to_string(),
+        })?;
+
         let tvmffi_get_version: TVMFFIGetVersionFn = unsafe {
             resolve_symbol(
                 &tvmffi_lib,
@@ -1096,6 +1169,97 @@ impl FlashInferRuntime {
             )?
         };
 
+        let sampling_fns = SamplingKernelFns {
+            softmax: unsafe {
+                resolve_symbol(
+                    &sampling_lib,
+                    &artifacts.sampling_so_path,
+                    b"__tvm_ffi_softmax\0",
+                    "__tvm_ffi_softmax",
+                )?
+            },
+            sampling_from_probs: unsafe {
+                resolve_symbol(
+                    &sampling_lib,
+                    &artifacts.sampling_so_path,
+                    b"__tvm_ffi_sampling_from_probs\0",
+                    "__tvm_ffi_sampling_from_probs",
+                )?
+            },
+            sampling_from_logits: unsafe {
+                resolve_symbol(
+                    &sampling_lib,
+                    &artifacts.sampling_so_path,
+                    b"__tvm_ffi_sampling_from_logits\0",
+                    "__tvm_ffi_sampling_from_logits",
+                )?
+            },
+            top_p_sampling_from_probs: unsafe {
+                resolve_symbol(
+                    &sampling_lib,
+                    &artifacts.sampling_so_path,
+                    b"__tvm_ffi_top_p_sampling_from_probs\0",
+                    "__tvm_ffi_top_p_sampling_from_probs",
+                )?
+            },
+            top_k_sampling_from_probs: unsafe {
+                resolve_symbol(
+                    &sampling_lib,
+                    &artifacts.sampling_so_path,
+                    b"__tvm_ffi_top_k_sampling_from_probs\0",
+                    "__tvm_ffi_top_k_sampling_from_probs",
+                )?
+            },
+            min_p_sampling_from_probs: unsafe {
+                resolve_symbol(
+                    &sampling_lib,
+                    &artifacts.sampling_so_path,
+                    b"__tvm_ffi_min_p_sampling_from_probs\0",
+                    "__tvm_ffi_min_p_sampling_from_probs",
+                )?
+            },
+            top_k_top_p_sampling_from_probs: unsafe {
+                resolve_symbol(
+                    &sampling_lib,
+                    &artifacts.sampling_so_path,
+                    b"__tvm_ffi_top_k_top_p_sampling_from_probs\0",
+                    "__tvm_ffi_top_k_top_p_sampling_from_probs",
+                )?
+            },
+            top_p_renorm_probs: unsafe {
+                resolve_symbol(
+                    &sampling_lib,
+                    &artifacts.sampling_so_path,
+                    b"__tvm_ffi_top_p_renorm_probs\0",
+                    "__tvm_ffi_top_p_renorm_probs",
+                )?
+            },
+            top_k_renorm_probs: unsafe {
+                resolve_symbol(
+                    &sampling_lib,
+                    &artifacts.sampling_so_path,
+                    b"__tvm_ffi_top_k_renorm_probs\0",
+                    "__tvm_ffi_top_k_renorm_probs",
+                )?
+            },
+            top_k_mask_logits: unsafe {
+                resolve_symbol(
+                    &sampling_lib,
+                    &artifacts.sampling_so_path,
+                    b"__tvm_ffi_top_k_mask_logits\0",
+                    "__tvm_ffi_top_k_mask_logits",
+                )?
+            },
+            _chain_speculative_sampling: unsafe {
+                resolve_symbol(
+                    &sampling_lib,
+                    &artifacts.sampling_so_path,
+                    b"__tvm_ffi_chain_speculative_sampling\0",
+                    "__tvm_ffi_chain_speculative_sampling",
+                )?
+            },
+        };
+
         let mut version = TVMFFIVersion {
             major: 0,
             minor: 0,
@@ -1134,6 +1298,7 @@ impl FlashInferRuntime {
             _norm_lib: norm_lib,
             _gdn_prefill_sm90_lib: gdn_prefill_sm90_lib,
             _page_lib: page_lib,
+            _sampling_lib: sampling_lib,
             _tvmffi_get_version: tvmffi_get_version,
             tvmffi_env_set_stream,
             tvmffi_error_move_from_raised,
@@ -1148,6 +1313,7 @@ impl FlashInferRuntime {
             tvm_ffi_gdn_prefill,
             tvm_ffi_append_paged_kv_cache,
             tvm_ffi_append_paged_mla_kv_cache,
+            sampling_fns,
             single_prefill_kernel_cache: Mutex::new(HashMap::new()),
             batch_prefill_kernel_cache: Mutex::new(HashMap::new()),
             single_decode_kernel_cache: Mutex::new(HashMap::new()),
@@ -1734,6 +1900,15 @@ fn extract_artifacts(
         )?;
     }
 
+    let sampling_so_path = artifact_dir.join("sampling.so");
+    if !sampling_so_path.exists() {
+        extract_member_from_wheel_by_suffix(
+            &materialized_wheels.jit_cache_wheel_path,
+            FLASHINFER_SAMPLING_SO_SUFFIX,
+            &sampling_so_path,
+        )?;
+    }
+
     let tvmffi_so_path = artifact_dir.join("libtvm_ffi.so");
     if !tvmffi_so_path.exists() {
         extract_member_from_wheel_exact(
@@ -1750,6 +1925,7 @@ fn extract_artifacts(
         norm_so_path,
         gdn_prefill_sm90_so_path,
         page_so_path,
+        sampling_so_path,
         tvmffi_so_path,
     })
 }

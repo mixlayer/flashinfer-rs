@@ -10,6 +10,7 @@ pub mod mla_batch_paged;
 pub mod norm;
 pub mod paged_kv_append;
 pub mod runtime;
+pub mod sampling;
 
 pub use error::FlashInferError;
 pub use fused_moe::{
@@ -88,3 +89,21 @@ pub use paged_kv_append::{
 #[cfg(feature = "cudarc")]
 pub use paged_kv_append::{append_paged_kv_cache_cudarc, append_paged_mla_kv_cache_cudarc};
 pub use runtime::{FlashInferRuntime, RuntimeConfig};
+pub use sampling::{
+    MinPSamplingParams, SAMPLING_WORKSPACE_BYTES, SamplingFromLogitsParams,
+    SamplingFromProbsParams, SamplingParams, SamplingRandomParams, SamplingSoftmaxParams,
+    SamplingTensor1DF32Desc, SamplingTensor1DI32Desc, SamplingTensor1DU64Desc,
+    SamplingTensor2DF32Desc, SamplingWorkspaceDesc, TopKMaskLogitsParams, TopKRenormParams,
+    TopKSamplingParams, TopKTopPSamplingParams, TopPRenormParams, TopPSamplingParams,
+    min_p_sampling_from_probs, sampling_from_logits, sampling_from_probs, sampling_softmax,
+    top_k_mask_logits, top_k_renorm_probs, top_k_sampling_from_probs,
+    top_k_top_p_sampling_from_probs, top_p_renorm_probs, top_p_sampling_from_probs,
+};
+#[cfg(feature = "cudarc")]
+pub use sampling::{
+    SamplingCudarcRandom, min_p_sampling_from_probs_cudarc, sampling_from_logits_cudarc,
+    sampling_from_probs_cudarc, sampling_softmax_cudarc, top_k_mask_logits_cudarc,
+    top_k_renorm_probs_cudarc, top_k_sampling_from_probs_cudarc,
+    top_k_top_p_sampling_from_probs_cudarc, top_p_renorm_probs_cudarc,
+    top_p_sampling_from_probs_cudarc,
+};

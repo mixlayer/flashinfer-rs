@@ -13,6 +13,7 @@ Rust-first integration for calling precompiled FlashInfer kernels through TVM-FF
 - MHA batched paged decode (`batch_decode_with_kv_cache`) via on-demand JIT-cache module loading
 - CUTLASS fused MoE (`fused_moe_{90,100,103,120}`) via on-demand JIT-cache module loading
 - Paged KV append (`append_paged_kv_cache`) and paged MLA KV append (`append_paged_mla_kv_cache`) from `page.so`
+- FP32 sampling, filtering, renormalization, masking, and softmax kernels from `sampling.so`
 - Pure Rust TVM-FFI ABI packing and dynamic loading
 - Optional `cudarc` convenience wrappers
 
@@ -69,6 +70,11 @@ Runtime flow:
 2. Existing cached wheel files are SHA256-validated and rewritten if mismatched.
 3. Required `.so` members are extracted from cached wheel files into:
    - `~/.cache/flashinfer-rs/<artifact-hash>/`
+
+The FlashInfer JIT-cache matrix is pinned to `0.6.4+cu130` for both CUDA
+13.0 and CUDA 13.1 metadata keys. Sampling uses the 0.6.4 optional
+device-resident U64 seed/offset tensor ABI, with scalar values retained as
+fallbacks.
 
 Runtime env vars:
 
