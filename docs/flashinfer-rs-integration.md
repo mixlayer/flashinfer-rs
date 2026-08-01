@@ -6,6 +6,7 @@ A Python wheel (`*.whl`) is a zip archive that carries prebuilt artifacts. For t
 - `flashinfer_jit_cache/.../jit_cache/norm/norm.so`
 - `flashinfer_jit_cache/.../jit_cache/gdn_prefill_sm90/gdn_prefill_sm90.so`
 - `flashinfer_jit_cache/.../jit_cache/page/page.so`
+- `flashinfer_jit_cache/.../jit_cache/sampling/sampling.so`
 - `flashinfer_jit_cache/.../jit_cache/single_prefill_with_kv_cache_.../single_prefill_with_kv_cache_....so`
 - `flashinfer_jit_cache/.../jit_cache/batch_prefill_with_kv_cache_.../batch_prefill_with_kv_cache_....so`
 - `flashinfer_jit_cache/.../jit_cache/single_decode_with_kv_cache_.../single_decode_with_kv_cache_....so`
@@ -55,6 +56,7 @@ The Rust integration calls the exported TVM-FFI host wrapper:
 - `__tvm_ffi_gdn_prefill`
 - `__tvm_ffi_append_paged_kv_cache` (from fixed `page.so`)
 - `__tvm_ffi_append_paged_mla_kv_cache` (from fixed `page.so`)
+- `__tvm_ffi_softmax`, sampling/filtering functions, and renormalization/masking functions (from fixed `sampling.so`)
 - `__tvm_ffi_run` (for `single_prefill_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_plan`, `__tvm_ffi_ragged_run`, and `__tvm_ffi_paged_run` (for `batch_prefill_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_run` (for `single_decode_with_kv_cache` JIT-cache modules)
@@ -66,7 +68,7 @@ This wrapper handles argument decoding, validation, stream lookup, and dispatch 
 ## Dependency/artifact matrix
 Pinned v1 artifacts:
 
-- `flashinfer_jit_cache 0.6.3+cu130` pins for both `cu130` and `cu131` metadata keys (`x86_64` and `aarch64`)
+- `flashinfer_jit_cache 0.6.4+cu130` pins for both `cu130` and `cu131` metadata keys (`x86_64` and `aarch64`)
 - `apache_tvm_ffi 0.1.3` pins for both `cu130` and `cu131` metadata keys (`x86_64` and `aarch64`)
 
 Runtime loading order:
@@ -75,10 +77,25 @@ Runtime loading order:
 2. Load `norm.so` with `RTLD_NOW | RTLD_LOCAL`
 3. Load `gdn_prefill_sm90.so` with `RTLD_NOW | RTLD_LOCAL`
 4. Load `page.so` with `RTLD_NOW | RTLD_LOCAL`
-5. Load `single_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
-6. Load `batch_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
-7. Load `single_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
-8. Load `batch_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+5. Load `sampling.so` with `RTLD_NOW | RTLD_LOCAL`
+6. Load `single_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+7. Load `batch_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+8. Load `single_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+9. Load `batch_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+
+## Sampling RNG ABI
+
+FlashInfer 0.6.4 sampling entry points accept optional device-resident U64
+seed and offset tensors in addition to scalar fallbacks. The Rust core API
+represents these as caller-owned `SamplingTensor1DU64Desc` values, and the
+`cudarc` wrapper accepts borrowed `CudaSlice<u64>` values. Both tensors must be
+present together, contiguous, on the input device, the same length, and have
+length one or `output_batch`.
+
+The pinned 0.6.4 CUDA implementation currently reads element zero from each
+tensor. The batch-length form is accepted for parity with upstream validation;
+its main benefit is mutable device-side RNG state for CUDA Graph replay, not a
+different seed/offset per output row.
 
 Required CUDA runtime dependency from `norm.so`:
 
@@ -103,7 +120,7 @@ Implementation behavior:
 
 1. Set stream and capture `old_stream`.
 2. Create `StreamRestoreGuard`.
-3. Launch wrapper (`__tvm_ffi_gemma_rmsnorm` / `__tvm_ffi_gdn_prefill` / `__tvm_ffi_append_paged_kv_cache` / `__tvm_ffi_run`).
+3. Launch wrapper (`__tvm_ffi_gemma_rmsnorm` / `__tvm_ffi_gdn_prefill` / sampling symbols / `__tvm_ffi_append_paged_kv_cache` / `__tvm_ffi_run`).
 4. Call `restore_now()` to surface stream-restore errors explicitly.
 5. If control exits early, `Drop` performs a best-effort restore.
 
