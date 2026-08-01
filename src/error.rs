@@ -109,6 +109,26 @@ pub enum FlashInferError {
 
     #[error("runtime has already been initialized with a different configuration")]
     RuntimeAlreadyInitialized,
+
+    #[error("FlashInfer cubin cache I/O failed at `{path}`")]
+    CubinCache {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to download FlashInfer cubin from `{url}`: {message}")]
+    CubinDownload { url: String, message: String },
+
+    #[error("FlashInfer cubin checksum mismatch at `{path}`: expected {expected}, found {found}")]
+    CubinChecksumMismatch {
+        path: PathBuf,
+        expected: String,
+        found: String,
+    },
+
+    #[error("CUDA device-to-device copy failed (code {code})")]
+    CudaCopy { code: i32 },
 }
 
 impl FlashInferError {

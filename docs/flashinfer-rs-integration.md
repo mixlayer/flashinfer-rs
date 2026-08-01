@@ -11,6 +11,7 @@ A Python wheel (`*.whl`) is a zip archive that carries prebuilt artifacts. For t
 - `flashinfer_jit_cache/.../jit_cache/batch_prefill_with_kv_cache_.../batch_prefill_with_kv_cache_....so`
 - `flashinfer_jit_cache/.../jit_cache/single_decode_with_kv_cache_.../single_decode_with_kv_cache_....so`
 - `flashinfer_jit_cache/.../jit_cache/batch_decode_with_kv_cache_.../batch_decode_with_kv_cache_....so`
+- `flashinfer_jit_cache/.../jit_cache/fused_moe_trtllm_sm100/fused_moe_trtllm_sm100.so`
 - `tvm_ffi/lib/libtvm_ffi.so`
 
 No Python runtime is required for calling `gemma_rmsnorm` once the `.so` files are extracted.
@@ -62,6 +63,7 @@ The Rust integration calls the exported TVM-FFI host wrapper:
 - `__tvm_ffi_run` (for `single_decode_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_plan` and `__tvm_ffi_run` (for `batch_decode_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_init` (for `fused_moe_{90,100,103,120}` JIT-cache modules; `run_moe` resolved from returned module)
+- `__tvm_ffi_trtllm_fp8_block_scale_moe` (for the SM100 TensorRT-LLM Gen MoE module)
 
 This wrapper handles argument decoding, validation, stream lookup, and dispatch to the correct kernel implementation.
 
@@ -82,6 +84,25 @@ Runtime loading order:
 7. Load `batch_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
 8. Load `single_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
 9. Load `batch_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+10. Load `fused_moe_trtllm_sm100` on demand and install its synchronous cubin callback
+
+## SM100 TensorRT-LLM Gen MoE
+
+The `trtllm_gen_fp8_block_scale_moe_sm100` API binds the dedicated Blackwell launcher rather
+than the CUTLASS `fused_moe_100` backend. It accepts FP8 E4M3 activations and MajorK expert
+weights, F32 DeepSeek block scales, F32 router logits with optional correction bias, and writes
+BF16 output. Routing is performed inside the launcher using the DeepSeekV3 grouped-routing mode.
+
+The pinned 0.6.4 host ABI has 25 arguments, including the final `Fp8QuantizationType` value. Its
+launcher currently allocates and returns a BF16 tensor even though an output tensor is supplied;
+the Rust binding therefore enqueues a device-to-device copy from that returned tensor to the
+caller-owned output on the same CUDA stream.
+
+This module loads TensorRT-LLM Gen cubins on demand through `FlashInferSetCubinCallback`. Cubins
+are downloaded synchronously, checksum-verified, and cached under
+`<cache_dir>/cubins/`. `FLASHINFER_CUBIN_DIR` overrides that directory and
+`FLASHINFER_CUBINS_REPOSITORY` overrides the default NVIDIA repository root. The callback rejects
+absolute paths and traversal components before accessing the cache.
 
 ## Sampling RNG ABI
 
