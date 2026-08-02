@@ -11,6 +11,7 @@ pub mod norm;
 pub mod paged_kv_append;
 pub mod runtime;
 pub mod sampling;
+pub mod trtllm_allreduce;
 pub mod trtllm_gen_moe;
 
 pub use error::FlashInferError;
@@ -107,6 +108,16 @@ pub use sampling::{
     top_k_renorm_probs_cudarc, top_k_sampling_from_probs_cudarc,
     top_k_top_p_sampling_from_probs_cudarc, top_p_renorm_probs_cudarc,
     top_p_sampling_from_probs_cudarc,
+};
+#[cfg(feature = "cudarc")]
+pub use trtllm_allreduce::{
+    TrtllmAllReduceBf16CudarcOptions, trtllm_allreduce_bf16_in_place_cudarc,
+    trtllm_lamport_initialize_bf16_cudarc,
+};
+pub use trtllm_allreduce::{
+    TrtllmAllReduceBf16Params, TrtllmAllReduceBf16TensorDesc, TrtllmAllReduceWorkspaceDesc,
+    TrtllmLamportInitializeBf16Params, trtllm_allreduce_bf16_in_place,
+    trtllm_lamport_initialize_bf16,
 };
 #[cfg(feature = "cudarc")]
 pub use trtllm_gen_moe::{
