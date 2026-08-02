@@ -7,6 +7,7 @@ A Python wheel (`*.whl`) is a zip archive that carries prebuilt artifacts. For t
 - `flashinfer_jit_cache/.../jit_cache/gdn_prefill_sm90/gdn_prefill_sm90.so`
 - `flashinfer_jit_cache/.../jit_cache/page/page.so`
 - `flashinfer_jit_cache/.../jit_cache/sampling/sampling.so`
+- `flashinfer_jit_cache/.../jit_cache/trtllm_comm/trtllm_comm.so`
 - `flashinfer_jit_cache/.../jit_cache/single_prefill_with_kv_cache_.../single_prefill_with_kv_cache_....so`
 - `flashinfer_jit_cache/.../jit_cache/batch_prefill_with_kv_cache_.../batch_prefill_with_kv_cache_....so`
 - `flashinfer_jit_cache/.../jit_cache/single_decode_with_kv_cache_.../single_decode_with_kv_cache_....so`
@@ -64,6 +65,8 @@ The Rust integration calls the exported TVM-FFI host wrapper:
 - `__tvm_ffi_plan` and `__tvm_ffi_run` (for `batch_decode_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_init` (for `fused_moe_{90,100,103,120}` JIT-cache modules; `run_moe` resolved from returned module)
 - `__tvm_ffi_trtllm_fp8_block_scale_moe` (for the SM100 TensorRT-LLM Gen MoE module)
+- `__tvm_ffi_trtllm_allreduce_fusion` and `__tvm_ffi_trtllm_lamport_initialize`
+  (from fixed `trtllm_comm.so`)
 
 This wrapper handles argument decoding, validation, stream lookup, and dispatch to the correct kernel implementation.
 
@@ -80,11 +83,24 @@ Runtime loading order:
 3. Load `gdn_prefill_sm90.so` with `RTLD_NOW | RTLD_LOCAL`
 4. Load `page.so` with `RTLD_NOW | RTLD_LOCAL`
 5. Load `sampling.so` with `RTLD_NOW | RTLD_LOCAL`
-6. Load `single_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
-7. Load `batch_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
-8. Load `single_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
-9. Load `batch_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
-10. Load `fused_moe_trtllm_sm100` on demand and install its synchronous cubin callback
+6. Load `trtllm_comm.so` with `RTLD_NOW | RTLD_LOCAL`
+7. Load `single_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+8. Load `batch_prefill_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+9. Load `single_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+10. Load `batch_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
+11. Load `fused_moe_trtllm_sm100` on demand and install its synchronous cubin callback
+
+## TensorRT-LLM BF16 All-Reduce Fusion
+
+The all-reduce API binds the fixed 21-argument
+`__tvm_ffi_trtllm_allreduce_fusion` ABI. Separate Rust parameter types expose
+plain in-place all-reduce (`kAllReduce`) and fused all-reduce, residual
+addition, and RMSNorm (`kARResidualRMSNorm`). The fused operation accepts
+distinct contiguous BF16 `[tokens, hidden]` input/residual/output tensors and a
+BF16 `[hidden]` gamma tensor, and fully initializes both residual and normalized
+outputs asynchronously on the caller's stream. Both operations reuse the same
+caller-owned CUDA IPC workspace and preserve the explicitly selected one-shot
+or two-shot algorithm without fallback.
 
 ## SM100 TensorRT-LLM Gen MoE
 

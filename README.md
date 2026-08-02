@@ -14,7 +14,7 @@ Rust-first integration for calling precompiled FlashInfer kernels through TVM-FF
 - CUTLASS fused MoE (`fused_moe_{90,100,103,120}`) via on-demand JIT-cache module loading
 - Paged KV append (`append_paged_kv_cache`) and paged MLA KV append (`append_paged_mla_kv_cache`) from `page.so`
 - FP32 sampling, filtering, renormalization, masking, and softmax kernels from `sampling.so`
-- TensorRT-LLM standalone BF16 all-reduce and Lamport initialization from `trtllm_comm.so`
+- TensorRT-LLM BF16 all-reduce, fused residual/RMSNorm, and Lamport initialization from `trtllm_comm.so`
 - Pure Rust TVM-FFI ABI packing and dynamic loading
 - Optional `cudarc` convenience wrappers
 
@@ -160,6 +160,31 @@ trtllm_allreduce_bf16_in_place_cudarc(
         use_oneshot: true,
         ..Default::default()
     },
+)?;
+```
+
+The same workspace supports the fused decoder-boundary operation. It writes
+both the updated residual and its RMS-normalized value:
+
+```rust
+use flashinfer_rs::trtllm_allreduce_residual_rmsnorm_bf16_cudarc;
+
+trtllm_allreduce_residual_rmsnorm_bf16_cudarc(
+    stream.as_ref(),
+    &rank_local_output_bf16,
+    &residual_input_bf16,
+    &mut residual_output_bf16,
+    &mut norm_output_bf16,
+    &rms_gamma_bf16,
+    1e-5,
+    &workspace_ptrs_i64,
+    tokens,
+    hidden_size,
+    world_size,
+    rank,
+    workspace_max_tokens,
+    workspace_hidden_size,
+    TrtllmAllReduceBf16CudarcOptions::default(),
 )?;
 ```
 

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DeviceSlice, sys};
 use flashinfer_rs::{
     TrtllmAllReduceBf16CudarcOptions, trtllm_allreduce_bf16_in_place_cudarc,
-    trtllm_lamport_initialize_bf16_cudarc,
+    trtllm_allreduce_residual_rmsnorm_bf16_cudarc, trtllm_lamport_initialize_bf16_cudarc,
 };
 
 fn should_run_gpu_tests() -> bool {
@@ -169,6 +169,48 @@ fn run_allreduce_rank(rank: usize, coord_dir: &Path) {
     .expect("launch all-reduce");
     let output = stream.clone_dtoh(&input).expect("copy all-reduce output");
     assert!(output.iter().all(|value| *value == 0x4040));
+
+    let fused_input = stream
+        .clone_htod(&vec![input_bits; message_elements])
+        .expect("copy fused rank input");
+    let residual_input = stream
+        .clone_htod(&vec![0x3f80_u16; message_elements])
+        .expect("copy fused residual input");
+    let mut residual_output = stream
+        .alloc_zeros::<u16>(message_elements)
+        .expect("allocate fused residual output");
+    let mut norm_output = stream
+        .alloc_zeros::<u16>(message_elements)
+        .expect("allocate fused norm output");
+    let rms_gamma = stream
+        .clone_htod(&vec![0x3f80_u16; hidden_size])
+        .expect("copy RMSNorm gamma");
+    trtllm_allreduce_residual_rmsnorm_bf16_cudarc(
+        stream.as_ref(),
+        &fused_input,
+        &residual_input,
+        &mut residual_output,
+        &mut norm_output,
+        &rms_gamma,
+        1e-5,
+        &workspace,
+        tokens,
+        hidden_size,
+        world_size,
+        rank,
+        tokens,
+        hidden_size,
+        TrtllmAllReduceBf16CudarcOptions::default(),
+    )
+    .expect("launch fused all-reduce/residual/RMSNorm");
+    let residual_output = stream
+        .clone_dtoh(&residual_output)
+        .expect("copy fused residual output");
+    let norm_output = stream
+        .clone_dtoh(&norm_output)
+        .expect("copy fused norm output");
+    assert!(residual_output.iter().all(|value| *value == 0x4080));
+    assert!(norm_output.iter().all(|value| *value == 0x3f80));
 
     let done_path = coord_dir.join(format!("done-{rank}"));
     fs::write(&done_path, []).expect("write done marker");

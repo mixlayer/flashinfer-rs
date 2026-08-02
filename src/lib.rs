@@ -112,12 +112,13 @@ pub use sampling::{
 #[cfg(feature = "cudarc")]
 pub use trtllm_allreduce::{
     TrtllmAllReduceBf16CudarcOptions, trtllm_allreduce_bf16_in_place_cudarc,
-    trtllm_lamport_initialize_bf16_cudarc,
+    trtllm_allreduce_residual_rmsnorm_bf16_cudarc, trtllm_lamport_initialize_bf16_cudarc,
 };
 pub use trtllm_allreduce::{
-    TrtllmAllReduceBf16Params, TrtllmAllReduceBf16TensorDesc, TrtllmAllReduceWorkspaceDesc,
+    TrtllmAllReduceBf16Params, TrtllmAllReduceBf16TensorDesc, TrtllmAllReduceBf16VectorDesc,
+    TrtllmAllReduceResidualRmsNormBf16Params, TrtllmAllReduceWorkspaceDesc,
     TrtllmLamportInitializeBf16Params, trtllm_allreduce_bf16_in_place,
-    trtllm_lamport_initialize_bf16,
+    trtllm_allreduce_residual_rmsnorm_bf16, trtllm_lamport_initialize_bf16,
 };
 #[cfg(feature = "cudarc")]
 pub use trtllm_gen_moe::{
