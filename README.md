@@ -67,10 +67,14 @@ Build flow:
 
 Runtime flow:
 
-1. Runtime downloads pinned wheels into `~/.cache/flashinfer-rs/wheels/` (or `FLASHINFER_RS_CACHE_DIR/wheels/`) on cache miss.
-2. Existing cached wheel files are SHA256-validated and rewritten if mismatched.
-3. Required `.so` members are extracted from cached wheel files into:
+1. `prefetch_pinned_wheels` is the supported build/bootstrap entry point for materializing the pinned FlashInfer JIT-cache and TVM-FFI wheels before CUDA is initialized.
+2. The writable primary cache stores downloaded fallback wheels, extracted `.so` files, and default cubins.
+3. An optional read-only seed cache can provide Docker-baked wheels using the same `wheels/<sha256>-<filename>` layout as the primary cache.
+4. Wheel lookup order is primary, seed, network; every candidate is SHA256-validated before use.
+5. Runtime initialization repeats the same wheel check as a fallback if prefetch was skipped or the primary cache changed.
+6. Required `.so` members are extracted from cached wheel files into:
    - `~/.cache/flashinfer-rs/<artifact-hash>/`
+7. First inference may still extract/load a shape-specific module from the local wheel, but should not download wheels after a successful prefetch.
 
 The FlashInfer JIT-cache matrix is pinned to `0.6.4+cu130` for both CUDA
 13.0 and CUDA 13.1 metadata keys. Sampling uses the 0.6.4 optional
@@ -80,16 +84,19 @@ fallbacks.
 Runtime env vars:
 
 - `FLASHINFER_RS_CACHE_DIR`
+- `FLASHINFER_RS_SEED_CACHE_DIR`
 
 ## Quick Start
 
 1. Build the crate.
-2. Initialize runtime once:
+2. Optionally prefetch pinned wheels before CUDA/runtime initialization, then initialize runtime once:
 
 ```rust
-use flashinfer_rs::{FlashInferRuntime, RuntimeConfig};
+use flashinfer_rs::{FlashInferRuntime, RuntimeConfig, prefetch_pinned_wheels};
 
-let _rt = FlashInferRuntime::initialize(RuntimeConfig::default())?;
+let config = RuntimeConfig::default();
+prefetch_pinned_wheels(config.clone())?;
+let _rt = FlashInferRuntime::initialize(config)?;
 ```
 
 3. Call kernels through typed APIs.

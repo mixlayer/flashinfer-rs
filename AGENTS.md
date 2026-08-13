@@ -56,6 +56,11 @@ This file documents the expected process for adding new FlashInfer kernel bindin
 - If symbol is fixed: resolve during runtime init and store function pointer.
 - If symbol is variant-dependent: lazy extract/load by URI and cache library+function pointer for process lifetime.
 - Keep wheel cache under `<cache_dir>/wheels/<sha256>-<filename>` with lock-file protection and SHA256 verification.
+- `prefetch_pinned_wheels` is the supported build/bootstrap entry point for materializing the pinned wheels without initializing CUDA or loading shared libraries.
+- The primary cache is writable and contains downloaded fallback wheels, extracted `.so` files, and default cubins.
+- The optional seed cache is read-only, configured by `FLASHINFER_RS_SEED_CACHE_DIR`, and uses the same `wheels/<sha256>-<filename>` layout.
+- Wheel lookup order is primary, seed, network; every primary and seed candidate must be SHA256-validated before use.
+- Runtime initialization must keep the same wheel materialization check as a fallback. First inference may still extract/load a shape-specific module from the local wheel, but should not download wheels after successful prefetch.
 - On checksum mismatch, rewrite the cached wheel from the pinned URL.
 - Keep wheel download logic synchronous and streaming; do not introduce async runtime dependencies.
 - Keep `libtvm_ffi.so` loaded first with `RTLD_GLOBAL`.
@@ -137,7 +142,7 @@ Primary files to inspect:
 ## Gotchas and Notes for Future Bindings
 
 - Wheel naming does not guarantee architecture suffix in URI; always inspect actual wheel members.
-- `build.rs` no longer downloads wheels; first runtime initialization on a cold cache performs network download and may block.
+- `build.rs` no longer downloads wheels; use `prefetch_pinned_wheels` during build/bootstrap to avoid wheel downloads on first runtime initialization.
 - A generic host symbol (`__tvm_ffi_run`) can correspond to different ABI shapes across module families.
 - Do not infer ABI from cubin symbols; use host binding sources.
 - Optional parameters often map to `None`/null tensor slots and must preserve positional ABI.

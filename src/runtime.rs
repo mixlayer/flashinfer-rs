@@ -25,6 +25,7 @@ use crate::ffi::{
 include!(concat!(env!("OUT_DIR"), "/embedded_wheels.rs"));
 
 const ENV_CACHE_DIR: &str = "FLASHINFER_RS_CACHE_DIR";
+const ENV_SEED_CACHE_DIR: &str = "FLASHINFER_RS_SEED_CACHE_DIR";
 const ENV_CUBIN_DIR: &str = "FLASHINFER_CUBIN_DIR";
 const ENV_CUBIN_REPOSITORY: &str = "FLASHINFER_CUBINS_REPOSITORY";
 const DEFAULT_CUBIN_REPOSITORY: &str =
@@ -83,6 +84,7 @@ type CudaMemcpyAsyncFn =
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedRuntimeConfig {
     cache_dir: PathBuf,
+    seed_cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,20 +93,33 @@ struct CubinLoaderConfig {
     repository: String,
 }
 
+/// Runtime cache configuration for FlashInfer wheel and artifact loading.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeConfig {
+    /// Writable cache root for downloaded wheels, extracted shared libraries, and default cubins.
     pub cache_dir: Option<PathBuf>,
+    /// Optional read-only seed cache root containing pre-baked pinned wheels.
+    pub seed_cache_dir: Option<PathBuf>,
 }
 
 impl RuntimeConfig {
+    /// Reads runtime cache configuration from supported environment variables.
     pub fn from_env() -> Result<Self, FlashInferError> {
         Ok(Self {
             cache_dir: env_path(ENV_CACHE_DIR)?,
+            seed_cache_dir: env_path(ENV_SEED_CACHE_DIR)?,
         })
     }
 
+    /// Sets the writable runtime cache root.
     pub fn with_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(path.into());
+        self
+    }
+
+    /// Sets the optional read-only seed cache root for pre-baked pinned wheels.
+    pub fn with_seed_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.seed_cache_dir = Some(path.into());
         self
     }
 
@@ -116,9 +131,22 @@ impl RuntimeConfig {
         } else {
             default_cache_dir()?
         };
+        let seed_cache_dir = self.seed_cache_dir.clone().or(env_cfg.seed_cache_dir);
 
-        Ok(ResolvedRuntimeConfig { cache_dir })
+        Ok(ResolvedRuntimeConfig {
+            cache_dir,
+            seed_cache_dir,
+        })
     }
+}
+
+/// Ensures the build-selected FlashInfer JIT-cache and TVM-FFI wheels are
+/// locally available and SHA-256 valid without initializing CUDA or loading
+/// shared libraries.
+pub fn prefetch_pinned_wheels(config: RuntimeConfig) -> Result<(), FlashInferError> {
+    let resolved = config.resolve()?;
+    let _ = ensure_pinned_wheels_cached(&resolved)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1197,7 +1225,7 @@ impl FlashInferRuntime {
 
     unsafe fn load(resolved: ResolvedRuntimeConfig) -> Result<Self, FlashInferError> {
         let cubin_loader_config = resolve_cubin_loader_config(&resolved)?;
-        let materialized_wheels = ensure_pinned_wheels_cached(&resolved.cache_dir)?;
+        let materialized_wheels = ensure_pinned_wheels_cached(&resolved)?;
         let artifacts = extract_artifacts(&resolved, &materialized_wheels)?;
 
         let tvmffi_lib = unsafe {
@@ -2439,16 +2467,29 @@ fn pinned_apache_tvm_ffi_wheel() -> PinnedWheelMetadata<'static> {
     }
 }
 
-fn ensure_pinned_wheels_cached(cache_dir: &Path) -> Result<MaterializedWheels, FlashInferError> {
-    let wheels_dir = cache_dir.join(WHEEL_CACHE_DIR_NAME);
-    fs::create_dir_all(&wheels_dir).map_err(|e| FlashInferError::CreateCacheDir {
-        path: wheels_dir.clone(),
+fn ensure_pinned_wheels_cached(
+    resolved: &ResolvedRuntimeConfig,
+) -> Result<MaterializedWheels, FlashInferError> {
+    let primary_wheels_dir = resolved.cache_dir.join(WHEEL_CACHE_DIR_NAME);
+    fs::create_dir_all(&primary_wheels_dir).map_err(|e| FlashInferError::CreateCacheDir {
+        path: primary_wheels_dir.clone(),
         source: e,
     })?;
+    let seed_wheels_dir = resolved
+        .seed_cache_dir
+        .as_ref()
+        .map(|seed_cache_dir| seed_cache_dir.join(WHEEL_CACHE_DIR_NAME));
 
-    let jit_cache_wheel_path =
-        ensure_pinned_wheel_cached(&wheels_dir, pinned_flashinfer_jit_cache_wheel())?;
-    let tvmffi_wheel_path = ensure_pinned_wheel_cached(&wheels_dir, pinned_apache_tvm_ffi_wheel())?;
+    let jit_cache_wheel_path = ensure_pinned_wheel_cached(
+        &primary_wheels_dir,
+        seed_wheels_dir.as_deref(),
+        pinned_flashinfer_jit_cache_wheel(),
+    )?;
+    let tvmffi_wheel_path = ensure_pinned_wheel_cached(
+        &primary_wheels_dir,
+        seed_wheels_dir.as_deref(),
+        pinned_apache_tvm_ffi_wheel(),
+    )?;
 
     Ok(MaterializedWheels {
         jit_cache_wheel_path,
@@ -2457,22 +2498,30 @@ fn ensure_pinned_wheels_cached(cache_dir: &Path) -> Result<MaterializedWheels, F
 }
 
 fn ensure_pinned_wheel_cached(
-    wheels_dir: &Path,
+    primary_wheels_dir: &Path,
+    seed_wheels_dir: Option<&Path>,
     wheel: PinnedWheelMetadata<'_>,
 ) -> Result<PathBuf, FlashInferError> {
-    ensure_pinned_wheel_cached_with_downloader(wheels_dir, wheel, download_pinned_wheel)
+    ensure_pinned_wheel_cached_with_downloader(
+        primary_wheels_dir,
+        seed_wheels_dir,
+        wheel,
+        download_pinned_wheel,
+    )
 }
 
 fn ensure_pinned_wheel_cached_with_downloader<F>(
-    wheels_dir: &Path,
+    primary_wheels_dir: &Path,
+    seed_wheels_dir: Option<&Path>,
     wheel: PinnedWheelMetadata<'_>,
     mut downloader: F,
 ) -> Result<PathBuf, FlashInferError>
 where
     F: FnMut(&Path, PinnedWheelMetadata<'_>) -> Result<(), FlashInferError>,
 {
-    cleanup_stale_download_temps(wheels_dir, wheel);
-    let output_path = wheels_dir.join(format!("{}-{}", wheel.sha256_hex, wheel.filename));
+    cleanup_stale_download_temps(primary_wheels_dir, wheel);
+    let output_filename = format!("{}-{}", wheel.sha256_hex, wheel.filename);
+    let output_path = primary_wheels_dir.join(&output_filename);
     let lock_path = output_path.with_extension("lock");
     let lock_file = OpenOptions::new()
         .create(true)
@@ -2491,25 +2540,43 @@ where
             source: e,
         })?;
 
-    let mut needs_write = !output_path.exists();
-    if !needs_write {
+    if output_path.exists() {
         let found = sha256_file_hex(&output_path, wheel.logical_name)?;
-        needs_write = found != wheel.sha256_hex;
-    }
-
-    if needs_write {
-        if output_path.exists() {
-            fs::remove_file(&output_path).map_err(|e| FlashInferError::EmbeddedWheelCache {
-                wheel: wheel.logical_name,
-                path: output_path.clone(),
-                source: e,
-            })?;
+        if found == wheel.sha256_hex {
+            let _ = lock_file.unlock();
+            return Ok(output_path);
         }
-        downloader(&output_path, wheel)?;
+        fs::remove_file(&output_path).map_err(|e| FlashInferError::EmbeddedWheelCache {
+            wheel: wheel.logical_name,
+            path: output_path.clone(),
+            source: e,
+        })?;
     }
 
-    let _ = lock_file.unlock();
-    Ok(output_path)
+    if let Some(seed_wheels_dir) = seed_wheels_dir {
+        let seed_path = seed_wheels_dir.join(output_filename);
+        if seed_path.exists() {
+            if sha256_file_hex(&seed_path, wheel.logical_name)
+                .map(|found| found == wheel.sha256_hex)
+                .unwrap_or(false)
+            {
+                let _ = lock_file.unlock();
+                return Ok(seed_path);
+            }
+        }
+    }
+
+    match downloader(&output_path, wheel) {
+        Ok(()) => {
+            let _ = lock_file.unlock();
+            Ok(output_path)
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&output_path);
+            let _ = lock_file.unlock();
+            Err(err)
+        }
+    }
 }
 
 fn cleanup_stale_download_temps(wheels_dir: &Path, wheel: PinnedWheelMetadata<'_>) {
@@ -2986,6 +3053,7 @@ mod tests {
         DLDataType, DLDevice, DLTensor, KDL_CUDA, KDL_FLOAT, TVMFFIAny, any_bool, any_dltensor_ptr,
         any_f64, any_none,
     };
+    use std::cell::Cell;
     use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
@@ -2997,6 +3065,19 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         format!("{:x}", hasher.finalize())
+    }
+
+    fn pinned_test_wheel<'a>(filename: &'a str, sha256_hex: &'a str) -> PinnedWheelMetadata<'a> {
+        PinnedWheelMetadata {
+            logical_name: "test_wheel",
+            filename,
+            url: "https://unused.invalid/test.whl",
+            sha256_hex,
+        }
+    }
+
+    fn cached_wheel_path(wheels_dir: &Path, wheel: PinnedWheelMetadata<'_>) -> PathBuf {
+        wheels_dir.join(format!("{}-{}", wheel.sha256_hex, wheel.filename))
     }
 
     #[test]
@@ -3121,19 +3202,18 @@ mod tests {
 
         let bytes = b"wheel-bytes-v1";
         let sha = sha256_bytes_hex(bytes);
-        let wheel = PinnedWheelMetadata {
-            logical_name: "test_wheel",
-            filename: "test.whl",
-            url: "https://unused.invalid/test.whl",
-            sha256_hex: &sha,
-        };
+        let wheel = pinned_test_wheel("test.whl", &sha);
 
-        let output_path =
-            ensure_pinned_wheel_cached_with_downloader(&wheels_dir, wheel, |output_path, wheel| {
+        let output_path = ensure_pinned_wheel_cached_with_downloader(
+            &wheels_dir,
+            None,
+            wheel,
+            |output_path, wheel| {
                 let mut reader = Cursor::new(bytes.as_slice());
                 write_wheel_from_reader(&mut reader, output_path, wheel)
-            })
-            .expect("cache wheel");
+            },
+        )
+        .expect("cache wheel");
         let written = fs::read(&output_path).expect("read output");
         assert_eq!(written, bytes);
     }
@@ -3146,19 +3226,18 @@ mod tests {
 
         let bytes = b"wheel-bytes-v2";
         let sha = sha256_bytes_hex(bytes);
-        let wheel = PinnedWheelMetadata {
-            logical_name: "test_wheel",
-            filename: "reuse.whl",
-            url: "https://unused.invalid/reuse.whl",
-            sha256_hex: &sha,
-        };
+        let wheel = pinned_test_wheel("reuse.whl", &sha);
 
-        let output_path =
-            ensure_pinned_wheel_cached_with_downloader(&wheels_dir, wheel, |output_path, wheel| {
+        let output_path = ensure_pinned_wheel_cached_with_downloader(
+            &wheels_dir,
+            None,
+            wheel,
+            |output_path, wheel| {
                 let mut reader = Cursor::new(bytes.as_slice());
                 write_wheel_from_reader(&mut reader, output_path, wheel)
-            })
-            .expect("cache wheel 1");
+            },
+        )
+        .expect("cache wheel 1");
         let before = fs::metadata(&output_path)
             .expect("metadata 1")
             .modified()
@@ -3166,6 +3245,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1100));
         let output_path_2 = ensure_pinned_wheel_cached_with_downloader(
             &wheels_dir,
+            None,
             wheel,
             |_output_path, _wheel| {
                 panic!("downloader should not be called on cache hit");
@@ -3189,24 +3269,148 @@ mod tests {
 
         let bytes = b"wheel-bytes-v3";
         let sha = sha256_bytes_hex(bytes);
-        let target_path = wheels_dir.join(format!("{sha}-rewrite.whl"));
+        let wheel = pinned_test_wheel("rewrite.whl", &sha);
+        let target_path = cached_wheel_path(&wheels_dir, wheel);
         fs::write(&target_path, b"corrupt-data").expect("write corrupt");
 
-        let wheel = PinnedWheelMetadata {
-            logical_name: "test_wheel",
-            filename: "rewrite.whl",
-            url: "https://unused.invalid/rewrite.whl",
-            sha256_hex: &sha,
-        };
-
-        let output_path =
-            ensure_pinned_wheel_cached_with_downloader(&wheels_dir, wheel, |output_path, wheel| {
+        let output_path = ensure_pinned_wheel_cached_with_downloader(
+            &wheels_dir,
+            None,
+            wheel,
+            |output_path, wheel| {
                 let mut reader = Cursor::new(bytes.as_slice());
                 write_wheel_from_reader(&mut reader, output_path, wheel)
-            })
-            .expect("cache wheel");
+            },
+        )
+        .expect("cache wheel");
         let written = fs::read(&output_path).expect("read output");
         assert_eq!(written, bytes);
+    }
+
+    #[test]
+    fn ensure_pinned_wheel_cached_primary_hit_wins_over_seed() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let primary_wheels_dir = tmpdir.path().join("primary").join("wheels");
+        let seed_wheels_dir = tmpdir.path().join("seed").join("wheels");
+        fs::create_dir_all(&primary_wheels_dir).expect("create primary wheels dir");
+        fs::create_dir_all(&seed_wheels_dir).expect("create seed wheels dir");
+
+        let bytes = b"wheel-bytes-primary";
+        let sha = sha256_bytes_hex(bytes);
+        let wheel = pinned_test_wheel("primary-hit.whl", &sha);
+        fs::write(cached_wheel_path(&primary_wheels_dir, wheel), bytes).expect("write primary");
+        fs::write(cached_wheel_path(&seed_wheels_dir, wheel), b"corrupt-seed")
+            .expect("write corrupt seed");
+
+        let output_path = ensure_pinned_wheel_cached_with_downloader(
+            &primary_wheels_dir,
+            Some(&seed_wheels_dir),
+            wheel,
+            |_output_path, _wheel| {
+                panic!("downloader should not be called on primary cache hit");
+            },
+        )
+        .expect("cache wheel");
+
+        assert_eq!(output_path, cached_wheel_path(&primary_wheels_dir, wheel));
+    }
+
+    #[test]
+    fn ensure_pinned_wheel_cached_returns_valid_seed_when_primary_missing() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let primary_wheels_dir = tmpdir.path().join("primary").join("wheels");
+        let seed_wheels_dir = tmpdir.path().join("seed").join("wheels");
+        fs::create_dir_all(&primary_wheels_dir).expect("create primary wheels dir");
+        fs::create_dir_all(&seed_wheels_dir).expect("create seed wheels dir");
+
+        let bytes = b"wheel-bytes-seed";
+        let sha = sha256_bytes_hex(bytes);
+        let wheel = pinned_test_wheel("seed-hit.whl", &sha);
+        fs::write(cached_wheel_path(&seed_wheels_dir, wheel), bytes).expect("write seed");
+
+        let output_path = ensure_pinned_wheel_cached_with_downloader(
+            &primary_wheels_dir,
+            Some(&seed_wheels_dir),
+            wheel,
+            |_output_path, _wheel| {
+                panic!("downloader should not be called on seed cache hit");
+            },
+        )
+        .expect("cache wheel");
+
+        assert_eq!(output_path, cached_wheel_path(&seed_wheels_dir, wheel));
+        assert!(
+            !cached_wheel_path(&primary_wheels_dir, wheel).exists(),
+            "seed hit should not be copied into primary cache"
+        );
+    }
+
+    #[test]
+    fn ensure_pinned_wheel_cached_corrupt_primary_can_use_valid_seed() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let primary_wheels_dir = tmpdir.path().join("primary").join("wheels");
+        let seed_wheels_dir = tmpdir.path().join("seed").join("wheels");
+        fs::create_dir_all(&primary_wheels_dir).expect("create primary wheels dir");
+        fs::create_dir_all(&seed_wheels_dir).expect("create seed wheels dir");
+
+        let bytes = b"wheel-bytes-valid-seed";
+        let sha = sha256_bytes_hex(bytes);
+        let wheel = pinned_test_wheel("corrupt-primary.whl", &sha);
+        let primary_path = cached_wheel_path(&primary_wheels_dir, wheel);
+        let seed_path = cached_wheel_path(&seed_wheels_dir, wheel);
+        fs::write(&primary_path, b"corrupt-primary").expect("write corrupt primary");
+        fs::write(&seed_path, bytes).expect("write seed");
+
+        let output_path = ensure_pinned_wheel_cached_with_downloader(
+            &primary_wheels_dir,
+            Some(&seed_wheels_dir),
+            wheel,
+            |_output_path, _wheel| {
+                panic!("downloader should not be called on valid seed cache hit");
+            },
+        )
+        .expect("cache wheel");
+
+        assert_eq!(output_path, seed_path);
+        assert!(!primary_path.exists(), "corrupt primary should be removed");
+    }
+
+    #[test]
+    fn ensure_pinned_wheel_cached_corrupt_seed_downloads_primary() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let primary_wheels_dir = tmpdir.path().join("primary").join("wheels");
+        let seed_wheels_dir = tmpdir.path().join("seed").join("wheels");
+        fs::create_dir_all(&primary_wheels_dir).expect("create primary wheels dir");
+        fs::create_dir_all(&seed_wheels_dir).expect("create seed wheels dir");
+
+        let bytes = b"wheel-bytes-download";
+        let sha = sha256_bytes_hex(bytes);
+        let wheel = pinned_test_wheel("corrupt-seed.whl", &sha);
+        let primary_path = cached_wheel_path(&primary_wheels_dir, wheel);
+        let seed_path = cached_wheel_path(&seed_wheels_dir, wheel);
+        fs::write(&seed_path, b"corrupt-seed").expect("write corrupt seed");
+        let downloaded = Cell::new(false);
+
+        let output_path = ensure_pinned_wheel_cached_with_downloader(
+            &primary_wheels_dir,
+            Some(&seed_wheels_dir),
+            wheel,
+            |output_path, wheel| {
+                downloaded.set(true);
+                let mut reader = Cursor::new(bytes.as_slice());
+                write_wheel_from_reader(&mut reader, output_path, wheel)
+            },
+        )
+        .expect("cache wheel");
+
+        assert!(downloaded.get(), "downloader should be called");
+        assert_eq!(output_path, primary_path);
+        assert_eq!(fs::read(&primary_path).expect("read primary"), bytes);
+        assert_eq!(
+            fs::read(&seed_path).expect("read seed"),
+            b"corrupt-seed",
+            "corrupt seed should not be modified"
+        );
     }
 
     #[test]
@@ -3219,12 +3423,7 @@ mod tests {
         let bad_bytes = b"wheel-bytes-actual";
         let sha = sha256_bytes_hex(good_bytes);
         let output_path = wheels_dir.join(format!("{sha}-bad.whl"));
-        let wheel = PinnedWheelMetadata {
-            logical_name: "test_wheel",
-            filename: "bad.whl",
-            url: "https://unused.invalid/bad.whl",
-            sha256_hex: &sha,
-        };
+        let wheel = pinned_test_wheel("bad.whl", &sha);
 
         let mut reader = Cursor::new(bad_bytes.as_slice());
         let err = write_wheel_from_reader(&mut reader, &output_path, wheel)
@@ -3242,20 +3441,76 @@ mod tests {
     }
 
     #[test]
+    fn seed_cache_env_empty_is_error() {
+        let _guard = ENV_TEST_LOCK.lock().expect("env lock");
+        let prev_seed = env::var_os(ENV_SEED_CACHE_DIR);
+
+        unsafe {
+            env::set_var(ENV_SEED_CACHE_DIR, "");
+        }
+
+        let result = RuntimeConfig::from_env();
+
+        unsafe {
+            match prev_seed {
+                Some(v) => env::set_var(ENV_SEED_CACHE_DIR, v),
+                None => env::remove_var(ENV_SEED_CACHE_DIR),
+            }
+        }
+
+        match result {
+            Err(FlashInferError::InvalidEnvironment { name, .. }) => {
+                assert_eq!(name, ENV_SEED_CACHE_DIR);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_seed_cache_dir_overrides_env_seed_cache_dir() {
+        let _guard = ENV_TEST_LOCK.lock().expect("env lock");
+        let prev_seed = env::var_os(ENV_SEED_CACHE_DIR);
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let env_seed = tmpdir.path().join("env-seed");
+        let explicit_seed = tmpdir.path().join("explicit-seed");
+
+        unsafe {
+            env::set_var(ENV_SEED_CACHE_DIR, &env_seed);
+        }
+
+        let resolved = RuntimeConfig::default()
+            .with_seed_cache_dir(&explicit_seed)
+            .resolve()
+            .expect("resolve");
+
+        unsafe {
+            match prev_seed {
+                Some(v) => env::set_var(ENV_SEED_CACHE_DIR, v),
+                None => env::remove_var(ENV_SEED_CACHE_DIR),
+            }
+        }
+
+        assert_eq!(resolved.seed_cache_dir, Some(explicit_seed));
+    }
+
+    #[test]
     fn legacy_wheel_env_vars_are_ignored() {
         let _guard = ENV_TEST_LOCK.lock().expect("env lock");
         let prev_jit = env::var_os("FLASHINFER_RS_JIT_CACHE_WHEEL");
         let prev_tvm = env::var_os("FLASHINFER_RS_TVMFFI_WHEEL");
         let prev_cache = env::var_os(ENV_CACHE_DIR);
+        let prev_seed = env::var_os(ENV_SEED_CACHE_DIR);
 
         unsafe {
             env::set_var("FLASHINFER_RS_JIT_CACHE_WHEEL", "/tmp/legacy-jit.whl");
             env::set_var("FLASHINFER_RS_TVMFFI_WHEEL", "/tmp/legacy-tvm.whl");
             env::remove_var(ENV_CACHE_DIR);
+            env::remove_var(ENV_SEED_CACHE_DIR);
         }
 
         let cfg = RuntimeConfig::from_env().expect("from env");
         assert_eq!(cfg.cache_dir, None);
+        assert_eq!(cfg.seed_cache_dir, None);
 
         unsafe {
             match prev_jit {
@@ -3269,6 +3524,10 @@ mod tests {
             match prev_cache {
                 Some(v) => env::set_var(ENV_CACHE_DIR, v),
                 None => env::remove_var(ENV_CACHE_DIR),
+            }
+            match prev_seed {
+                Some(v) => env::set_var(ENV_SEED_CACHE_DIR, v),
+                None => env::remove_var(ENV_SEED_CACHE_DIR),
             }
         }
     }

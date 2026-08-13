@@ -90,7 +90,7 @@ pub use paged_kv_append::{
 };
 #[cfg(feature = "cudarc")]
 pub use paged_kv_append::{append_paged_kv_cache_cudarc, append_paged_mla_kv_cache_cudarc};
-pub use runtime::{FlashInferRuntime, RuntimeConfig};
+pub use runtime::{FlashInferRuntime, RuntimeConfig, prefetch_pinned_wheels};
 pub use sampling::{
     MinPSamplingParams, SAMPLING_WORKSPACE_BYTES, SamplingFromLogitsParams,
     SamplingFromProbsParams, SamplingParams, SamplingRandomParams, SamplingSoftmaxParams,
