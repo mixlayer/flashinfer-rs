@@ -1228,16 +1228,7 @@ impl FlashInferRuntime {
         let materialized_wheels = ensure_pinned_wheels_cached(&resolved)?;
         let artifacts = extract_artifacts(&resolved, &materialized_wheels)?;
 
-        let tvmffi_lib = unsafe {
-            Library::open(
-                Some(&artifacts.tvmffi_so_path),
-                libc::RTLD_NOW | libc::RTLD_GLOBAL,
-            )
-        }
-        .map_err(|e| FlashInferError::LibraryLoad {
-            library: artifacts.tvmffi_so_path.clone(),
-            message: e.to_string(),
-        })?;
+        let tvmffi_lib = load_or_reuse_tvmffi(&artifacts.tvmffi_so_path)?;
 
         let norm_lib = unsafe {
             Library::open(
@@ -1662,6 +1653,29 @@ unsafe fn resolve_symbol<T: Copy>(
             message: e.to_string(),
         })?;
     Ok(*symbol)
+}
+
+fn load_or_reuse_tvmffi(path: &Path) -> Result<Library, FlashInferError> {
+    let process = Library::this();
+    // Reuse a TVM FFI runtime that another kernel stack intentionally made
+    // process-global. ABI compatibility is checked after all required symbols
+    // are resolved, just as it is for the pinned runtime below.
+    if unsafe {
+        process
+            .get::<TVMFFIGetVersionFn>(b"TVMFFIGetVersion\0")
+            .is_ok()
+    } {
+        return Ok(process);
+    }
+
+    // SAFETY: the path names the checksum-validated pinned TVM FFI runtime and
+    // its handle remains owned by FlashInferRuntime for the process lifetime.
+    unsafe { Library::open(Some(path), libc::RTLD_NOW | libc::RTLD_GLOBAL) }.map_err(|error| {
+        FlashInferError::LibraryLoad {
+            library: path.to_path_buf(),
+            message: error.to_string(),
+        }
+    })
 }
 
 fn cuda_runtime_fns() -> Result<&'static CudaRuntimeFns, String> {
