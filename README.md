@@ -14,6 +14,7 @@ Rust-first integration for calling precompiled FlashInfer kernels through TVM-FF
 - CUTLASS fused MoE (`fused_moe_{90,100,103,120}`) via on-demand JIT-cache module loading
 - Paged KV append (`append_paged_kv_cache`) and paged MLA KV append (`append_paged_mla_kv_cache`) from `page.so`
 - FP32 sampling, filtering, renormalization, masking, and softmax kernels from `sampling.so`
+- TensorRT-LLM BF16 all-reduce, fused residual/RMSNorm, and Lamport initialization from `trtllm_comm.so`
 - Pure Rust TVM-FFI ABI packing and dynamic loading
 - Optional `cudarc` convenience wrappers
 
@@ -132,6 +133,59 @@ let params = GemmaRmsNormParams::new(
 );
 
 gemma_rmsnorm(&params)?;
+```
+
+## API Example: TensorRT-LLM BF16 All-Reduce (`cudarc`)
+
+The workspace pointer tensor and every IPC allocation it references are created and owned by the
+caller. The binding validates the workspace's declared capacity and uses the selected algorithm
+without an automatic fallback.
+
+```rust
+use flashinfer_rs::{
+    TrtllmAllReduceBf16CudarcOptions, trtllm_allreduce_bf16_in_place_cudarc,
+};
+
+trtllm_allreduce_bf16_in_place_cudarc(
+    stream.as_ref(),
+    &mut activations_bf16,
+    &workspace_ptrs_i64,
+    tokens,
+    hidden_size,
+    world_size,
+    rank,
+    workspace_max_tokens,
+    workspace_hidden_size,
+    TrtllmAllReduceBf16CudarcOptions {
+        use_oneshot: true,
+        ..Default::default()
+    },
+)?;
+```
+
+The same workspace supports the fused decoder-boundary operation. It writes
+both the updated residual and its RMS-normalized value:
+
+```rust
+use flashinfer_rs::trtllm_allreduce_residual_rmsnorm_bf16_cudarc;
+
+trtllm_allreduce_residual_rmsnorm_bf16_cudarc(
+    stream.as_ref(),
+    &rank_local_output_bf16,
+    &residual_input_bf16,
+    &mut residual_output_bf16,
+    &mut norm_output_bf16,
+    &rms_gamma_bf16,
+    1e-5,
+    &workspace_ptrs_i64,
+    tokens,
+    hidden_size,
+    world_size,
+    rank,
+    workspace_max_tokens,
+    workspace_hidden_size,
+    TrtllmAllReduceBf16CudarcOptions::default(),
+)?;
 ```
 
 ## API Example: SM90 Prefill (`cudarc`)
