@@ -21,9 +21,11 @@ Build/runtime model in this crate:
 
 1. `build.rs` selects pinned wheel entries from `Cargo.toml` by build-host CUDA version (`cu130`/`cu131`) and target architecture (`x86_64` or `aarch64`).
 2. `build.rs` emits selected wheel metadata (filename, URL, SHA256) as generated constants.
-3. Runtime downloads selected wheels into `~/.cache/flashinfer-rs/wheels/` (or `FLASHINFER_RS_CACHE_DIR/wheels/`) on cache miss.
-4. Runtime verifies cached wheel SHA256 and rewrites mismatches.
-5. Runtime extracts required `.so` members from cached wheel files.
+3. `prefetch_pinned_wheels` is the supported build/bootstrap entry point for materializing the selected FlashInfer JIT-cache and TVM-FFI wheels without initializing CUDA or loading shared libraries.
+4. Wheel lookup order is primary, seed, network. The writable primary cache is `~/.cache/flashinfer-rs/wheels/` or `FLASHINFER_RS_CACHE_DIR/wheels/`; the optional read-only seed cache is `FLASHINFER_RS_SEED_CACHE_DIR/wheels/`.
+5. Runtime verifies every cached or seed wheel SHA256 before use, rewrites only bad primary-cache wheels, and treats bad seed wheels as unavailable.
+6. Runtime initialization performs the same check as a fallback if prefetch was skipped or a cache changed.
+7. Runtime extracts required `.so` members from cached wheel files. First inference may still extract/load a shape-specific module from the local wheel, but should not download wheels after successful prefetch.
 
 ## Artifact Download URLs
 `libtvm_ffi.so` source:
@@ -271,13 +273,15 @@ Notes:
 Environment variables accepted by `flashinfer-rs`:
 
 - `FLASHINFER_RS_CACHE_DIR`
+- `FLASHINFER_RS_SEED_CACHE_DIR`
 
 Runtime wheel cache:
 
 - `~/.cache/flashinfer-rs/wheels/<sha256>-<filename>.whl`
+- `FLASHINFER_RS_SEED_CACHE_DIR/wheels/<sha256>-<filename>.whl` for optional read-only seed wheels
 
 Extracted shared-library cache:
 
 - `~/.cache/flashinfer-rs/<artifact-hash>/`
 
-Both wheel materialization and `.so` extraction use lock files to avoid concurrent races.
+The primary cache is writable and contains downloaded fallback wheels, extracted `.so` files, and default cubins. The optional seed cache is read-only and contains only wheels in the same `wheels/` layout. Cache lookup order is primary, seed, network; `prefetch_pinned_wheels` and runtime initialization use that same order and the same lock/checksum/download path. Both wheel materialization and `.so` extraction use lock files to avoid concurrent races.
