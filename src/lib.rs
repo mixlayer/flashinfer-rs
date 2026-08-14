@@ -11,6 +11,7 @@ pub mod norm;
 pub mod paged_kv_append;
 pub mod runtime;
 pub mod sampling;
+pub mod trtllm_gen_moe;
 
 pub use error::FlashInferError;
 pub use fused_moe::{
@@ -106,4 +107,12 @@ pub use sampling::{
     top_k_renorm_probs_cudarc, top_k_sampling_from_probs_cudarc,
     top_k_top_p_sampling_from_probs_cudarc, top_p_renorm_probs_cudarc,
     top_p_sampling_from_probs_cudarc,
+};
+#[cfg(feature = "cudarc")]
+pub use trtllm_gen_moe::{
+    TrtllmGenFp8BlockScaleMoeSm100CudarcOptions, trtllm_gen_fp8_block_scale_moe_sm100_cudarc,
+};
+pub use trtllm_gen_moe::{
+    TrtllmGenFp8BlockScaleMoeSm100Params, TrtllmGenMoeDType, TrtllmGenMoeTensor1DDesc,
+    TrtllmGenMoeTensor2DDesc, TrtllmGenMoeTensor3DDesc, trtllm_gen_fp8_block_scale_moe_sm100,
 };

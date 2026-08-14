@@ -1,9 +1,10 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
@@ -24,6 +25,11 @@ use crate::ffi::{
 include!(concat!(env!("OUT_DIR"), "/embedded_wheels.rs"));
 
 const ENV_CACHE_DIR: &str = "FLASHINFER_RS_CACHE_DIR";
+const ENV_CUBIN_DIR: &str = "FLASHINFER_CUBIN_DIR";
+const ENV_CUBIN_REPOSITORY: &str = "FLASHINFER_CUBINS_REPOSITORY";
+const DEFAULT_CUBIN_REPOSITORY: &str =
+    "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local";
+const TRTLLM_GEN_MOE_SM100_URI: &str = "fused_moe_trtllm_sm100";
 
 const FLASHINFER_NORM_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/norm/norm.so";
 const FLASHINFER_GDN_PREFILL_SM90_SO_SUFFIX: &str =
@@ -55,8 +61,13 @@ type TVMFFIStringFromByteArrayFn =
     unsafe extern "C" fn(*const TVMFFIByteArray, *mut TVMFFIAny) -> i32;
 type TVMFFITensorFromDLPackVersionedFn =
     unsafe extern "C" fn(*mut DLManagedTensorVersioned, i32, i32, *mut TVMFFIObjectHandle) -> i32;
+type TVMFFITensorToDLPackVersionedFn =
+    unsafe extern "C" fn(TVMFFIObjectHandle, *mut *mut DLManagedTensorVersioned) -> i32;
 type TVMFFISafeCallFn =
     unsafe extern "C" fn(*mut c_void, *const TVMFFIAny, i32, *mut TVMFFIAny) -> i32;
+type FlashInferCubinCallbackFn = unsafe extern "C" fn(*const c_char, *const c_char);
+type FlashInferSetCubinCallbackFn = unsafe extern "C" fn(Option<FlashInferCubinCallbackFn>);
+type FlashInferSetCurrentCubinFn = unsafe extern "C" fn(*const c_char, c_int);
 type CudaMallocFn = unsafe extern "C" fn(*mut *mut c_void, usize) -> i32;
 type CudaFreeFn = unsafe extern "C" fn(*mut c_void) -> i32;
 type CudaMallocAsyncFn = unsafe extern "C" fn(*mut *mut c_void, usize, *mut c_void) -> i32;
@@ -64,10 +75,18 @@ type CudaFreeAsyncFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
 type CudaGetDeviceFn = unsafe extern "C" fn(*mut i32) -> i32;
 type CudaSetDeviceFn = unsafe extern "C" fn(i32) -> i32;
 type CudaGetErrorStringFn = unsafe extern "C" fn(i32) -> *const c_char;
+type CudaMemcpyAsyncFn =
+    unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32, *mut c_void) -> i32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedRuntimeConfig {
     cache_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CubinLoaderConfig {
+    cache_dir: PathBuf,
+    repository: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -131,6 +150,11 @@ struct LoadedKernel {
 struct LoadedFusedMoeKernel {
     _lib: Library,
     init: TVMFFISafeCallFn,
+}
+
+struct LoadedTrtllmGenMoeKernel {
+    _lib: Library,
+    fp8_block_scale_moe: TVMFFISafeCallFn,
 }
 
 #[derive(Clone, Copy)]
@@ -213,6 +237,7 @@ pub struct FlashInferRuntime {
     tvmffi_function_call: TVMFFIFunctionCallFn,
     tvmffi_string_from_byte_array: TVMFFIStringFromByteArrayFn,
     tvmffi_tensor_from_dlpack_versioned: TVMFFITensorFromDLPackVersionedFn,
+    tvmffi_tensor_to_dlpack_versioned: TVMFFITensorToDLPackVersionedFn,
     tvm_ffi_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gemma_rmsnorm: TVMFFISafeCallFn,
     tvm_ffi_gemma_fused_add_rmsnorm: TVMFFISafeCallFn,
@@ -226,6 +251,8 @@ pub struct FlashInferRuntime {
     batch_decode_kernel_cache: Mutex<HashMap<String, LoadedBatchDecodeKernel>>,
     batch_mla_kernel_cache: Mutex<HashMap<String, LoadedBatchMlaKernel>>,
     fused_moe_kernel_cache: Mutex<HashMap<String, LoadedFusedMoeKernel>>,
+    trtllm_gen_moe_kernel: Mutex<Option<LoadedTrtllmGenMoeKernel>>,
+    cubin_loader_config: CubinLoaderConfig,
 }
 
 static GLOBAL_RUNTIME: OnceLock<FlashInferRuntime> = OnceLock::new();
@@ -233,10 +260,16 @@ static HOST_SHA256SUM: OnceLock<Option<PathBuf>> = OnceLock::new();
 static RUNTIME_INIT_LOCK: Mutex<()> = Mutex::new(());
 static CUDA_RUNTIME_FNS: OnceLock<Result<CudaRuntimeFns, String>> = OnceLock::new();
 static TVM_ENV_GET_STREAM_FN: OnceLock<Option<TVMFFIEnvGetStreamFn>> = OnceLock::new();
+static CUBIN_LOADER_CONFIG: OnceLock<CubinLoaderConfig> = OnceLock::new();
+static SET_CURRENT_CUBIN_FN: OnceLock<FlashInferSetCurrentCubinFn> = OnceLock::new();
 const RUNTIME_ERROR_KIND: &[u8] = b"RuntimeError\0";
 
-#[derive(Clone, Copy)]
+thread_local! {
+    static LAST_CUBIN_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 struct CudaRuntimeFns {
+    _lib: Library,
     malloc: CudaMallocFn,
     free: CudaFreeFn,
     malloc_async: Option<CudaMallocAsyncFn>,
@@ -244,6 +277,7 @@ struct CudaRuntimeFns {
     get_device: CudaGetDeviceFn,
     set_device: CudaSetDeviceFn,
     get_error_string: Option<CudaGetErrorStringFn>,
+    memcpy_async: CudaMemcpyAsyncFn,
 }
 
 struct ManagedTensorContext {
@@ -534,6 +568,35 @@ impl FlashInferRuntime {
         Err(self.decode_raised_error(code))
     }
 
+    pub(crate) unsafe fn call_trtllm_gen_fp8_block_scale_moe_sm100(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let call = unsafe { self.resolve_trtllm_gen_moe_sm100()? };
+        clear_last_cubin_error();
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { call(std::ptr::null_mut(), args, num_args, result) };
+        let cubin_error = take_last_cubin_error();
+        if code != 0 {
+            let call_error = self.decode_raised_error(code);
+            if let Some(message) = cubin_error {
+                return Err(FlashInferError::invalid_argument(format!(
+                    "FlashInfer cubin loading failed: {message}; kernel error: {call_error}"
+                )));
+            }
+            return Err(call_error);
+        }
+        if let Some(message) = cubin_error {
+            return Err(FlashInferError::invalid_argument(format!(
+                "FlashInfer cubin loading failed: {message}"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) unsafe fn call_batch_decode_plan(
         &self,
         kernel_uri: &str,
@@ -683,6 +746,46 @@ impl FlashInferRuntime {
         Ok(out)
     }
 
+    pub(crate) unsafe fn tensor_to_dlpack_versioned(
+        &self,
+        tensor: TVMFFIObjectHandle,
+    ) -> Result<*mut DLManagedTensorVersioned, FlashInferError> {
+        if tensor.is_null() {
+            return Err(FlashInferError::invalid_argument(
+                "cannot export a null TVM tensor to DLPack",
+            ));
+        }
+        let mut out: *mut DLManagedTensorVersioned = std::ptr::null_mut();
+        // SAFETY: tensor is an owned TVM tensor object returned by a safe call.
+        let code = unsafe { (self.tvmffi_tensor_to_dlpack_versioned)(tensor, &mut out as *mut _) };
+        if code != 0 {
+            return Err(self.decode_raised_error(code));
+        }
+        if out.is_null() {
+            return Err(FlashInferError::invalid_argument(
+                "TVMFFITensorToDLPackVersioned returned a null managed tensor",
+            ));
+        }
+        Ok(out)
+    }
+
+    pub(crate) unsafe fn copy_device_to_device_async(
+        &self,
+        destination: *mut c_void,
+        source: *const c_void,
+        bytes: usize,
+        stream: *mut c_void,
+    ) -> Result<(), FlashInferError> {
+        let fns = cuda_runtime_fns().map_err(FlashInferError::invalid_argument)?;
+        // cudaMemcpyDeviceToDevice is enum value 3 in the CUDA runtime API.
+        let code = unsafe { (fns.memcpy_async)(destination, source, bytes, 3, stream) };
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(FlashInferError::CudaCopy { code })
+        }
+    }
+
     pub(crate) unsafe fn object_dec_ref(&self, obj: TVMFFIObjectHandle) {
         if obj.is_null() {
             return;
@@ -813,6 +916,82 @@ impl FlashInferRuntime {
             },
         );
         Ok(init)
+    }
+
+    unsafe fn resolve_trtllm_gen_moe_sm100(&self) -> Result<TVMFFISafeCallFn, FlashInferError> {
+        let mut loaded = self.trtllm_gen_moe_kernel.lock().map_err(|_| {
+            FlashInferError::invalid_argument("TensorRT-LLM Gen MoE cache lock is poisoned")
+        })?;
+
+        if let Some(kernel) = loaded.as_ref() {
+            return Ok(kernel.fp8_block_scale_moe);
+        }
+
+        let kernel_path = extract_jit_kernel(
+            &self.jit_cache_wheel_path,
+            &self.artifact_dir,
+            TRTLLM_GEN_MOE_SM100_URI,
+        )?;
+        let kernel_lib =
+            unsafe { Library::open(Some(&kernel_path), libc::RTLD_NOW | libc::RTLD_LOCAL) }
+                .map_err(|e| FlashInferError::LibraryLoad {
+                    library: kernel_path.clone(),
+                    message: e.to_string(),
+                })?;
+
+        let fp8_block_scale_moe = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"__tvm_ffi_trtllm_fp8_block_scale_moe\0",
+                "__tvm_ffi_trtllm_fp8_block_scale_moe",
+            )?
+        };
+        let set_cubin_callback: FlashInferSetCubinCallbackFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"FlashInferSetCubinCallback\0",
+                "FlashInferSetCubinCallback",
+            )?
+        };
+        let set_current_cubin: FlashInferSetCurrentCubinFn = unsafe {
+            resolve_symbol(
+                &kernel_lib,
+                &kernel_path,
+                b"FlashInferSetCurrentCubin\0",
+                "FlashInferSetCurrentCubin",
+            )?
+        };
+
+        if let Some(existing) = CUBIN_LOADER_CONFIG.get() {
+            if existing != &self.cubin_loader_config {
+                return Err(FlashInferError::invalid_argument(
+                    "FlashInfer cubin loader was initialized with a different configuration",
+                ));
+            }
+        } else {
+            let _ = CUBIN_LOADER_CONFIG.set(self.cubin_loader_config.clone());
+        }
+        if let Some(existing) = SET_CURRENT_CUBIN_FN.get() {
+            if *existing as usize != set_current_cubin as usize {
+                return Err(FlashInferError::invalid_argument(
+                    "a different FlashInfer cubin loader is already active",
+                ));
+            }
+        } else {
+            let _ = SET_CURRENT_CUBIN_FN.set(set_current_cubin);
+        }
+
+        // SAFETY: callback has the C ABI required by the loaded FlashInfer module and remains
+        // process-global for at least as long as the library stored below.
+        unsafe { set_cubin_callback(Some(load_cubin_callback)) };
+
+        *loaded = Some(LoadedTrtllmGenMoeKernel {
+            _lib: kernel_lib,
+            fp8_block_scale_moe,
+        });
+        Ok(fp8_block_scale_moe)
     }
 
     unsafe fn resolve_batch_prefill_kernel(
@@ -979,6 +1158,7 @@ impl FlashInferRuntime {
     }
 
     unsafe fn load(resolved: ResolvedRuntimeConfig) -> Result<Self, FlashInferError> {
+        let cubin_loader_config = resolve_cubin_loader_config(&resolved)?;
         let materialized_wheels = ensure_pinned_wheels_cached(&resolved.cache_dir)?;
         let artifacts = extract_artifacts(&resolved, &materialized_wheels)?;
 
@@ -1116,6 +1296,15 @@ impl FlashInferRuntime {
                 &artifacts.tvmffi_so_path,
                 b"TVMFFITensorFromDLPackVersioned\0",
                 "TVMFFITensorFromDLPackVersioned",
+            )?
+        };
+
+        let tvmffi_tensor_to_dlpack_versioned: TVMFFITensorToDLPackVersionedFn = unsafe {
+            resolve_symbol(
+                &tvmffi_lib,
+                &artifacts.tvmffi_so_path,
+                b"TVMFFITensorToDLPackVersioned\0",
+                "TVMFFITensorToDLPackVersioned",
             )?
         };
 
@@ -1311,6 +1500,7 @@ impl FlashInferRuntime {
             tvmffi_function_call,
             tvmffi_string_from_byte_array,
             tvmffi_tensor_from_dlpack_versioned,
+            tvmffi_tensor_to_dlpack_versioned,
             tvm_ffi_rmsnorm,
             tvm_ffi_gemma_rmsnorm,
             tvm_ffi_gemma_fused_add_rmsnorm,
@@ -1324,6 +1514,8 @@ impl FlashInferRuntime {
             batch_decode_kernel_cache: Mutex::new(HashMap::new()),
             batch_mla_kernel_cache: Mutex::new(HashMap::new()),
             fused_moe_kernel_cache: Mutex::new(HashMap::new()),
+            trtllm_gen_moe_kernel: Mutex::new(None),
+            cubin_loader_config,
         })
     }
 
@@ -1385,65 +1577,70 @@ fn cuda_runtime_fns() -> Result<&'static CudaRuntimeFns, String> {
 }
 
 unsafe fn load_cuda_runtime_fns() -> Result<CudaRuntimeFns, String> {
+    // Keep an explicit handle because cudarc uses the driver API and does not make CUDA Runtime
+    // symbols globally visible. FlashInfer's shared objects are deliberately loaded RTLD_LOCAL.
+    let runtime_lib = unsafe {
+        Library::open(
+            Some(Path::new("libcudart.so.13")),
+            libc::RTLD_NOW | libc::RTLD_LOCAL,
+        )
+    }
+    .map_err(|error| format!("failed to load libcudart.so.13: {error}"))?;
     // SAFETY: symbol signatures match CUDA Runtime API.
     let malloc = unsafe {
-        std::mem::transmute::<*mut c_void, CudaMallocFn>(resolve_process_symbol(
-            "cudaMalloc",
-            b"cudaMalloc\0",
-        )?)
+        resolve_runtime_symbol::<CudaMallocFn>(&runtime_lib, "cudaMalloc", b"cudaMalloc\0")?
     };
     // SAFETY: symbol signatures match CUDA Runtime API.
-    let free = unsafe {
-        std::mem::transmute::<*mut c_void, CudaFreeFn>(resolve_process_symbol(
-            "cudaFree",
-            b"cudaFree\0",
-        )?)
-    };
+    let free =
+        unsafe { resolve_runtime_symbol::<CudaFreeFn>(&runtime_lib, "cudaFree", b"cudaFree\0")? };
     // SAFETY: symbol signatures match CUDA Runtime API.
     let get_device = unsafe {
-        std::mem::transmute::<*mut c_void, CudaGetDeviceFn>(resolve_process_symbol(
+        resolve_runtime_symbol::<CudaGetDeviceFn>(
+            &runtime_lib,
             "cudaGetDevice",
             b"cudaGetDevice\0",
-        )?)
+        )?
     };
     // SAFETY: symbol signatures match CUDA Runtime API.
     let set_device = unsafe {
-        std::mem::transmute::<*mut c_void, CudaSetDeviceFn>(resolve_process_symbol(
+        resolve_runtime_symbol::<CudaSetDeviceFn>(
+            &runtime_lib,
             "cudaSetDevice",
             b"cudaSetDevice\0",
-        )?)
+        )?
     };
     // SAFETY: optional symbol; null means we fall back to `cudaMalloc`.
     let malloc_async = unsafe {
-        let ptr = libc::dlsym(libc::RTLD_DEFAULT, b"cudaMallocAsync\0".as_ptr().cast());
-        if ptr.is_null() {
-            None
-        } else {
-            Some(std::mem::transmute::<*mut c_void, CudaMallocAsyncFn>(ptr))
-        }
+        runtime_lib
+            .get::<CudaMallocAsyncFn>(b"cudaMallocAsync\0")
+            .ok()
+            .map(|symbol| *symbol)
     };
     // SAFETY: optional symbol; null means we fall back to `cudaFree`.
     let free_async = unsafe {
-        let ptr = libc::dlsym(libc::RTLD_DEFAULT, b"cudaFreeAsync\0".as_ptr().cast());
-        if ptr.is_null() {
-            None
-        } else {
-            Some(std::mem::transmute::<*mut c_void, CudaFreeAsyncFn>(ptr))
-        }
+        runtime_lib
+            .get::<CudaFreeAsyncFn>(b"cudaFreeAsync\0")
+            .ok()
+            .map(|symbol| *symbol)
     };
     // SAFETY: optional symbol; null means we fall back to numeric code messages.
     let get_error_string = unsafe {
-        let ptr = libc::dlsym(libc::RTLD_DEFAULT, b"cudaGetErrorString\0".as_ptr().cast());
-        if ptr.is_null() {
-            None
-        } else {
-            Some(std::mem::transmute::<*mut c_void, CudaGetErrorStringFn>(
-                ptr,
-            ))
-        }
+        runtime_lib
+            .get::<CudaGetErrorStringFn>(b"cudaGetErrorString\0")
+            .ok()
+            .map(|symbol| *symbol)
+    };
+    // SAFETY: symbol signature matches the CUDA Runtime API.
+    let memcpy_async = unsafe {
+        resolve_runtime_symbol::<CudaMemcpyAsyncFn>(
+            &runtime_lib,
+            "cudaMemcpyAsync",
+            b"cudaMemcpyAsync\0",
+        )?
     };
 
     Ok(CudaRuntimeFns {
+        _lib: runtime_lib,
         malloc,
         free,
         malloc_async,
@@ -1451,21 +1648,19 @@ unsafe fn load_cuda_runtime_fns() -> Result<CudaRuntimeFns, String> {
         get_device,
         set_device,
         get_error_string,
+        memcpy_async,
     })
 }
 
-unsafe fn resolve_process_symbol(
+unsafe fn resolve_runtime_symbol<T: Copy>(
+    runtime_lib: &Library,
     symbol_name: &'static str,
     symbol_bytes: &'static [u8],
-) -> Result<*mut c_void, String> {
-    // SAFETY: direct process-wide symbol lookup.
-    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol_bytes.as_ptr().cast()) };
-    if ptr.is_null() {
-        return Err(format!(
-            "failed to resolve `{symbol_name}` from process runtime symbols"
-        ));
-    }
-    Ok(ptr)
+) -> Result<T, String> {
+    // SAFETY: caller provides the matching CUDA Runtime function-pointer type.
+    unsafe { runtime_lib.get::<T>(symbol_bytes) }
+        .map(|symbol| *symbol)
+        .map_err(|error| format!("failed to resolve `{symbol_name}` from libcudart.so.13: {error}"))
 }
 
 fn cuda_error_message(fns: &CudaRuntimeFns, code: i32) -> String {
@@ -1851,6 +2046,218 @@ unsafe fn report_allocator_error(
             message_cstr.as_ptr(),
         )
     };
+}
+
+fn resolve_cubin_loader_config(
+    resolved: &ResolvedRuntimeConfig,
+) -> Result<CubinLoaderConfig, FlashInferError> {
+    let cache_dir = env_path(ENV_CUBIN_DIR)?.unwrap_or_else(|| resolved.cache_dir.join("cubins"));
+    let repository = match env::var(ENV_CUBIN_REPOSITORY) {
+        Ok(value) if !value.trim().is_empty() => value,
+        Ok(_) => {
+            return Err(FlashInferError::InvalidEnvironment {
+                name: ENV_CUBIN_REPOSITORY,
+                message: "value must not be empty".to_string(),
+            });
+        }
+        Err(env::VarError::NotPresent) => DEFAULT_CUBIN_REPOSITORY.to_string(),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(FlashInferError::InvalidEnvironment {
+                name: ENV_CUBIN_REPOSITORY,
+                message: "value is not valid Unicode".to_string(),
+            });
+        }
+    };
+    Ok(CubinLoaderConfig {
+        cache_dir,
+        repository,
+    })
+}
+
+fn clear_last_cubin_error() {
+    LAST_CUBIN_ERROR.with(|slot| *slot.borrow_mut() = None);
+}
+
+fn take_last_cubin_error() -> Option<String> {
+    LAST_CUBIN_ERROR.with(|slot| slot.borrow_mut().take())
+}
+
+fn record_last_cubin_error(message: String) {
+    LAST_CUBIN_ERROR.with(|slot| *slot.borrow_mut() = Some(message));
+}
+
+unsafe extern "C" fn load_cubin_callback(name: *const c_char, sha256: *const c_char) {
+    const EMPTY_CUBIN: &[u8] = b"\0";
+    let result = std::panic::catch_unwind(|| {
+        if name.is_null() || sha256.is_null() {
+            return Err(FlashInferError::invalid_argument(
+                "FlashInfer requested a cubin with a null name or checksum",
+            ));
+        }
+        // SAFETY: FlashInfer passes null-terminated strings for the duration of the callback.
+        let name = unsafe { CStr::from_ptr(name) }
+            .to_str()
+            .map_err(|_| FlashInferError::invalid_argument("cubin name is not valid UTF-8"))?;
+        // SAFETY: FlashInfer passes null-terminated strings for the duration of the callback.
+        let sha256 = unsafe { CStr::from_ptr(sha256) }
+            .to_str()
+            .map_err(|_| FlashInferError::invalid_argument("cubin checksum is not valid UTF-8"))?;
+        materialize_cubin(name, sha256)
+    });
+
+    let set_current = SET_CURRENT_CUBIN_FN.get().copied();
+    match result {
+        Ok(Ok(bytes)) => {
+            let Ok(size) = c_int::try_from(bytes.len()) else {
+                record_last_cubin_error("FlashInfer cubin is too large for the loader ABI".into());
+                if let Some(set_current) = set_current {
+                    // SAFETY: the module copies the provided bytes before this call returns.
+                    unsafe { set_current(EMPTY_CUBIN.as_ptr().cast(), 0) };
+                }
+                return;
+            };
+            if let Some(set_current) = set_current {
+                // SAFETY: the module copies the provided bytes before this call returns.
+                unsafe { set_current(bytes.as_ptr().cast(), size) };
+            } else {
+                record_last_cubin_error("FlashInfer cubin setter is not initialized".into());
+            }
+        }
+        Ok(Err(error)) => {
+            record_last_cubin_error(error.to_string());
+            if let Some(set_current) = set_current {
+                // SAFETY: an empty cubin signals callback failure to the module.
+                unsafe { set_current(EMPTY_CUBIN.as_ptr().cast(), 0) };
+            }
+        }
+        Err(_) => {
+            record_last_cubin_error("panic while loading a FlashInfer cubin".into());
+            if let Some(set_current) = set_current {
+                // SAFETY: an empty cubin signals callback failure to the module.
+                unsafe { set_current(EMPTY_CUBIN.as_ptr().cast(), 0) };
+            }
+        }
+    }
+}
+
+fn materialize_cubin(name: &str, expected_sha256: &str) -> Result<Vec<u8>, FlashInferError> {
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(FlashInferError::invalid_argument(format!(
+            "invalid SHA-256 supplied for FlashInfer cubin `{name}`"
+        )));
+    }
+    let relative = safe_cubin_relative_path(name)?;
+    let config = CUBIN_LOADER_CONFIG.get().ok_or_else(|| {
+        FlashInferError::invalid_argument("FlashInfer cubin loader is not initialized")
+    })?;
+    let path = config.cache_dir.join(relative);
+
+    if let Ok(bytes) = fs::read(&path) {
+        let found = format!("{:x}", Sha256::digest(&bytes));
+        if found.eq_ignore_ascii_case(expected_sha256) {
+            return Ok(bytes);
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| FlashInferError::CubinCache {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| FlashInferError::CubinCache {
+            path: lock_path.clone(),
+            source,
+        })?;
+    lock.lock_exclusive()
+        .map_err(|source| FlashInferError::CubinCache {
+            path: lock_path,
+            source,
+        })?;
+
+    if let Ok(bytes) = fs::read(&path) {
+        let found = format!("{:x}", Sha256::digest(&bytes));
+        if found.eq_ignore_ascii_case(expected_sha256) {
+            let _ = lock.unlock();
+            return Ok(bytes);
+        }
+    }
+
+    let url = format!(
+        "{}/{}",
+        config.repository.trim_end_matches('/'),
+        name.trim_start_matches('/')
+    );
+    let response = ureq::get(&url)
+        .call()
+        .map_err(|error| FlashInferError::CubinDownload {
+            url: url.clone(),
+            message: error.to_string(),
+        })?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    {
+        let mut output =
+            File::create(&temporary).map_err(|source| FlashInferError::CubinCache {
+                path: temporary.clone(),
+                source,
+            })?;
+        io::copy(&mut response.into_reader(), &mut output).map_err(|source| {
+            FlashInferError::CubinCache {
+                path: temporary.clone(),
+                source,
+            }
+        })?;
+        output
+            .sync_all()
+            .map_err(|source| FlashInferError::CubinCache {
+                path: temporary.clone(),
+                source,
+            })?;
+    }
+    let bytes = fs::read(&temporary).map_err(|source| FlashInferError::CubinCache {
+        path: temporary.clone(),
+        source,
+    })?;
+    let found = format!("{:x}", Sha256::digest(&bytes));
+    if !found.eq_ignore_ascii_case(expected_sha256) {
+        let _ = fs::remove_file(&temporary);
+        let _ = lock.unlock();
+        return Err(FlashInferError::CubinChecksumMismatch {
+            path,
+            expected: expected_sha256.to_ascii_lowercase(),
+            found,
+        });
+    }
+    fs::rename(&temporary, &path).map_err(|source| FlashInferError::CubinCache {
+        path: path.clone(),
+        source,
+    })?;
+    let _ = lock.unlock();
+    Ok(bytes)
+}
+
+fn safe_cubin_relative_path(name: &str) -> Result<PathBuf, FlashInferError> {
+    let path = Path::new(name);
+    if name.is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(FlashInferError::invalid_argument(format!(
+            "unsafe FlashInfer cubin path `{name}`"
+        )));
+    }
+    Ok(path.to_path_buf())
 }
 
 fn extract_artifacts(
