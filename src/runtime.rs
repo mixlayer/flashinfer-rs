@@ -234,7 +234,7 @@ struct SamplingKernelFns {
     top_p_renorm_probs: TVMFFISafeCallFn,
     top_k_renorm_probs: TVMFFISafeCallFn,
     top_k_mask_logits: TVMFFISafeCallFn,
-    _chain_speculative_sampling: TVMFFISafeCallFn,
+    chain_speculative_sampling: TVMFFISafeCallFn,
 }
 
 #[derive(Clone, Copy)]
@@ -249,6 +249,7 @@ pub(crate) enum SamplingKernel {
     TopPRenormProbs,
     TopKRenormProbs,
     TopKMaskLogits,
+    ChainSpeculativeSampling,
 }
 
 pub struct FlashInferRuntime {
@@ -523,6 +524,9 @@ impl FlashInferRuntime {
             SamplingKernel::TopPRenormProbs => self.sampling_fns.top_p_renorm_probs,
             SamplingKernel::TopKRenormProbs => self.sampling_fns.top_k_renorm_probs,
             SamplingKernel::TopKMaskLogits => self.sampling_fns.top_k_mask_logits,
+            SamplingKernel::ChainSpeculativeSampling => {
+                self.sampling_fns.chain_speculative_sampling
+            }
         };
         // SAFETY: every symbol has TVMFFISafeCallType and arguments are validated by callers.
         let code = unsafe { function(std::ptr::null_mut(), args, num_args, result) };
@@ -1529,7 +1533,7 @@ impl FlashInferRuntime {
                     "__tvm_ffi_top_k_mask_logits",
                 )?
             },
-            _chain_speculative_sampling: unsafe {
+            chain_speculative_sampling: unsafe {
                 resolve_symbol(
                     &sampling_lib,
                     &artifacts.sampling_so_path,

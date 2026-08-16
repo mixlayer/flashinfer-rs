@@ -31,6 +31,31 @@ pub struct SamplingTensor2DF32Desc {
     pub device_id: i32,
 }
 
+/// Caller-owned contiguous FP32 CUDA tensor with shape
+/// `[batch_size, num_tokens, vocab_size]`.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingTensor3DF32Desc {
+    pub ptr: *const c_void,
+    pub batch_size: i64,
+    pub num_tokens: i64,
+    pub vocab_size: i64,
+    pub stride_batch: i64,
+    pub stride_token: i64,
+    pub stride_vocab: i64,
+    pub device_id: i32,
+}
+
+/// Caller-owned contiguous I32 CUDA tensor with shape `[rows, cols]`.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingTensor2DI32Desc {
+    pub ptr: *const c_void,
+    pub rows: i64,
+    pub cols: i64,
+    pub stride_row: i64,
+    pub stride_col: i64,
+    pub device_id: i32,
+}
+
 /// Caller-owned FP32 CUDA tensor with shape `[len]`.
 #[derive(Debug, Clone, Copy)]
 pub struct SamplingTensor1DF32Desc {
@@ -421,6 +446,126 @@ impl TopKMaskLogitsParams {
     }
 }
 
+/// Parameters for chain speculative sampling over a batch of draft sequences.
+///
+/// The shape and dtype contract follows
+/// `flashinfer/csrc/flashinfer_sampling_binding.cu::chain_speculative_sampling`.
+/// All tensors must be contiguous, reside on the same CUDA device, and remain
+/// alive until work enqueued on `stream` completes.
+#[derive(Debug, Clone, Copy)]
+pub struct ChainSpeculativeSamplingParams {
+    /// Draft-model probabilities, contiguous FP32
+    /// `[batch_size, num_speculative_tokens, vocab_size]`.
+    pub draft_probs: SamplingTensor3DF32Desc,
+    /// Draft token IDs, contiguous I32 `[batch_size, num_speculative_tokens]`.
+    ///
+    /// Device values must be in `0..vocab_size`; Rust cannot inspect them
+    /// without synchronizing.
+    pub draft_token_ids: SamplingTensor2DI32Desc,
+    /// Target-model probabilities, contiguous FP32
+    /// `[batch_size, num_speculative_tokens + 1, vocab_size]`.
+    pub target_probs: SamplingTensor3DF32Desc,
+    /// Caller-owned I32 output `[batch_size, num_speculative_tokens + 1]`.
+    ///
+    /// Each row contains the emitted token chain followed by `-1` padding.
+    pub output_token_ids: SamplingTensor2DI32Desc,
+    /// Caller-owned contiguous I32 counters `[batch_size]`.
+    ///
+    /// The kernel adds the independently accepted draft-token count to each
+    /// element. Zero this tensor first when per-launch counts are desired.
+    pub output_accepted_token_num: SamplingTensor1DI32Desc,
+    /// Caller-owned contiguous I32 counters `[batch_size]`.
+    ///
+    /// The kernel adds the number of drafts emitted before the first rejection
+    /// to each element. The separately emitted replacement or bonus token is
+    /// not included. Zero this tensor first when per-launch counts are desired.
+    pub output_emitted_draft_token_num: SamplingTensor1DI32Desc,
+    /// Philox seed/offset and deterministic-mode settings.
+    pub random: SamplingRandomParams,
+    /// CUDA stream (`cudaStream_t`) used for the asynchronous launch.
+    ///
+    /// A `cudarc` or Candle stream pointer can be passed directly. The previous
+    /// TVM-FFI stream is restored before this function returns.
+    pub stream: *mut c_void,
+}
+
+impl ChainSpeculativeSamplingParams {
+    /// Validates tensor shapes, layouts, devices, and RNG state without
+    /// synchronizing or inspecting device values.
+    pub fn validate(&self) -> Result<(), FlashInferError> {
+        validate_f32_tensor3d("draft_probs", self.draft_probs)?;
+        validate_i32_matrix("draft_token_ids", self.draft_token_ids)?;
+        validate_f32_tensor3d("target_probs", self.target_probs)?;
+        validate_i32_matrix("output_token_ids", self.output_token_ids)?;
+        validate_i32_vector("output_accepted_token_num", self.output_accepted_token_num)?;
+        validate_i32_vector(
+            "output_emitted_draft_token_num",
+            self.output_emitted_draft_token_num,
+        )?;
+
+        let batch_size = self.draft_probs.batch_size;
+        let num_speculative_tokens = self.draft_probs.num_tokens;
+        let output_tokens = num_speculative_tokens.checked_add(1).ok_or_else(|| {
+            FlashInferError::invalid_argument("num_speculative_tokens + 1 overflow")
+        })?;
+        if self.draft_token_ids.rows != batch_size
+            || self.draft_token_ids.cols != num_speculative_tokens
+        {
+            return Err(FlashInferError::invalid_argument(
+                "draft_token_ids shape must be [batch_size, num_speculative_tokens]",
+            ));
+        }
+        if self.target_probs.batch_size != batch_size
+            || self.target_probs.num_tokens != output_tokens
+            || self.target_probs.vocab_size != self.draft_probs.vocab_size
+        {
+            return Err(FlashInferError::invalid_argument(
+                "target_probs shape must be [batch_size, num_speculative_tokens + 1, vocab_size]",
+            ));
+        }
+        if self.output_token_ids.rows != batch_size || self.output_token_ids.cols != output_tokens {
+            return Err(FlashInferError::invalid_argument(
+                "output_token_ids shape must be [batch_size, num_speculative_tokens + 1]",
+            ));
+        }
+        for (name, counter) in [
+            ("output_accepted_token_num", self.output_accepted_token_num),
+            (
+                "output_emitted_draft_token_num",
+                self.output_emitted_draft_token_num,
+            ),
+        ] {
+            if counter.len != batch_size {
+                return Err(FlashInferError::invalid_argument(format!(
+                    "{name} length must equal batch_size ({batch_size})"
+                )));
+            }
+        }
+
+        let device_id = self.draft_probs.device_id;
+        for (name, tensor_device_id) in [
+            ("draft_token_ids", self.draft_token_ids.device_id),
+            ("target_probs", self.target_probs.device_id),
+            ("output_token_ids", self.output_token_ids.device_id),
+            (
+                "output_accepted_token_num",
+                self.output_accepted_token_num.device_id,
+            ),
+            (
+                "output_emitted_draft_token_num",
+                self.output_emitted_draft_token_num.device_id,
+            ),
+        ] {
+            if tensor_device_id != device_id {
+                return Err(FlashInferError::invalid_argument(format!(
+                    "{name} must be on the draft_probs CUDA device"
+                )));
+            }
+        }
+        validate_random_params(self.random, batch_size, device_id)
+    }
+}
+
 pub fn sampling_from_probs(params: &SamplingFromProbsParams) -> Result<(), FlashInferError> {
     params.validate()?;
     call_basic_sampling(SamplingKernel::SamplingFromProbs, params)
@@ -585,6 +730,127 @@ pub fn top_k_mask_logits(params: &TopKMaskLogitsParams) -> Result<(), FlashInfer
         params.top_k,
         params.workspace,
         params.stream,
+    )
+}
+
+/// Verifies draft-token chains and samples the first replacement or bonus
+/// token using the target and draft probability distributions.
+///
+/// The launch is asynchronous on `params.stream`. Output counter tensors are
+/// incremented rather than overwritten, matching the upstream FlashInfer API.
+pub fn chain_speculative_sampling(
+    params: &ChainSpeculativeSamplingParams,
+) -> Result<(), FlashInferError> {
+    params.validate()?;
+    let runtime = FlashInferRuntime::global()?;
+
+    let mut draft_probs_shape = [
+        params.draft_probs.batch_size,
+        params.draft_probs.num_tokens,
+        params.draft_probs.vocab_size,
+    ];
+    let mut draft_probs_strides = [
+        params.draft_probs.stride_batch,
+        params.draft_probs.stride_token,
+        params.draft_probs.stride_vocab,
+    ];
+    let draft_probs = tensor_3d_f32(
+        params.draft_probs,
+        &mut draft_probs_shape,
+        &mut draft_probs_strides,
+    );
+    let mut draft_token_ids_shape = [params.draft_token_ids.rows, params.draft_token_ids.cols];
+    let mut draft_token_ids_strides = [
+        params.draft_token_ids.stride_row,
+        params.draft_token_ids.stride_col,
+    ];
+    let draft_token_ids = tensor_2d_i32(
+        params.draft_token_ids,
+        &mut draft_token_ids_shape,
+        &mut draft_token_ids_strides,
+    );
+    let mut target_probs_shape = [
+        params.target_probs.batch_size,
+        params.target_probs.num_tokens,
+        params.target_probs.vocab_size,
+    ];
+    let mut target_probs_strides = [
+        params.target_probs.stride_batch,
+        params.target_probs.stride_token,
+        params.target_probs.stride_vocab,
+    ];
+    let target_probs = tensor_3d_f32(
+        params.target_probs,
+        &mut target_probs_shape,
+        &mut target_probs_strides,
+    );
+    let mut output_token_ids_shape = [params.output_token_ids.rows, params.output_token_ids.cols];
+    let mut output_token_ids_strides = [
+        params.output_token_ids.stride_row,
+        params.output_token_ids.stride_col,
+    ];
+    let output_token_ids = tensor_2d_i32(
+        params.output_token_ids,
+        &mut output_token_ids_shape,
+        &mut output_token_ids_strides,
+    );
+    let mut accepted_shape = [params.output_accepted_token_num.len];
+    let mut accepted_strides = [params.output_accepted_token_num.stride];
+    let output_accepted_token_num = tensor_1d(
+        params.output_accepted_token_num.ptr,
+        params.output_accepted_token_num.device_id,
+        &mut accepted_shape,
+        &mut accepted_strides,
+        dl_i32(),
+    );
+    let mut emitted_shape = [params.output_emitted_draft_token_num.len];
+    let mut emitted_strides = [params.output_emitted_draft_token_num.stride];
+    let output_emitted_draft_token_num = tensor_1d(
+        params.output_emitted_draft_token_num.ptr,
+        params.output_emitted_draft_token_num.device_id,
+        &mut emitted_shape,
+        &mut emitted_strides,
+        dl_i32(),
+    );
+    let mut seed_shape = [params.random.seed_arr.map_or(0, |value| value.len)];
+    let mut seed_strides = [params.random.seed_arr.map_or(1, |value| value.stride)];
+    let seed_arr = params.random.seed_arr.map(|value| {
+        tensor_1d(
+            value.ptr,
+            value.device_id,
+            &mut seed_shape,
+            &mut seed_strides,
+            dl_u64(),
+        )
+    });
+    let mut offset_shape = [params.random.offset_arr.map_or(0, |value| value.len)];
+    let mut offset_strides = [params.random.offset_arr.map_or(1, |value| value.stride)];
+    let offset_arr = params.random.offset_arr.map(|value| {
+        tensor_1d(
+            value.ptr,
+            value.device_id,
+            &mut offset_shape,
+            &mut offset_strides,
+            dl_u64(),
+        )
+    });
+    let args = pack_chain_speculative_sampling_args(
+        &draft_probs,
+        &draft_token_ids,
+        &target_probs,
+        &output_token_ids,
+        &output_accepted_token_num,
+        &output_emitted_draft_token_num,
+        seed_arr.as_ref(),
+        offset_arr.as_ref(),
+        params.random,
+    );
+    call_kernel_with_stream(
+        runtime,
+        SamplingKernel::ChainSpeculativeSampling,
+        params.draft_probs.device_id,
+        params.stream,
+        &args,
     )
 }
 
@@ -885,6 +1151,44 @@ fn tensor_2d_f32(
     }
 }
 
+fn tensor_3d_f32(
+    desc: SamplingTensor3DF32Desc,
+    shape: &mut [i64; 3],
+    strides: &mut [i64; 3],
+) -> DLTensor {
+    DLTensor {
+        data: desc.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: desc.device_id,
+        },
+        ndim: 3,
+        dtype: dl_f32(),
+        shape: shape.as_mut_ptr(),
+        strides: strides.as_mut_ptr(),
+        byte_offset: 0,
+    }
+}
+
+fn tensor_2d_i32(
+    desc: SamplingTensor2DI32Desc,
+    shape: &mut [i64; 2],
+    strides: &mut [i64; 2],
+) -> DLTensor {
+    DLTensor {
+        data: desc.ptr.cast_mut(),
+        device: DLDevice {
+            device_type: KDL_CUDA,
+            device_id: desc.device_id,
+        },
+        ndim: 2,
+        dtype: dl_i32(),
+        shape: shape.as_mut_ptr(),
+        strides: strides.as_mut_ptr(),
+        byte_offset: 0,
+    }
+}
+
 fn tensor_1d(
     ptr: *const c_void,
     device_id: i32,
@@ -922,6 +1226,33 @@ fn pack_basic_sampling_args(
         any_dltensor_ptr(input),
         any_dltensor_ptr(output),
         optional_tensor_any(indices),
+        any_bool(random.deterministic),
+        optional_tensor_any(seed_arr),
+        any_u64(random.seed),
+        optional_tensor_any(offset_arr),
+        any_u64(random.offset),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pack_chain_speculative_sampling_args(
+    draft_probs: &DLTensor,
+    draft_token_ids: &DLTensor,
+    target_probs: &DLTensor,
+    output_token_ids: &DLTensor,
+    output_accepted_token_num: &DLTensor,
+    output_emitted_draft_token_num: &DLTensor,
+    seed_arr: Option<&DLTensor>,
+    offset_arr: Option<&DLTensor>,
+    random: SamplingRandomParams,
+) -> [TVMFFIAny; 11] {
+    [
+        any_dltensor_ptr(draft_probs),
+        any_dltensor_ptr(draft_token_ids),
+        any_dltensor_ptr(target_probs),
+        any_dltensor_ptr(output_token_ids),
+        any_dltensor_ptr(output_accepted_token_num),
+        any_dltensor_ptr(output_emitted_draft_token_num),
         any_bool(random.deterministic),
         optional_tensor_any(seed_arr),
         any_u64(random.seed),
@@ -1139,6 +1470,74 @@ fn validate_same_matrix(
 }
 
 fn validate_f32_matrix(name: &str, desc: SamplingTensor2DF32Desc) -> Result<(), FlashInferError> {
+    if desc.ptr.is_null() {
+        return Err(FlashInferError::invalid_argument(format!(
+            "{name} pointer must be non-null"
+        )));
+    }
+    if desc.rows <= 0 || desc.cols <= 0 {
+        return Err(FlashInferError::invalid_argument(format!(
+            "{name} dimensions must be positive"
+        )));
+    }
+    if desc.rows > u32::MAX as i64 || desc.cols > u32::MAX as i64 {
+        return Err(FlashInferError::invalid_argument(format!(
+            "{name} dimensions must fit in u32"
+        )));
+    }
+    if desc.stride_col != 1 || desc.stride_row != desc.cols {
+        return Err(FlashInferError::invalid_argument(format!(
+            "{name} must be contiguous row-major"
+        )));
+    }
+    if desc.device_id < 0 {
+        return Err(FlashInferError::invalid_argument(format!(
+            "{name} device_id must be non-negative"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_f32_tensor3d(name: &str, desc: SamplingTensor3DF32Desc) -> Result<(), FlashInferError> {
+    if desc.ptr.is_null() {
+        return Err(FlashInferError::invalid_argument(format!(
+            "{name} pointer must be non-null"
+        )));
+    }
+    if desc.batch_size <= 0 || desc.num_tokens <= 0 || desc.vocab_size <= 0 {
+        return Err(FlashInferError::invalid_argument(format!(
+            "{name} dimensions must be positive"
+        )));
+    }
+    if desc.batch_size > u32::MAX as i64
+        || desc.num_tokens > u32::MAX as i64
+        || desc.vocab_size > u32::MAX as i64
+    {
+        return Err(FlashInferError::invalid_argument(format!(
+            "{name} dimensions must fit in u32"
+        )));
+    }
+    let expected_stride_batch = desc
+        .num_tokens
+        .checked_mul(desc.vocab_size)
+        .ok_or_else(|| FlashInferError::invalid_argument(format!("{name} stride overflow")))?;
+    if desc.stride_vocab != 1
+        || desc.stride_token != desc.vocab_size
+        || desc.stride_batch != expected_stride_batch
+    {
+        return Err(FlashInferError::invalid_argument(format!(
+            "{name} must be contiguous row-major"
+        )));
+    }
+    if desc.device_id < 0 {
+        return Err(FlashInferError::invalid_argument(format!(
+            "{name} device_id must be non-negative"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_i32_matrix(name: &str, desc: SamplingTensor2DI32Desc) -> Result<(), FlashInferError> {
     if desc.ptr.is_null() {
         return Err(FlashInferError::invalid_argument(format!(
             "{name} pointer must be non-null"
@@ -1568,6 +1967,235 @@ where
         },
         SamplingKernel::TopKTopPSamplingFromProbs,
     )
+}
+
+/// `cudarc` wrapper for batched chain speculative sampling.
+///
+/// Flat buffers represent contiguous tensors with shapes
+/// `[batch_size, num_speculative_tokens, vocab_size]` for `draft_probs`,
+/// `[batch_size, num_speculative_tokens]` for `draft_token_ids`,
+/// `[batch_size, num_speculative_tokens + 1, vocab_size]` for `target_probs`,
+/// `[batch_size, num_speculative_tokens + 1]` for `output_token_ids`, and
+/// `[batch_size]` for each counter. Probability buffers are FP32 and token IDs
+/// and counters are I32. The launch is asynchronous on `stream`; counters are
+/// incremented rather than overwritten.
+#[cfg(feature = "cudarc")]
+#[allow(clippy::too_many_arguments)]
+pub fn chain_speculative_sampling_cudarc<DP, DI, TP, OI, OA, OE>(
+    stream: &cudarc::driver::CudaStream,
+    draft_probs: &DP,
+    draft_token_ids: &DI,
+    target_probs: &TP,
+    output_token_ids: &mut OI,
+    output_accepted_token_num: &mut OA,
+    output_emitted_draft_token_num: &mut OE,
+    batch_size: usize,
+    num_speculative_tokens: usize,
+    vocab_size: usize,
+    random: SamplingCudarcRandom<'_>,
+) -> Result<(), FlashInferError>
+where
+    DP: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtr<f32>,
+    DI: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtr<i32>,
+    TP: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtr<f32>,
+    OI: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtrMut<i32>,
+    OA: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtrMut<i32>,
+    OE: cudarc::driver::DeviceSlice<i32> + cudarc::driver::DevicePtrMut<i32>,
+{
+    if batch_size == 0 || num_speculative_tokens == 0 || vocab_size == 0 {
+        return Err(FlashInferError::invalid_argument(
+            "batch_size, num_speculative_tokens, and vocab_size must be positive",
+        ));
+    }
+    let draft_token_count = batch_size
+        .checked_mul(num_speculative_tokens)
+        .ok_or_else(|| {
+            FlashInferError::invalid_argument("batch_size * num_speculative_tokens overflow")
+        })?;
+    let draft_probs_len = draft_token_count.checked_mul(vocab_size).ok_or_else(|| {
+        FlashInferError::invalid_argument(
+            "batch_size * num_speculative_tokens * vocab_size overflow",
+        )
+    })?;
+    let output_tokens = num_speculative_tokens
+        .checked_add(1)
+        .ok_or_else(|| FlashInferError::invalid_argument("num_speculative_tokens + 1 overflow"))?;
+    let output_token_count = batch_size.checked_mul(output_tokens).ok_or_else(|| {
+        FlashInferError::invalid_argument("batch_size * (num_speculative_tokens + 1) overflow")
+    })?;
+    let target_probs_len = output_token_count.checked_mul(vocab_size).ok_or_else(|| {
+        FlashInferError::invalid_argument(
+            "batch_size * (num_speculative_tokens + 1) * vocab_size overflow",
+        )
+    })?;
+    for (name, actual, expected) in [
+        ("draft_probs", draft_probs.len(), draft_probs_len),
+        ("draft_token_ids", draft_token_ids.len(), draft_token_count),
+        ("target_probs", target_probs.len(), target_probs_len),
+        (
+            "output_token_ids",
+            output_token_ids.len(),
+            output_token_count,
+        ),
+        (
+            "output_accepted_token_num",
+            output_accepted_token_num.len(),
+            batch_size,
+        ),
+        (
+            "output_emitted_draft_token_num",
+            output_emitted_draft_token_num.len(),
+            batch_size,
+        ),
+    ] {
+        if actual != expected {
+            return Err(FlashInferError::invalid_argument(format!(
+                "{name} length ({actual}) must equal {expected}"
+            )));
+        }
+    }
+    match (random.seed_arr, random.offset_arr) {
+        (None, None) => {}
+        (Some(seed_arr), Some(offset_arr)) => {
+            let valid_len = |len: usize| len == 1 || len == batch_size;
+            if !valid_len(seed_arr.len()) || !valid_len(offset_arr.len()) {
+                return Err(FlashInferError::invalid_argument(format!(
+                    "seed_arr and offset_arr lengths must be 1 or batch_size ({batch_size})"
+                )));
+            }
+            if seed_arr.len() != offset_arr.len() {
+                return Err(FlashInferError::invalid_argument(
+                    "seed_arr and offset_arr lengths must match",
+                ));
+            }
+        }
+        _ => {
+            return Err(FlashInferError::invalid_argument(
+                "seed_arr and offset_arr must either both be present or both be absent",
+            ));
+        }
+    }
+
+    let (draft_probs_ptr, _draft_probs_sync) = draft_probs.device_ptr(stream);
+    let (draft_token_ids_ptr, _draft_token_ids_sync) = draft_token_ids.device_ptr(stream);
+    let (target_probs_ptr, _target_probs_sync) = target_probs.device_ptr(stream);
+    let (output_token_ids_ptr, _output_token_ids_sync) = output_token_ids.device_ptr_mut(stream);
+    let (accepted_ptr, _accepted_sync) = output_accepted_token_num.device_ptr_mut(stream);
+    let (emitted_ptr, _emitted_sync) = output_emitted_draft_token_num.device_ptr_mut(stream);
+    let (seed_ptr, _seed_sync) = match random.seed_arr {
+        Some(array) => {
+            let (ptr, sync) = array.device_ptr(stream);
+            (Some(ptr), Some(sync))
+        }
+        None => (None, None),
+    };
+    let (offset_ptr, _offset_sync) = match random.offset_arr {
+        Some(array) => {
+            let (ptr, sync) = array.device_ptr(stream);
+            (Some(ptr), Some(sync))
+        }
+        None => (None, None),
+    };
+
+    let batch_size_i64 = i64::try_from(batch_size)
+        .map_err(|_| FlashInferError::invalid_argument("batch_size does not fit in i64"))?;
+    let num_speculative_tokens_i64 = i64::try_from(num_speculative_tokens).map_err(|_| {
+        FlashInferError::invalid_argument("num_speculative_tokens does not fit in i64")
+    })?;
+    let output_tokens_i64 = i64::try_from(output_tokens).map_err(|_| {
+        FlashInferError::invalid_argument("num_speculative_tokens + 1 does not fit in i64")
+    })?;
+    let vocab_size_i64 = i64::try_from(vocab_size)
+        .map_err(|_| FlashInferError::invalid_argument("vocab_size does not fit in i64"))?;
+    let draft_stride_batch = i64::try_from(
+        num_speculative_tokens
+            .checked_mul(vocab_size)
+            .ok_or_else(|| FlashInferError::invalid_argument("draft stride overflow"))?,
+    )
+    .map_err(|_| FlashInferError::invalid_argument("draft stride does not fit in i64"))?;
+    let target_stride_batch = i64::try_from(
+        output_tokens
+            .checked_mul(vocab_size)
+            .ok_or_else(|| FlashInferError::invalid_argument("target stride overflow"))?,
+    )
+    .map_err(|_| FlashInferError::invalid_argument("target stride does not fit in i64"))?;
+    let device_id = i32::try_from(stream.context().ordinal())
+        .map_err(|_| FlashInferError::invalid_argument("device id does not fit in i32"))?;
+    let rng_len = |array: Option<&cudarc::driver::CudaSlice<u64>>| {
+        i64::try_from(array.map_or(0, |value| value.len()))
+            .map_err(|_| FlashInferError::invalid_argument("RNG array length does not fit in i64"))
+    };
+    let seed_len = rng_len(random.seed_arr)?;
+    let offset_len = rng_len(random.offset_arr)?;
+
+    chain_speculative_sampling(&ChainSpeculativeSamplingParams {
+        draft_probs: SamplingTensor3DF32Desc {
+            ptr: draft_probs_ptr as usize as *const c_void,
+            batch_size: batch_size_i64,
+            num_tokens: num_speculative_tokens_i64,
+            vocab_size: vocab_size_i64,
+            stride_batch: draft_stride_batch,
+            stride_token: vocab_size_i64,
+            stride_vocab: 1,
+            device_id,
+        },
+        draft_token_ids: SamplingTensor2DI32Desc {
+            ptr: draft_token_ids_ptr as usize as *const c_void,
+            rows: batch_size_i64,
+            cols: num_speculative_tokens_i64,
+            stride_row: num_speculative_tokens_i64,
+            stride_col: 1,
+            device_id,
+        },
+        target_probs: SamplingTensor3DF32Desc {
+            ptr: target_probs_ptr as usize as *const c_void,
+            batch_size: batch_size_i64,
+            num_tokens: output_tokens_i64,
+            vocab_size: vocab_size_i64,
+            stride_batch: target_stride_batch,
+            stride_token: vocab_size_i64,
+            stride_vocab: 1,
+            device_id,
+        },
+        output_token_ids: SamplingTensor2DI32Desc {
+            ptr: output_token_ids_ptr as usize as *const c_void,
+            rows: batch_size_i64,
+            cols: output_tokens_i64,
+            stride_row: output_tokens_i64,
+            stride_col: 1,
+            device_id,
+        },
+        output_accepted_token_num: SamplingTensor1DI32Desc {
+            ptr: accepted_ptr as usize as *const c_void,
+            len: batch_size_i64,
+            stride: 1,
+            device_id,
+        },
+        output_emitted_draft_token_num: SamplingTensor1DI32Desc {
+            ptr: emitted_ptr as usize as *const c_void,
+            len: batch_size_i64,
+            stride: 1,
+            device_id,
+        },
+        random: SamplingRandomParams {
+            deterministic: random.deterministic,
+            seed: random.seed,
+            offset: random.offset,
+            seed_arr: seed_ptr.map(|ptr| SamplingTensor1DU64Desc {
+                ptr: ptr as usize as *const c_void,
+                len: seed_len,
+                stride: 1,
+                device_id,
+            }),
+            offset_arr: offset_ptr.map(|ptr| SamplingTensor1DU64Desc {
+                ptr: ptr as usize as *const c_void,
+                len: offset_len,
+                stride: 1,
+                device_id,
+            }),
+        },
+        stream: stream.cu_stream().cast(),
+    })
 }
 
 #[cfg(feature = "cudarc")]
@@ -2206,6 +2834,30 @@ mod tests {
         }
     }
 
+    fn tensor3(batch_size: i64, num_tokens: i64, vocab_size: i64) -> SamplingTensor3DF32Desc {
+        SamplingTensor3DF32Desc {
+            ptr: ptr(),
+            batch_size,
+            num_tokens,
+            vocab_size,
+            stride_batch: num_tokens * vocab_size,
+            stride_token: vocab_size,
+            stride_vocab: 1,
+            device_id: 0,
+        }
+    }
+
+    fn i32_matrix(rows: i64, cols: i64) -> SamplingTensor2DI32Desc {
+        SamplingTensor2DI32Desc {
+            ptr: ptr(),
+            rows,
+            cols,
+            stride_row: cols,
+            stride_col: 1,
+            device_id: 0,
+        }
+    }
+
     fn i32_vector(len: i64) -> SamplingTensor1DI32Desc {
         SamplingTensor1DI32Desc {
             ptr: ptr(),
@@ -2231,6 +2883,19 @@ mod tests {
             SamplingRandomParams::new(7, 11),
             std::ptr::null_mut(),
         )
+    }
+
+    fn valid_chain_speculative_sampling() -> ChainSpeculativeSamplingParams {
+        ChainSpeculativeSamplingParams {
+            draft_probs: tensor3(2, 3, 4),
+            draft_token_ids: i32_matrix(2, 3),
+            target_probs: tensor3(2, 4, 4),
+            output_token_ids: i32_matrix(2, 4),
+            output_accepted_token_num: i32_vector(2),
+            output_emitted_draft_token_num: i32_vector(2),
+            random: SamplingRandomParams::new(7, 11),
+            stream: std::ptr::null_mut(),
+        }
     }
 
     #[test]
@@ -2299,6 +2964,35 @@ mod tests {
     }
 
     #[test]
+    fn chain_speculative_validation_accepts_pinned_contract() {
+        valid_chain_speculative_sampling().validate().unwrap();
+    }
+
+    #[test]
+    fn chain_speculative_validation_rejects_shape_and_device_mismatches() {
+        let mut params = valid_chain_speculative_sampling();
+        params.target_probs.num_tokens = 3;
+        params.target_probs.stride_batch = 12;
+        assert!(params.validate().is_err());
+
+        let mut params = valid_chain_speculative_sampling();
+        params.output_token_ids.cols = 3;
+        params.output_token_ids.stride_row = 3;
+        assert!(params.validate().is_err());
+
+        let mut params = valid_chain_speculative_sampling();
+        params.output_emitted_draft_token_num.device_id = 1;
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn chain_speculative_validation_rejects_non_contiguous_probabilities() {
+        let mut params = valid_chain_speculative_sampling();
+        params.draft_probs.stride_batch += 1;
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
     fn basic_packer_matches_pinned_argument_order() {
         let mut matrix_shape = [2, 4];
         let mut matrix_strides = [4, 1];
@@ -2361,5 +3055,76 @@ mod tests {
         assert_eq!(args[6].type_index, KTVM_FFI_FLOAT);
         // SAFETY: the packer wrote floating-point payloads for these slots.
         assert_eq!(unsafe { args[4].value.v_float64 }, 3.0);
+    }
+
+    #[test]
+    fn chain_speculative_packer_matches_pinned_argument_order() {
+        let params = valid_chain_speculative_sampling();
+        let mut draft_probs_shape = [2, 3, 4];
+        let mut draft_probs_strides = [12, 4, 1];
+        let draft_probs = tensor_3d_f32(
+            params.draft_probs,
+            &mut draft_probs_shape,
+            &mut draft_probs_strides,
+        );
+        let mut draft_ids_shape = [2, 3];
+        let mut draft_ids_strides = [3, 1];
+        let draft_ids = tensor_2d_i32(
+            params.draft_token_ids,
+            &mut draft_ids_shape,
+            &mut draft_ids_strides,
+        );
+        let mut target_probs_shape = [2, 4, 4];
+        let mut target_probs_strides = [16, 4, 1];
+        let target_probs = tensor_3d_f32(
+            params.target_probs,
+            &mut target_probs_shape,
+            &mut target_probs_strides,
+        );
+        let mut output_ids_shape = [2, 4];
+        let mut output_ids_strides = [4, 1];
+        let output_ids = tensor_2d_i32(
+            params.output_token_ids,
+            &mut output_ids_shape,
+            &mut output_ids_strides,
+        );
+        let mut counter_shape = [2];
+        let mut counter_strides = [1];
+        let accepted = tensor_1d(ptr(), 0, &mut counter_shape, &mut counter_strides, dl_i32());
+        let mut emitted_shape = [2];
+        let mut emitted_strides = [1];
+        let emitted = tensor_1d(ptr(), 0, &mut emitted_shape, &mut emitted_strides, dl_i32());
+        let args = pack_chain_speculative_sampling_args(
+            &draft_probs,
+            &draft_ids,
+            &target_probs,
+            &output_ids,
+            &accepted,
+            &emitted,
+            None,
+            None,
+            params.random,
+        );
+        assert_eq!(args.len(), 11);
+        assert_eq!(
+            args.iter().map(|arg| arg.type_index).collect::<Vec<_>>(),
+            vec![
+                KTVM_FFI_DL_TENSOR_PTR,
+                KTVM_FFI_DL_TENSOR_PTR,
+                KTVM_FFI_DL_TENSOR_PTR,
+                KTVM_FFI_DL_TENSOR_PTR,
+                KTVM_FFI_DL_TENSOR_PTR,
+                KTVM_FFI_DL_TENSOR_PTR,
+                KTVM_FFI_BOOL,
+                KTVM_FFI_NONE,
+                KTVM_FFI_INT,
+                KTVM_FFI_NONE,
+                KTVM_FFI_INT,
+            ]
+        );
+        // SAFETY: the packer wrote integer scalar payloads for these slots.
+        assert_eq!(unsafe { args[8].value.v_int64 }, 7);
+        // SAFETY: the packer wrote integer scalar payloads for these slots.
+        assert_eq!(unsafe { args[10].value.v_int64 }, 11);
     }
 }

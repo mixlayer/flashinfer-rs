@@ -60,7 +60,7 @@ The Rust integration calls the exported TVM-FFI host wrapper:
 - `__tvm_ffi_gdn_prefill`
 - `__tvm_ffi_append_paged_kv_cache` (from fixed `page.so`)
 - `__tvm_ffi_append_paged_mla_kv_cache` (from fixed `page.so`)
-- `__tvm_ffi_softmax`, sampling/filtering functions, and renormalization/masking functions (from fixed `sampling.so`)
+- `__tvm_ffi_softmax`, sampling/filtering functions, renormalization/masking functions, and `__tvm_ffi_chain_speculative_sampling` (from fixed `sampling.so`)
 - `__tvm_ffi_run` (for `single_prefill_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_plan`, `__tvm_ffi_ragged_run`, and `__tvm_ffi_paged_run` (for `batch_prefill_with_kv_cache` JIT-cache modules)
 - `__tvm_ffi_run` (for `single_decode_with_kv_cache` JIT-cache modules)
@@ -135,6 +135,14 @@ The pinned 0.6.4 CUDA implementation currently reads element zero from each
 tensor. The batch-length form is accepted for parity with upstream validation;
 its main benefit is mutable device-side RNG state for CUDA Graph replay, not a
 different seed/offset per output row.
+
+`chain_speculative_sampling` consumes contiguous FP32 draft probabilities
+`[batch, K, vocab]`, I32 draft IDs `[batch, K]`, and FP32 target probabilities
+`[batch, K + 1, vocab]`. It writes I32 token chains `[batch, K + 1]`, padded
+with `-1` after the replacement token, and increments caller-owned I32
+accepted/emitted counters `[batch]`. The Rust API therefore keeps all outputs
+caller-owned and does not allocate or synchronize, making stable buffers and
+device-resident RNG inputs suitable for CUDA Graph capture.
 
 Required CUDA runtime dependency from `norm.so`:
 
