@@ -11,6 +11,7 @@ pub mod norm;
 pub mod paged_kv_append;
 pub mod runtime;
 pub mod sampling;
+pub mod topk;
 pub mod trtllm_allreduce;
 pub mod trtllm_gen_moe;
 
@@ -95,13 +96,13 @@ pub use sampling::{
     ChainSpeculativeSamplingParams, MinPSamplingParams, SAMPLING_WORKSPACE_BYTES,
     SamplingFromLogitsParams, SamplingFromProbsParams, SamplingParams, SamplingRandomParams,
     SamplingSoftmaxParams, SamplingTensor1DF32Desc, SamplingTensor1DI32Desc,
-    SamplingTensor1DU64Desc, SamplingTensor2DF32Desc, SamplingTensor2DI32Desc,
-    SamplingTensor3DF32Desc, SamplingWorkspaceDesc, TopKMaskLogitsParams, TopKRenormParams,
-    TopKSamplingParams, TopKTopPSamplingParams, TopPRenormParams, TopPSamplingParams,
-    chain_speculative_sampling, min_p_sampling_from_probs, sampling_from_logits,
-    sampling_from_probs, sampling_softmax, top_k_mask_logits, top_k_renorm_probs,
-    top_k_sampling_from_probs, top_k_top_p_sampling_from_probs, top_p_renorm_probs,
-    top_p_sampling_from_probs,
+    SamplingTensor1DU8Desc, SamplingTensor1DU64Desc, SamplingTensor2DF32Desc,
+    SamplingTensor2DI32Desc, SamplingTensor3DF32Desc, SamplingWorkspaceDesc, TopKMaskLogitsParams,
+    TopKRenormParams, TopKSamplingParams, TopKTopPSamplingParams, TopPRenormParams,
+    TopPSamplingParams, chain_speculative_sampling, min_p_sampling_from_probs,
+    sampling_from_logits, sampling_from_probs, sampling_softmax, top_k_mask_logits,
+    top_k_renorm_probs, top_k_sampling_from_probs, top_k_top_p_sampling_from_probs,
+    top_p_renorm_probs, top_p_renorm_workspace_bytes, top_p_sampling_from_probs,
 };
 #[cfg(feature = "cudarc")]
 pub use sampling::{
@@ -110,6 +111,12 @@ pub use sampling::{
     top_k_mask_logits_cudarc, top_k_renorm_probs_cudarc, top_k_sampling_from_probs_cudarc,
     top_k_top_p_sampling_from_probs_cudarc, top_p_renorm_probs_cudarc,
     top_p_sampling_from_probs_cudarc,
+};
+#[cfg(feature = "cudarc")]
+pub use topk::top_k_cudarc;
+pub use topk::{
+    TOPK_ROW_STATES_BYTES, TopKDType, TopKOptions, TopKParams, TopKTensor2DDesc,
+    TopKTensor2DI32Desc, TopKTieBreak, TopKWorkspaceDesc, top_k,
 };
 #[cfg(feature = "cudarc")]
 pub use trtllm_allreduce::{

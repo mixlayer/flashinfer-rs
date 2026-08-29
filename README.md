@@ -14,6 +14,7 @@ Rust-first integration for calling precompiled FlashInfer kernels through TVM-FF
 - CUTLASS fused MoE (`fused_moe_{90,100,103,120}`) via on-demand JIT-cache module loading
 - Paged KV append (`append_paged_kv_cache`) and paged MLA KV append (`append_paged_mla_kv_cache`) from `page.so`
 - FP32 sampling, filtering, renormalization, masking, softmax, and chain speculative sampling kernels from `sampling.so`
+- Deterministic radix top-k for F16, BF16, and F32 rows from `topk.so`
 - TensorRT-LLM BF16 all-reduce, fused residual/RMSNorm, and Lamport initialization from `trtllm_comm.so`
 - Pure Rust TVM-FFI ABI packing and dynamic loading
 - Optional `cudarc` convenience wrappers
@@ -76,8 +77,8 @@ Runtime flow:
    - `~/.cache/flashinfer-rs/<artifact-hash>/`
 7. First inference may still extract/load a shape-specific module from the local wheel, but should not download wheels after a successful prefetch.
 
-The FlashInfer JIT-cache matrix is pinned to `0.6.4+cu130` for both CUDA
-13.0 and CUDA 13.1 metadata keys. Sampling uses the 0.6.4 optional
+The FlashInfer JIT-cache matrix is pinned to `0.6.12+cu130` for both CUDA
+13.0 and CUDA 13.1 metadata keys. Sampling uses the 0.6.12 optional
 device-resident U64 seed/offset tensor ABI, with scalar values retained as
 fallbacks.
 

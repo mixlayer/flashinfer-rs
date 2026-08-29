@@ -160,7 +160,7 @@ impl TrtllmGenFp8BlockScaleMoeSm100Params {
 
 /// Launches SM100 TensorRT-LLM Gen DeepSeek FP8 block-scale MoE.
 ///
-/// This function does not synchronize. The pinned FlashInfer 0.6.4 launcher returns an internally
+/// This function does not synchronize. The pinned FlashInfer 0.6.12 launcher returns an internally
 /// allocated BF16 tensor, so the binding enqueues a device-to-device copy into `params.out` on the
 /// same stream and releases the temporary allocation in stream order.
 pub fn trtllm_gen_fp8_block_scale_moe_sm100(
@@ -347,7 +347,7 @@ unsafe fn launch_with_runtime(
     let mut stream_guard = StreamRestoreGuard::new(runtime, params.out.device_id, previous_stream);
     let mut result = any_none();
     let call_result = (|| -> Result<(), FlashInferError> {
-        // SAFETY: argument order follows FlashInfer v0.6.4's exported typed function.
+        // SAFETY: argument order follows FlashInfer v0.6.12's exported typed function.
         unsafe {
             runtime.call_trtllm_gen_fp8_block_scale_moe_sm100(
                 args.as_ptr(),

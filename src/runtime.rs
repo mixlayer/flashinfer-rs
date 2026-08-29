@@ -37,6 +37,7 @@ const FLASHINFER_GDN_PREFILL_SM90_SO_SUFFIX: &str =
     "flashinfer_jit_cache/jit_cache/gdn_prefill_sm90/gdn_prefill_sm90.so";
 const FLASHINFER_PAGE_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/page/page.so";
 const FLASHINFER_SAMPLING_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/sampling/sampling.so";
+const FLASHINFER_TOPK_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/topk/topk.so";
 const FLASHINFER_TRTLLM_COMM_SO_SUFFIX: &str =
     "flashinfer_jit_cache/jit_cache/trtllm_comm/trtllm_comm.so";
 const TVMFFI_SO_MEMBER: &str = "tvm_ffi/lib/libtvm_ffi.so";
@@ -156,6 +157,7 @@ struct ExtractedArtifacts {
     gdn_prefill_sm90_so_path: PathBuf,
     page_so_path: PathBuf,
     sampling_so_path: PathBuf,
+    topk_so_path: PathBuf,
     trtllm_comm_so_path: PathBuf,
     tvmffi_so_path: PathBuf,
 }
@@ -261,6 +263,7 @@ pub struct FlashInferRuntime {
     _gdn_prefill_sm90_lib: Library,
     _page_lib: Library,
     _sampling_lib: Library,
+    _topk_lib: Library,
     _trtllm_comm_lib: Library,
     _tvmffi_get_version: TVMFFIGetVersionFn,
     tvmffi_env_set_stream: TVMFFIEnvSetStreamFn,
@@ -279,6 +282,7 @@ pub struct FlashInferRuntime {
     tvm_ffi_append_paged_mla_kv_cache: TVMFFISafeCallFn,
     tvm_ffi_trtllm_allreduce_fusion: TVMFFISafeCallFn,
     tvm_ffi_trtllm_lamport_initialize: TVMFFISafeCallFn,
+    tvm_ffi_radix_topk: TVMFFISafeCallFn,
     sampling_fns: SamplingKernelFns,
     single_prefill_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
     batch_prefill_kernel_cache: Mutex<HashMap<String, LoadedBatchPrefillKernel>>,
@@ -530,6 +534,22 @@ impl FlashInferRuntime {
         };
         // SAFETY: every symbol has TVMFFISafeCallType and arguments are validated by callers.
         let code = unsafe { function(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_radix_topk(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType and arguments are validated by the
+        // typed top-k wrapper.
+        let code =
+            unsafe { (self.tvm_ffi_radix_topk)(std::ptr::null_mut(), args, num_args, result) };
         if code == 0 {
             return Ok(());
         }
@@ -1278,6 +1298,17 @@ impl FlashInferRuntime {
             message: e.to_string(),
         })?;
 
+        let topk_lib = unsafe {
+            Library::open(
+                Some(&artifacts.topk_so_path),
+                libc::RTLD_NOW | libc::RTLD_LOCAL,
+            )
+        }
+        .map_err(|e| FlashInferError::LibraryLoad {
+            library: artifacts.topk_so_path.clone(),
+            message: e.to_string(),
+        })?;
+
         let trtllm_comm_lib = unsafe {
             Library::open(
                 Some(&artifacts.trtllm_comm_so_path),
@@ -1452,6 +1483,15 @@ impl FlashInferRuntime {
             )?
         };
 
+        let tvm_ffi_radix_topk: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &topk_lib,
+                &artifacts.topk_so_path,
+                b"__tvm_ffi_radix_topk\0",
+                "__tvm_ffi_radix_topk",
+            )?
+        };
+
         let sampling_fns = SamplingKernelFns {
             softmax: unsafe {
                 resolve_symbol(
@@ -1582,6 +1622,7 @@ impl FlashInferRuntime {
             _gdn_prefill_sm90_lib: gdn_prefill_sm90_lib,
             _page_lib: page_lib,
             _sampling_lib: sampling_lib,
+            _topk_lib: topk_lib,
             _trtllm_comm_lib: trtllm_comm_lib,
             _tvmffi_get_version: tvmffi_get_version,
             tvmffi_env_set_stream,
@@ -1600,6 +1641,7 @@ impl FlashInferRuntime {
             tvm_ffi_append_paged_mla_kv_cache,
             tvm_ffi_trtllm_allreduce_fusion,
             tvm_ffi_trtllm_lamport_initialize,
+            tvm_ffi_radix_topk,
             sampling_fns,
             single_prefill_kernel_cache: Mutex::new(HashMap::new()),
             batch_prefill_kernel_cache: Mutex::new(HashMap::new()),
@@ -2436,6 +2478,15 @@ fn extract_artifacts(
         )?;
     }
 
+    let topk_so_path = artifact_dir.join("topk.so");
+    if !topk_so_path.exists() {
+        extract_member_from_wheel_by_suffix(
+            &materialized_wheels.jit_cache_wheel_path,
+            FLASHINFER_TOPK_SO_SUFFIX,
+            &topk_so_path,
+        )?;
+    }
+
     let trtllm_comm_so_path = artifact_dir.join("trtllm_comm.so");
     if !trtllm_comm_so_path.exists() {
         extract_member_from_wheel_by_suffix(
@@ -2462,6 +2513,7 @@ fn extract_artifacts(
         gdn_prefill_sm90_so_path,
         page_so_path,
         sampling_so_path,
+        topk_so_path,
         trtllm_comm_so_path,
         tvmffi_so_path,
     })

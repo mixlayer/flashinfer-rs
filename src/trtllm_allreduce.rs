@@ -307,7 +307,7 @@ unsafe fn allreduce_with_runtime(
     let previous_stream = unsafe { runtime.set_stream(params.buffer.device_id, params.stream)? };
     let mut stream_guard =
         StreamRestoreGuard::new(runtime, params.buffer.device_id, previous_stream);
-    // SAFETY: argument order and values match FlashInfer v0.6.4's exported typed function.
+    // SAFETY: argument order and values match FlashInfer v0.6.12's exported typed function.
     let call_result = unsafe {
         runtime.call_trtllm_allreduce_fusion(
             args.as_ptr(),
@@ -424,7 +424,7 @@ unsafe fn allreduce_residual_rmsnorm_with_runtime(
         unsafe { runtime.set_stream(params.allreduce_input.device_id, params.stream)? };
     let mut stream_guard =
         StreamRestoreGuard::new(runtime, params.allreduce_input.device_id, previous_stream);
-    // SAFETY: argument order and values match FlashInfer v0.6.4's exported typed function.
+    // SAFETY: argument order and values match FlashInfer v0.6.12's exported typed function.
     let call_result = unsafe {
         runtime.call_trtllm_allreduce_fusion(
             args.as_ptr(),
@@ -467,7 +467,7 @@ unsafe fn lamport_initialize_with_runtime(
     // SAFETY: TVM-FFI stream context is set for the validated CUDA device.
     let previous_stream = unsafe { runtime.set_stream(params.device_id, params.stream)? };
     let mut stream_guard = StreamRestoreGuard::new(runtime, params.device_id, previous_stream);
-    // SAFETY: argument order and values match FlashInfer v0.6.4's exported typed function.
+    // SAFETY: argument order and values match FlashInfer v0.6.12's exported typed function.
     let call_result = unsafe {
         runtime.call_trtllm_lamport_initialize(
             args.as_ptr(),

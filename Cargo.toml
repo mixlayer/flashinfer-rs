@@ -5,48 +5,48 @@ edition = "2024"
 build = "build.rs"
 
 [package.metadata.flashinfer_rs.pinned_wheels.flashinfer_jit_cache.cu130.x86_64]
-filename = "flashinfer_jit_cache-0.6.4+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"
-url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.4/flashinfer_jit_cache-0.6.4%2Bcu130-cp39-abi3-manylinux_2_28_x86_64.whl"
-sha256 = "04220efdcee5ba4b63ca8e868dcf559cfb9ad4014ec79ed622e87bf0361dba27"
+filename = "flashinfer_jit_cache-0.6.12+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"
+url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.12/flashinfer_jit_cache-0.6.12%2Bcu130-cp39-abi3-manylinux_2_28_x86_64.whl"
+sha256 = "c7800a4d43bf53f0e11df627f249c13fc1e28b4a39e6ca2f237a01969ba16292"
 
 [package.metadata.flashinfer_rs.pinned_wheels.flashinfer_jit_cache.cu130.aarch64]
-filename = "flashinfer_jit_cache-0.6.4+cu130-cp39-abi3-manylinux_2_28_aarch64.whl"
-url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.4/flashinfer_jit_cache-0.6.4%2Bcu130-cp39-abi3-manylinux_2_28_aarch64.whl"
-sha256 = "3cd8caf37e247eeb8fb3005211df560790d586e3b44f2700ef09cd59527e1e95"
+filename = "flashinfer_jit_cache-0.6.12+cu130-cp39-abi3-manylinux_2_28_aarch64.whl"
+url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.12/flashinfer_jit_cache-0.6.12%2Bcu130-cp39-abi3-manylinux_2_28_aarch64.whl"
+sha256 = "097ee785b4886719761cda20d8363957d4b158e937c6dcde3ba84ea774065048"
 
 # Upstream stable currently publishes cu130 wheels for CUDA 13.x; `cu131` entries
 # intentionally map to the same pinned wheel artifacts.
 [package.metadata.flashinfer_rs.pinned_wheels.flashinfer_jit_cache.cu131.x86_64]
-filename = "flashinfer_jit_cache-0.6.4+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"
-url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.4/flashinfer_jit_cache-0.6.4%2Bcu130-cp39-abi3-manylinux_2_28_x86_64.whl"
-sha256 = "04220efdcee5ba4b63ca8e868dcf559cfb9ad4014ec79ed622e87bf0361dba27"
+filename = "flashinfer_jit_cache-0.6.12+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"
+url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.12/flashinfer_jit_cache-0.6.12%2Bcu130-cp39-abi3-manylinux_2_28_x86_64.whl"
+sha256 = "c7800a4d43bf53f0e11df627f249c13fc1e28b4a39e6ca2f237a01969ba16292"
 
 [package.metadata.flashinfer_rs.pinned_wheels.flashinfer_jit_cache.cu131.aarch64]
-filename = "flashinfer_jit_cache-0.6.4+cu130-cp39-abi3-manylinux_2_28_aarch64.whl"
-url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.4/flashinfer_jit_cache-0.6.4%2Bcu130-cp39-abi3-manylinux_2_28_aarch64.whl"
-sha256 = "3cd8caf37e247eeb8fb3005211df560790d586e3b44f2700ef09cd59527e1e95"
+filename = "flashinfer_jit_cache-0.6.12+cu130-cp39-abi3-manylinux_2_28_aarch64.whl"
+url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.12/flashinfer_jit_cache-0.6.12%2Bcu130-cp39-abi3-manylinux_2_28_aarch64.whl"
+sha256 = "097ee785b4886719761cda20d8363957d4b158e937c6dcde3ba84ea774065048"
 
 [package.metadata.flashinfer_rs.pinned_wheels.apache_tvm_ffi.cu130.x86_64]
-filename = "apache_tvm_ffi-0.1.3-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl"
-url = "https://files.pythonhosted.org/packages/49/97/ffe70c4679aebef0c1e32eec3970dc7e35113995d318aeb8c2ef0e4a3eb9/apache_tvm_ffi-0.1.3-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl"
-sha256 = "48ad3df2224f1b0943344895c6cba2f3f0a53bc67ddafdd3e9d7a34f56100aa9"
+filename = "apache_tvm_ffi-0.1.7-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl"
+url = "https://files.pythonhosted.org/packages/a2/98/737ffc4576af7d4da97f3c73bf347f69d269497cfe9ac089517af5900919/apache_tvm_ffi-0.1.7-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl"
+sha256 = "5f7deaa48cfd720949dd1638dfbd4cc7d5285008c7f3f342887e2bf33cf1f5be"
 
 [package.metadata.flashinfer_rs.pinned_wheels.apache_tvm_ffi.cu130.aarch64]
-filename = "apache_tvm_ffi-0.1.3-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl"
-url = "https://files.pythonhosted.org/packages/87/9c/68e30812874e60b141b99202dd3c4e4de964a7cb62cf6455de170b3a5111/apache_tvm_ffi-0.1.3-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl"
-sha256 = "ff65bf8a96dbbd2725937ff1502e52571e7a90d81d355a21a303328dd06449cc"
+filename = "apache_tvm_ffi-0.1.7-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl"
+url = "https://files.pythonhosted.org/packages/0a/e3/449fcdbe7ebd8df4b830399171fb325e7f77b2babe958c6fa6c537281e26/apache_tvm_ffi-0.1.7-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl"
+sha256 = "d5e9e668620ba3b78b1c1f393dee67a63850882b0713dba31972c5f854f02860"
 
 # Apache TVM-FFI wheels are CUDA-independent; duplicated across CUDA keys for
 # uniform matrix selection logic.
 [package.metadata.flashinfer_rs.pinned_wheels.apache_tvm_ffi.cu131.x86_64]
-filename = "apache_tvm_ffi-0.1.3-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl"
-url = "https://files.pythonhosted.org/packages/49/97/ffe70c4679aebef0c1e32eec3970dc7e35113995d318aeb8c2ef0e4a3eb9/apache_tvm_ffi-0.1.3-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl"
-sha256 = "48ad3df2224f1b0943344895c6cba2f3f0a53bc67ddafdd3e9d7a34f56100aa9"
+filename = "apache_tvm_ffi-0.1.7-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl"
+url = "https://files.pythonhosted.org/packages/a2/98/737ffc4576af7d4da97f3c73bf347f69d269497cfe9ac089517af5900919/apache_tvm_ffi-0.1.7-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl"
+sha256 = "5f7deaa48cfd720949dd1638dfbd4cc7d5285008c7f3f342887e2bf33cf1f5be"
 
 [package.metadata.flashinfer_rs.pinned_wheels.apache_tvm_ffi.cu131.aarch64]
-filename = "apache_tvm_ffi-0.1.3-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl"
-url = "https://files.pythonhosted.org/packages/87/9c/68e30812874e60b141b99202dd3c4e4de964a7cb62cf6455de170b3a5111/apache_tvm_ffi-0.1.3-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl"
-sha256 = "ff65bf8a96dbbd2725937ff1502e52571e7a90d81d355a21a303328dd06449cc"
+filename = "apache_tvm_ffi-0.1.7-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl"
+url = "https://files.pythonhosted.org/packages/0a/e3/449fcdbe7ebd8df4b830399171fb325e7f77b2babe958c6fa6c537281e26/apache_tvm_ffi-0.1.7-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl"
+sha256 = "d5e9e668620ba3b78b1c1f393dee67a63850882b0713dba31972c5f854f02860"
 
 [features]
 default = []
