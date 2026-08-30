@@ -2,11 +2,11 @@
 
 use cudarc::driver::CudaContext;
 use flashinfer_rs::{
-    SAMPLING_WORKSPACE_BYTES, SamplingCudarcRandom, min_p_sampling_from_probs_cudarc,
-    sampling_from_logits_cudarc, sampling_from_probs_cudarc, sampling_softmax_cudarc,
-    top_k_mask_logits_cudarc, top_k_renorm_probs_cudarc, top_k_sampling_from_probs_cudarc,
-    top_k_top_p_sampling_from_probs_cudarc, top_p_renorm_probs_cudarc,
-    top_p_sampling_from_probs_cudarc,
+    SAMPLING_WORKSPACE_BYTES, SamplingCudarcRandom, chain_speculative_sampling_cudarc,
+    min_p_sampling_from_probs_cudarc, sampling_from_logits_cudarc, sampling_from_probs_cudarc,
+    sampling_softmax_cudarc, top_k_mask_logits_cudarc, top_k_renorm_probs_cudarc,
+    top_k_sampling_from_probs_cudarc, top_k_top_p_sampling_from_probs_cudarc,
+    top_p_renorm_probs_cudarc, top_p_sampling_from_probs_cudarc,
 };
 
 fn should_run_gpu_tests() -> bool {
@@ -136,6 +136,49 @@ fn sampling_wheel_symbols_launch_smoke() {
     )
     .expect("launch top_k_top_p_sampling_from_probs");
 
+    let num_speculative_tokens = 2;
+    let draft_probs = stream
+        .clone_htod(&[
+            // Batch row 0: draft tokens 0, 1.
+            1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, // Batch row 1: draft tokens 2, 3.
+            0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ])
+        .expect("copy draft probabilities");
+    let draft_token_ids = stream
+        .clone_htod(&[0_i32, 1, 2, 3])
+        .expect("copy draft token IDs");
+    let target_probs = stream
+        .clone_htod(&[
+            // Batch row 0 accepts both drafts and emits bonus token 2.
+            1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+            // Batch row 1 accepts token 2, rejects token 3, and samples token 1.
+            0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+        ])
+        .expect("copy target probabilities");
+    let mut speculative_token_ids = stream
+        .alloc_zeros::<i32>(batch * (num_speculative_tokens + 1))
+        .expect("allocate speculative token output");
+    let mut accepted_token_num = stream
+        .alloc_zeros::<i32>(batch)
+        .expect("allocate accepted counters");
+    let mut emitted_draft_token_num = stream
+        .alloc_zeros::<i32>(batch)
+        .expect("allocate emitted counters");
+    chain_speculative_sampling_cudarc(
+        stream.as_ref(),
+        &draft_probs,
+        &draft_token_ids,
+        &target_probs,
+        &mut speculative_token_ids,
+        &mut accepted_token_num,
+        &mut emitted_draft_token_num,
+        batch,
+        num_speculative_tokens,
+        vocab,
+        SamplingCudarcRandom::new(14, 0).with_arrays(&seed_arr, &offset_arr),
+    )
+    .expect("launch chain_speculative_sampling");
+
     let mut workspace = stream
         .alloc_zeros::<u8>(SAMPLING_WORKSPACE_BYTES)
         .expect("allocate caller-owned workspace");
@@ -237,4 +280,22 @@ fn sampling_wheel_symbols_launch_smoke() {
     assert!(mask_host[0].is_infinite() && mask_host[0].is_sign_negative());
     assert_eq!(mask_host[3], 100.0);
     assert_eq!(mask_host[5], 100.0);
+    assert_eq!(
+        stream
+            .clone_dtoh(&speculative_token_ids)
+            .expect("copy speculative tokens"),
+        vec![0, 1, 2, 2, 1, -1]
+    );
+    assert_eq!(
+        stream
+            .clone_dtoh(&accepted_token_num)
+            .expect("copy accepted counters"),
+        vec![2, 1]
+    );
+    assert_eq!(
+        stream
+            .clone_dtoh(&emitted_draft_token_num)
+            .expect("copy emitted counters"),
+        vec![2, 1]
+    );
 }

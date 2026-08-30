@@ -13,7 +13,7 @@ Rust-first integration for calling precompiled FlashInfer kernels through TVM-FF
 - MHA batched paged decode (`batch_decode_with_kv_cache`) via on-demand JIT-cache module loading
 - CUTLASS fused MoE (`fused_moe_{90,100,103,120}`) via on-demand JIT-cache module loading
 - Paged KV append (`append_paged_kv_cache`) and paged MLA KV append (`append_paged_mla_kv_cache`) from `page.so`
-- FP32 sampling, filtering, renormalization, masking, and softmax kernels from `sampling.so`
+- FP32 sampling, filtering, renormalization, masking, softmax, and chain speculative sampling kernels from `sampling.so`
 - TensorRT-LLM BF16 all-reduce, fused residual/RMSNorm, and Lamport initialization from `trtllm_comm.so`
 - Pure Rust TVM-FFI ABI packing and dynamic loading
 - Optional `cudarc` convenience wrappers
@@ -141,6 +141,32 @@ let params = GemmaRmsNormParams::new(
 
 gemma_rmsnorm(&params)?;
 ```
+
+## API Example: Chain Speculative Sampling (`cudarc`)
+
+```rust
+use flashinfer_rs::{
+    SamplingCudarcRandom, chain_speculative_sampling_cudarc,
+};
+
+chain_speculative_sampling_cudarc(
+    stream.as_ref(),
+    &draft_probs,                    // FP32 [batch, K, vocab]
+    &draft_token_ids,                // I32  [batch, K]
+    &target_probs,                   // FP32 [batch, K + 1, vocab]
+    &mut output_token_ids,           // I32  [batch, K + 1]
+    &mut accepted_token_num,         // I32  [batch], incremented
+    &mut emitted_draft_token_num,    // I32  [batch], incremented
+    batch_size,
+    num_speculative_tokens,
+    vocab_size,
+    SamplingCudarcRandom::new(seed, offset),
+)?;
+```
+
+The output token rows contain the accepted drafts followed by a replacement or
+bonus token, then `-1` padding. Use device-resident seed and offset arrays via
+`SamplingCudarcRandom::with_arrays` when the call is captured in a CUDA Graph.
 
 ## API Example: TensorRT-LLM BF16 All-Reduce (`cudarc`)
 
