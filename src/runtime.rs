@@ -28,6 +28,7 @@ const ENV_CACHE_DIR: &str = "FLASHINFER_RS_CACHE_DIR";
 const ENV_SEED_CACHE_DIR: &str = "FLASHINFER_RS_SEED_CACHE_DIR";
 const ENV_CUBIN_DIR: &str = "FLASHINFER_CUBIN_DIR";
 const ENV_CUBIN_REPOSITORY: &str = "FLASHINFER_CUBINS_REPOSITORY";
+const ENV_FP4_QUANTIZATION_SO: &str = "FLASHINFER_RS_FP4_QUANTIZATION_SO";
 const DEFAULT_CUBIN_REPOSITORY: &str =
     "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local";
 const TRTLLM_GEN_MOE_SM100_URI: &str = "fused_moe_trtllm_sm100";
@@ -40,6 +41,10 @@ const FLASHINFER_SAMPLING_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/samp
 const FLASHINFER_TOPK_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/topk/topk.so";
 const FLASHINFER_TRTLLM_COMM_SO_SUFFIX: &str =
     "flashinfer_jit_cache/jit_cache/trtllm_comm/trtllm_comm.so";
+const FLASHINFER_FP4_QUANTIZATION_SM120_SO_SUFFIX: &str =
+    "flashinfer_jit_cache/jit_cache/fp4_quantization_120/fp4_quantization_120.so";
+const FLASHINFER_FP4_GEMM_SM120_SO_SUFFIX: &str =
+    "flashinfer_jit_cache/jit_cache/fp4_gemm_cutlass_sm120/fp4_gemm_cutlass_sm120.so";
 const TVMFFI_SO_MEMBER: &str = "tvm_ffi/lib/libtvm_ffi.so";
 const WHEEL_CACHE_DIR_NAME: &str = "wheels";
 const SHA256SUM_PROGRAM: &str = "sha256sum";
@@ -159,6 +164,8 @@ struct ExtractedArtifacts {
     sampling_so_path: PathBuf,
     topk_so_path: PathBuf,
     trtllm_comm_so_path: PathBuf,
+    fp4_quantization_sm120_so_path: PathBuf,
+    fp4_gemm_sm120_so_path: PathBuf,
     tvmffi_so_path: PathBuf,
 }
 
@@ -265,6 +272,8 @@ pub struct FlashInferRuntime {
     _sampling_lib: Library,
     _topk_lib: Library,
     _trtllm_comm_lib: Library,
+    _fp4_quantization_sm120_lib: Library,
+    _fp4_gemm_sm120_lib: Library,
     _tvmffi_get_version: TVMFFIGetVersionFn,
     tvmffi_env_set_stream: TVMFFIEnvSetStreamFn,
     tvmffi_error_move_from_raised: TVMFFIErrorMoveFromRaisedFn,
@@ -283,6 +292,9 @@ pub struct FlashInferRuntime {
     tvm_ffi_trtllm_allreduce_fusion: TVMFFISafeCallFn,
     tvm_ffi_trtllm_lamport_initialize: TVMFFISafeCallFn,
     tvm_ffi_radix_topk: TVMFFISafeCallFn,
+    tvm_ffi_fp4_quantize: TVMFFISafeCallFn,
+    tvm_ffi_block_scale_interleave_sm100: TVMFFISafeCallFn,
+    tvm_ffi_fp4_gemm: TVMFFISafeCallFn,
     sampling_fns: SamplingKernelFns,
     single_prefill_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
     batch_prefill_kernel_cache: Mutex<HashMap<String, LoadedBatchPrefillKernel>>,
@@ -423,6 +435,56 @@ impl FlashInferRuntime {
     ) -> Result<(), FlashInferError> {
         // SAFETY: symbol signature follows TVMFFISafeCallType.
         let code = unsafe { (self.tvm_ffi_rmsnorm)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_fp4_quantize(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code =
+            unsafe { (self.tvm_ffi_fp4_quantize)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_block_scale_interleave_sm100(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe {
+            (self.tvm_ffi_block_scale_interleave_sm100)(
+                std::ptr::null_mut(),
+                args,
+                num_args,
+                result,
+            )
+        };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_fp4_gemm(
+        &self,
+        args: *const TVMFFIAny,
+        num_args: i32,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe { (self.tvm_ffi_fp4_gemm)(std::ptr::null_mut(), args, num_args, result) };
         if code == 0 {
             return Ok(());
         }
@@ -1320,6 +1382,28 @@ impl FlashInferRuntime {
             message: e.to_string(),
         })?;
 
+        let fp4_quantization_sm120_lib = unsafe {
+            Library::open(
+                Some(&artifacts.fp4_quantization_sm120_so_path),
+                libc::RTLD_NOW | libc::RTLD_LOCAL,
+            )
+        }
+        .map_err(|e| FlashInferError::LibraryLoad {
+            library: artifacts.fp4_quantization_sm120_so_path.clone(),
+            message: e.to_string(),
+        })?;
+
+        let fp4_gemm_sm120_lib = unsafe {
+            Library::open(
+                Some(&artifacts.fp4_gemm_sm120_so_path),
+                libc::RTLD_NOW | libc::RTLD_LOCAL,
+            )
+        }
+        .map_err(|e| FlashInferError::LibraryLoad {
+            library: artifacts.fp4_gemm_sm120_so_path.clone(),
+            message: e.to_string(),
+        })?;
+
         let tvmffi_get_version: TVMFFIGetVersionFn = unsafe {
             resolve_symbol(
                 &tvmffi_lib,
@@ -1492,6 +1576,33 @@ impl FlashInferRuntime {
             )?
         };
 
+        let tvm_ffi_fp4_quantize: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &fp4_quantization_sm120_lib,
+                &artifacts.fp4_quantization_sm120_so_path,
+                b"__tvm_ffi_fp4_quantize\0",
+                "__tvm_ffi_fp4_quantize",
+            )?
+        };
+
+        let tvm_ffi_block_scale_interleave_sm100: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &fp4_quantization_sm120_lib,
+                &artifacts.fp4_quantization_sm120_so_path,
+                b"__tvm_ffi_block_scale_interleave_sm100\0",
+                "__tvm_ffi_block_scale_interleave_sm100",
+            )?
+        };
+
+        let tvm_ffi_fp4_gemm: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &fp4_gemm_sm120_lib,
+                &artifacts.fp4_gemm_sm120_so_path,
+                b"__tvm_ffi_fp4_gemm\0",
+                "__tvm_ffi_fp4_gemm",
+            )?
+        };
+
         let sampling_fns = SamplingKernelFns {
             softmax: unsafe {
                 resolve_symbol(
@@ -1624,6 +1735,8 @@ impl FlashInferRuntime {
             _sampling_lib: sampling_lib,
             _topk_lib: topk_lib,
             _trtllm_comm_lib: trtllm_comm_lib,
+            _fp4_quantization_sm120_lib: fp4_quantization_sm120_lib,
+            _fp4_gemm_sm120_lib: fp4_gemm_sm120_lib,
             _tvmffi_get_version: tvmffi_get_version,
             tvmffi_env_set_stream,
             tvmffi_error_move_from_raised,
@@ -1642,6 +1755,9 @@ impl FlashInferRuntime {
             tvm_ffi_trtllm_allreduce_fusion,
             tvm_ffi_trtllm_lamport_initialize,
             tvm_ffi_radix_topk,
+            tvm_ffi_fp4_quantize,
+            tvm_ffi_block_scale_interleave_sm100,
+            tvm_ffi_fp4_gemm,
             sampling_fns,
             single_prefill_kernel_cache: Mutex::new(HashMap::new()),
             batch_prefill_kernel_cache: Mutex::new(HashMap::new()),
@@ -2496,6 +2612,29 @@ fn extract_artifacts(
         )?;
     }
 
+    let fp4_quantization_override = env::var_os(ENV_FP4_QUANTIZATION_SO)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let fp4_quantization_sm120_so_path = fp4_quantization_override
+        .clone()
+        .unwrap_or_else(|| artifact_dir.join("fp4_quantization_sm120.so"));
+    if fp4_quantization_override.is_none() && !fp4_quantization_sm120_so_path.exists() {
+        extract_member_from_wheel_by_suffix(
+            &materialized_wheels.jit_cache_wheel_path,
+            FLASHINFER_FP4_QUANTIZATION_SM120_SO_SUFFIX,
+            &fp4_quantization_sm120_so_path,
+        )?;
+    }
+
+    let fp4_gemm_sm120_so_path = artifact_dir.join("fp4_gemm_cutlass_sm120.so");
+    if !fp4_gemm_sm120_so_path.exists() {
+        extract_member_from_wheel_by_suffix(
+            &materialized_wheels.jit_cache_wheel_path,
+            FLASHINFER_FP4_GEMM_SM120_SO_SUFFIX,
+            &fp4_gemm_sm120_so_path,
+        )?;
+    }
+
     let tvmffi_so_path = artifact_dir.join("libtvm_ffi.so");
     if !tvmffi_so_path.exists() {
         extract_member_from_wheel_exact(
@@ -2515,6 +2654,8 @@ fn extract_artifacts(
         sampling_so_path,
         topk_so_path,
         trtllm_comm_so_path,
+        fp4_quantization_sm120_so_path,
+        fp4_gemm_sm120_so_path,
         tvmffi_so_path,
     })
 }

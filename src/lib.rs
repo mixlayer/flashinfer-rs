@@ -8,6 +8,7 @@ pub mod mha_decode;
 pub mod mha_prefill;
 pub mod mla_batch_paged;
 pub mod norm;
+pub mod nvfp4;
 pub mod paged_kv_append;
 pub mod runtime;
 pub mod sampling;
@@ -85,6 +86,13 @@ pub use norm::{
     gemma_rmsnorm_cudarc_with_options, qk_rmsnorm_cudarc, rmsnorm_cudarc,
     rmsnorm_cudarc_with_options,
 };
+pub use nvfp4::{
+    NvFp4DType, NvFp4GemmParams, NvFp4QuantizeParams, NvFp4ScaleInterleaveParams,
+    NvFp4Tensor1DDesc, NvFp4Tensor2DDesc, nvfp4_gemm, nvfp4_quantize, nvfp4_scale_interleave,
+    swizzled_scale_len,
+};
+#[cfg(feature = "cudarc")]
+pub use nvfp4::{nvfp4_gemm_cudarc, nvfp4_quantize_cudarc, nvfp4_scale_interleave_cudarc};
 pub use paged_kv_append::{
     PagedKvAppendParams, PagedMlaKvAppendParams, PagedMlaTensor2DDesc, append_paged_kv_cache,
     append_paged_mla_kv_cache,

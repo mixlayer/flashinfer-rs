@@ -16,6 +16,7 @@ Rust-first integration for calling precompiled FlashInfer kernels through TVM-FF
 - FP32 sampling, filtering, renormalization, masking, softmax, and chain speculative sampling kernels from `sampling.so`
 - Deterministic radix top-k for F16, BF16, and F32 rows from `topk.so`
 - TensorRT-LLM BF16 all-reduce, fused residual/RMSNorm, and Lamport initialization from `trtllm_comm.so`
+- Dense SM120-family NVFP4 activation quantization, scale interleave, and CUTLASS GEMM
 - Pure Rust TVM-FFI ABI packing and dynamic loading
 - Optional `cudarc` convenience wrappers
 
