@@ -1,5 +1,6 @@
 pub mod error;
 mod ffi;
+pub mod fp8;
 pub mod fused_moe;
 pub mod gdn_prefill;
 pub mod mha_batch_prefill;
@@ -17,6 +18,9 @@ pub mod trtllm_allreduce;
 pub mod trtllm_gen_moe;
 
 pub use error::FlashInferError;
+#[cfg(feature = "cudarc")]
+pub use fp8::fp8_gemm_cudarc;
+pub use fp8::{Fp8GemmDType, Fp8GemmParams, Fp8Tensor1DDesc, Fp8Tensor2DDesc, fp8_gemm};
 pub use fused_moe::{
     FusedMoeActivationType, FusedMoeBackend, FusedMoeDeepSeekFp8BlockScaleQuantParams,
     FusedMoeFp8ActScaleDesc, FusedMoeFp8PerTensorQuantParams, FusedMoeParams, FusedMoeQuantization,
