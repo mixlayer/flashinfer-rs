@@ -53,12 +53,19 @@ fn sampling_wheel_symbols_launch_smoke() {
         seed_arr: Some(&seed_arr),
         offset_arr: Some(&offset_arr),
     };
+    let mut valid = stream
+        .alloc_zeros::<u8>(batch)
+        .expect("allocate validity output");
+    let mut workspace = stream
+        .alloc_zeros::<u8>(SAMPLING_WORKSPACE_BYTES)
+        .expect("allocate caller-owned workspace");
 
     let mut sample_probs = stream.alloc_zeros::<i32>(batch).expect("allocate output");
     sampling_from_probs_cudarc(
         stream.as_ref(),
         &probs,
         &mut sample_probs,
+        &mut valid,
         batch,
         vocab,
         Some(&row_indices),
@@ -83,6 +90,7 @@ fn sampling_wheel_symbols_launch_smoke() {
         stream.as_ref(),
         &probs,
         &mut sample_top_p,
+        &mut valid,
         batch,
         vocab,
         None,
@@ -97,6 +105,7 @@ fn sampling_wheel_symbols_launch_smoke() {
         stream.as_ref(),
         &probs,
         &mut sample_top_k,
+        &mut valid,
         batch,
         vocab,
         None,
@@ -111,6 +120,7 @@ fn sampling_wheel_symbols_launch_smoke() {
         stream.as_ref(),
         &probs,
         &mut sample_min_p,
+        &mut valid,
         batch,
         vocab,
         None,
@@ -125,6 +135,7 @@ fn sampling_wheel_symbols_launch_smoke() {
         stream.as_ref(),
         &probs,
         &mut sample_top_k_top_p,
+        &mut valid,
         batch,
         vocab,
         None,
@@ -179,9 +190,6 @@ fn sampling_wheel_symbols_launch_smoke() {
     )
     .expect("launch chain_speculative_sampling");
 
-    let mut workspace = stream
-        .alloc_zeros::<u8>(SAMPLING_WORKSPACE_BYTES)
-        .expect("allocate caller-owned workspace");
     let mut softmax_out = stream
         .alloc_zeros::<f32>(batch * vocab)
         .expect("allocate softmax output");
@@ -205,10 +213,12 @@ fn sampling_wheel_symbols_launch_smoke() {
         stream.as_ref(),
         &probs,
         &mut top_p_renorm_out,
+        &mut workspace,
         batch,
         vocab,
         0.9,
         Some(&top_p_arr),
+        false,
     )
     .expect("launch top_p_renorm_probs");
 

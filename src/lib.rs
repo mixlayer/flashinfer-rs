@@ -8,9 +8,11 @@ pub mod mha_decode;
 pub mod mha_prefill;
 pub mod mla_batch_paged;
 pub mod norm;
+pub mod nvfp4;
 pub mod paged_kv_append;
 pub mod runtime;
 pub mod sampling;
+pub mod topk;
 pub mod trtllm_allreduce;
 pub mod trtllm_gen_moe;
 
@@ -84,6 +86,13 @@ pub use norm::{
     gemma_rmsnorm_cudarc_with_options, qk_rmsnorm_cudarc, rmsnorm_cudarc,
     rmsnorm_cudarc_with_options,
 };
+pub use nvfp4::{
+    NvFp4DType, NvFp4GemmParams, NvFp4QuantizeParams, NvFp4ScaleInterleaveParams,
+    NvFp4Tensor1DDesc, NvFp4Tensor2DDesc, nvfp4_gemm, nvfp4_gemm_tactic_num, nvfp4_quantize,
+    nvfp4_scale_interleave, swizzled_scale_len,
+};
+#[cfg(feature = "cudarc")]
+pub use nvfp4::{nvfp4_gemm_cudarc, nvfp4_quantize_cudarc, nvfp4_scale_interleave_cudarc};
 pub use paged_kv_append::{
     PagedKvAppendParams, PagedMlaKvAppendParams, PagedMlaTensor2DDesc, append_paged_kv_cache,
     append_paged_mla_kv_cache,
@@ -95,13 +104,13 @@ pub use sampling::{
     ChainSpeculativeSamplingParams, MinPSamplingParams, SAMPLING_WORKSPACE_BYTES,
     SamplingFromLogitsParams, SamplingFromProbsParams, SamplingParams, SamplingRandomParams,
     SamplingSoftmaxParams, SamplingTensor1DF32Desc, SamplingTensor1DI32Desc,
-    SamplingTensor1DU64Desc, SamplingTensor2DF32Desc, SamplingTensor2DI32Desc,
-    SamplingTensor3DF32Desc, SamplingWorkspaceDesc, TopKMaskLogitsParams, TopKRenormParams,
-    TopKSamplingParams, TopKTopPSamplingParams, TopPRenormParams, TopPSamplingParams,
-    chain_speculative_sampling, min_p_sampling_from_probs, sampling_from_logits,
-    sampling_from_probs, sampling_softmax, top_k_mask_logits, top_k_renorm_probs,
-    top_k_sampling_from_probs, top_k_top_p_sampling_from_probs, top_p_renorm_probs,
-    top_p_sampling_from_probs,
+    SamplingTensor1DU8Desc, SamplingTensor1DU64Desc, SamplingTensor2DF32Desc,
+    SamplingTensor2DI32Desc, SamplingTensor3DF32Desc, SamplingWorkspaceDesc, TopKMaskLogitsParams,
+    TopKRenormParams, TopKSamplingParams, TopKTopPSamplingParams, TopPRenormParams,
+    TopPSamplingParams, chain_speculative_sampling, min_p_sampling_from_probs,
+    sampling_from_logits, sampling_from_probs, sampling_softmax, top_k_mask_logits,
+    top_k_renorm_probs, top_k_sampling_from_probs, top_k_top_p_sampling_from_probs,
+    top_p_renorm_probs, top_p_renorm_workspace_bytes, top_p_sampling_from_probs,
 };
 #[cfg(feature = "cudarc")]
 pub use sampling::{
@@ -110,6 +119,12 @@ pub use sampling::{
     top_k_mask_logits_cudarc, top_k_renorm_probs_cudarc, top_k_sampling_from_probs_cudarc,
     top_k_top_p_sampling_from_probs_cudarc, top_p_renorm_probs_cudarc,
     top_p_sampling_from_probs_cudarc,
+};
+#[cfg(feature = "cudarc")]
+pub use topk::top_k_cudarc;
+pub use topk::{
+    TOPK_ROW_STATES_BYTES, TopKDType, TopKOptions, TopKParams, TopKTensor2DDesc,
+    TopKTensor2DI32Desc, TopKTieBreak, TopKWorkspaceDesc, top_k,
 };
 #[cfg(feature = "cudarc")]
 pub use trtllm_allreduce::{

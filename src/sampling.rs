@@ -15,7 +15,7 @@ use crate::ffi::{
 use crate::runtime::{FlashInferRuntime, SamplingKernel};
 
 #[cfg(feature = "cudarc")]
-use cudarc::driver::DevicePtr;
+use cudarc::driver::{DevicePtr, DevicePtrMut};
 
 /// Workspace size used by the upstream Python sampling wrapper.
 pub const SAMPLING_WORKSPACE_BYTES: usize = 1024 * 1024;
@@ -74,9 +74,21 @@ pub struct SamplingTensor1DI32Desc {
     pub device_id: i32,
 }
 
+/// Caller-owned U8 CUDA tensor with shape `[len]`.
+///
+/// FlashInfer writes C++ `bool` validity flags into this one-byte-per-element
+/// storage for probability-based rejection samplers.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingTensor1DU8Desc {
+    pub ptr: *const c_void,
+    pub len: i64,
+    pub stride: i64,
+    pub device_id: i32,
+}
+
 /// Caller-owned U64 CUDA tensor with shape `[len]`.
 ///
-/// FlashInfer 0.6.4 accepts this device-resident RNG state as either a
+/// FlashInfer 0.6.12 accepts this device-resident RNG state as either a
 /// one-element array or an `[output_batch]` array. The pinned kernels currently
 /// consume element zero; accepting the batch-sized form preserves upstream ABI
 /// compatibility and CUDA Graph update semantics.
@@ -149,6 +161,10 @@ pub struct SamplingParams {
     pub input: SamplingTensor2DF32Desc,
     /// Caller-owned I32 output, contiguous rank-1 `[output_batch]`.
     pub output: SamplingTensor1DI32Desc,
+    /// Caller-owned U8 validity flags, contiguous `[output_batch]`.
+    ///
+    /// Required by probability-based samplers and ignored by logits sampling.
+    pub valid: Option<SamplingTensor1DU8Desc>,
     /// Optional I32 row mapping, contiguous rank-1 `[output_batch]`.
     ///
     /// `row_indices[i]` selects the input row used to produce `output[i]`. Values
@@ -173,6 +189,7 @@ impl SamplingParams {
         Self {
             input,
             output,
+            valid: None,
             row_indices: None,
             random,
             stream,
@@ -184,8 +201,20 @@ impl SamplingParams {
         self
     }
 
+    /// Sets caller-owned validity output for probability-based sampling.
+    pub fn with_valid(mut self, valid: SamplingTensor1DU8Desc) -> Self {
+        self.valid = Some(valid);
+        self
+    }
+
     pub fn validate(&self) -> Result<(), FlashInferError> {
-        validate_sampling_base(self.input, self.output, self.row_indices, self.random)
+        validate_sampling_base(
+            self.input,
+            self.output,
+            self.valid,
+            self.row_indices,
+            self.random,
+        )
     }
 }
 
@@ -382,6 +411,10 @@ pub struct TopPRenormParams {
     pub top_p: f64,
     /// Optional FP32 top-p thresholds, contiguous `[batch_size]`.
     pub top_p_arr: Option<SamplingTensor1DF32Desc>,
+    /// Whether to use deterministic integer accumulation.
+    pub deterministic: bool,
+    /// Caller-owned U8 workspace sized by [`top_p_renorm_workspace_bytes`].
+    pub workspace: SamplingWorkspaceDesc,
     /// CUDA stream (`cudaStream_t`) used for the asynchronous launch.
     pub stream: *mut c_void,
 }
@@ -390,8 +423,74 @@ impl TopPRenormParams {
     pub fn validate(&self) -> Result<(), FlashInferError> {
         validate_f32_transform(self.probs, self.output)?;
         validate_probability_threshold("top_p", self.top_p)?;
-        validate_f32_param_array("top_p_arr", self.top_p_arr, self.probs)
+        validate_f32_param_array("top_p_arr", self.top_p_arr, self.probs)?;
+        validate_workspace(self.workspace, self.probs.device_id)?;
+        let required = top_p_renorm_workspace_bytes(
+            usize::try_from(self.probs.rows).map_err(|_| {
+                FlashInferError::invalid_argument("batch size does not fit in usize")
+            })?,
+            usize::try_from(self.probs.cols).map_err(|_| {
+                FlashInferError::invalid_argument("vocab size does not fit in usize")
+            })?,
+            self.deterministic,
+        )?;
+        if self.workspace.len_bytes < required as i64 {
+            return Err(FlashInferError::invalid_argument(format!(
+                "top-p workspace contains {} bytes, but {required} are required",
+                self.workspace.len_bytes
+            )));
+        }
+        Ok(())
     }
+}
+
+/// Returns FlashInfer v0.6.12's AIR top-p renormalization workspace size.
+pub fn top_p_renorm_workspace_bytes(
+    batch_size: usize,
+    vocab_size: usize,
+    deterministic: bool,
+) -> Result<usize, FlashInferError> {
+    if batch_size == 0 || vocab_size == 0 {
+        return Err(FlashInferError::invalid_argument(
+            "batch_size and vocab_size must be positive",
+        ));
+    }
+    let align256 = |value: usize| -> Result<usize, FlashInferError> {
+        value
+            .checked_add(255)
+            .map(|value| value / 256 * 256)
+            .ok_or_else(|| FlashInferError::invalid_argument("workspace size overflow"))
+    };
+    let counters = align256(
+        384_usize
+            .checked_mul(batch_size)
+            .ok_or_else(|| FlashInferError::invalid_argument("workspace size overflow"))?,
+    )?;
+    let histogram_entry_bytes = if deterministic { 8_usize } else { 4_usize };
+    let histogram = align256(
+        histogram_entry_bytes
+            .checked_mul(2048)
+            .and_then(|value| value.checked_mul(batch_size))
+            .ok_or_else(|| FlashInferError::invalid_argument("workspace size overflow"))?,
+    )?;
+    let count_histogram = align256(
+        4_usize
+            .checked_mul(2048)
+            .and_then(|value| value.checked_mul(batch_size))
+            .ok_or_else(|| FlashInferError::invalid_argument("workspace size overflow"))?,
+    )?;
+    let buffer_len = align256(vocab_size / 32)?.max(256);
+    let buffer = align256(
+        4_usize
+            .checked_mul(buffer_len)
+            .and_then(|value| value.checked_mul(batch_size))
+            .ok_or_else(|| FlashInferError::invalid_argument("workspace size overflow"))?,
+    )?;
+    counters
+        .checked_add(histogram)
+        .and_then(|value| value.checked_add(count_histogram))
+        .and_then(|value| value.checked_add(buffer.checked_mul(2)?))
+        .ok_or_else(|| FlashInferError::invalid_argument("workspace size overflow"))
 }
 
 /// Parameters for top-k probability renormalization.
@@ -568,6 +667,7 @@ impl ChainSpeculativeSamplingParams {
 
 pub fn sampling_from_probs(params: &SamplingFromProbsParams) -> Result<(), FlashInferError> {
     params.validate()?;
+    validate_probability_valid_output(params)?;
     call_basic_sampling(SamplingKernel::SamplingFromProbs, params)
 }
 
@@ -578,6 +678,7 @@ pub fn sampling_from_logits(params: &SamplingFromLogitsParams) -> Result<(), Fla
 
 pub fn top_p_sampling_from_probs(params: &TopPSamplingParams) -> Result<(), FlashInferError> {
     params.validate()?;
+    validate_probability_valid_output(&params.sampling)?;
     call_filtered_sampling(
         SamplingKernel::TopPSamplingFromProbs,
         &params.sampling,
@@ -590,6 +691,7 @@ pub fn top_p_sampling_from_probs(params: &TopPSamplingParams) -> Result<(), Flas
 
 pub fn top_k_sampling_from_probs(params: &TopKSamplingParams) -> Result<(), FlashInferError> {
     params.validate()?;
+    validate_probability_valid_output(&params.sampling)?;
     call_filtered_sampling(
         SamplingKernel::TopKSamplingFromProbs,
         &params.sampling,
@@ -602,6 +704,7 @@ pub fn top_k_sampling_from_probs(params: &TopKSamplingParams) -> Result<(), Flas
 
 pub fn min_p_sampling_from_probs(params: &MinPSamplingParams) -> Result<(), FlashInferError> {
     params.validate()?;
+    validate_probability_valid_output(&params.sampling)?;
     call_filtered_sampling(
         SamplingKernel::MinPSamplingFromProbs,
         &params.sampling,
@@ -616,6 +719,7 @@ pub fn top_k_top_p_sampling_from_probs(
     params: &TopKTopPSamplingParams,
 ) -> Result<(), FlashInferError> {
     params.validate()?;
+    validate_probability_valid_output(&params.sampling)?;
     call_filtered_sampling(
         SamplingKernel::TopKTopPSamplingFromProbs,
         &params.sampling,
@@ -693,11 +797,22 @@ pub fn top_p_renorm_probs(params: &TopPRenormParams) -> Result<(), FlashInferErr
             dl_f32(),
         )
     });
+    let mut workspace_shape = [params.workspace.len_bytes];
+    let mut workspace_strides = [1];
+    let workspace = tensor_1d(
+        params.workspace.ptr,
+        params.workspace.device_id,
+        &mut workspace_shape,
+        &mut workspace_strides,
+        dl_u8(),
+    );
     let args = [
         any_dltensor_ptr(&input),
         any_dltensor_ptr(&output),
         optional_tensor_any(param.as_ref()),
         any_f64(params.top_p),
+        any_bool(params.deterministic),
+        any_dltensor_ptr(&workspace),
     ];
     call_global_kernel(
         SamplingKernel::TopPRenormProbs,
@@ -871,6 +986,17 @@ fn call_basic_sampling(
         &mut output_strides,
         dl_i32(),
     );
+    let mut valid_shape = [params.valid.map_or(0, |value| value.len)];
+    let mut valid_strides = [params.valid.map_or(1, |value| value.stride)];
+    let valid = params.valid.map(|value| {
+        tensor_1d(
+            value.ptr,
+            value.device_id,
+            &mut valid_shape,
+            &mut valid_strides,
+            dl_u8(),
+        )
+    });
     let mut indices_shape = [params.row_indices.map_or(0, |value| value.len)];
     let mut indices_strides = [params.row_indices.map_or(1, |value| value.stride)];
     let indices = params.row_indices.map(|value| {
@@ -905,13 +1031,15 @@ fn call_basic_sampling(
         )
     });
     let args = pack_basic_sampling_args(
+        kernel,
         &input,
         &output,
+        valid.as_ref(),
         indices.as_ref(),
         seed_arr.as_ref(),
         offset_arr.as_ref(),
         params.random,
-    );
+    )?;
     call_kernel_with_stream(
         runtime,
         kernel,
@@ -943,6 +1071,17 @@ fn call_filtered_sampling(
         &mut output_strides,
         dl_i32(),
     );
+    let mut valid_shape = [params.valid.map_or(0, |value| value.len)];
+    let mut valid_strides = [params.valid.map_or(1, |value| value.stride)];
+    let valid = params.valid.map(|value| {
+        tensor_1d(
+            value.ptr,
+            value.device_id,
+            &mut valid_shape,
+            &mut valid_strides,
+            dl_u8(),
+        )
+    });
     let mut indices_shape = [params.row_indices.map_or(0, |value| value.len)];
     let mut indices_strides = [params.row_indices.map_or(1, |value| value.stride)];
     let indices = params.row_indices.map(|value| {
@@ -1002,6 +1141,7 @@ fn call_filtered_sampling(
         kernel,
         &input,
         &output,
+        valid.as_ref(),
         indices.as_ref(),
         i32_param_tensor.as_ref(),
         f32_param_tensor.as_ref(),
@@ -1215,23 +1355,34 @@ fn optional_tensor_any(tensor: Option<&DLTensor>) -> TVMFFIAny {
 }
 
 fn pack_basic_sampling_args(
+    kernel: SamplingKernel,
     input: &DLTensor,
     output: &DLTensor,
+    valid: Option<&DLTensor>,
     indices: Option<&DLTensor>,
     seed_arr: Option<&DLTensor>,
     offset_arr: Option<&DLTensor>,
     random: SamplingRandomParams,
-) -> [TVMFFIAny; 8] {
-    [
-        any_dltensor_ptr(input),
-        any_dltensor_ptr(output),
+) -> Result<Vec<TVMFFIAny>, FlashInferError> {
+    let mut args = vec![any_dltensor_ptr(input), any_dltensor_ptr(output)];
+    match kernel {
+        SamplingKernel::SamplingFromProbs => args.push(optional_tensor_any(valid)),
+        SamplingKernel::SamplingFromLogits => {}
+        _ => {
+            return Err(FlashInferError::invalid_argument(
+                "internal basic sampling kernel mismatch",
+            ));
+        }
+    }
+    args.extend([
         optional_tensor_any(indices),
         any_bool(random.deterministic),
         optional_tensor_any(seed_arr),
         any_u64(random.seed),
         optional_tensor_any(offset_arr),
         any_u64(random.offset),
-    ]
+    ]);
+    Ok(args)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1266,6 +1417,7 @@ fn pack_filtered_sampling_args(
     kernel: SamplingKernel,
     input: &DLTensor,
     output: &DLTensor,
+    valid: Option<&DLTensor>,
     indices: Option<&DLTensor>,
     i32_param: Option<&DLTensor>,
     f32_param: Option<&DLTensor>,
@@ -1286,6 +1438,7 @@ fn pack_filtered_sampling_args(
         SamplingKernel::TopPSamplingFromProbs | SamplingKernel::MinPSamplingFromProbs => vec![
             any_dltensor_ptr(input),
             any_dltensor_ptr(output),
+            optional_tensor_any(valid),
             optional_tensor_any(indices),
             optional_tensor_any(f32_param),
             any_f64(f64_value),
@@ -1298,6 +1451,7 @@ fn pack_filtered_sampling_args(
         SamplingKernel::TopKSamplingFromProbs => vec![
             any_dltensor_ptr(input),
             any_dltensor_ptr(output),
+            optional_tensor_any(valid),
             optional_tensor_any(indices),
             optional_tensor_any(i32_param),
             any_i64(i64_value),
@@ -1310,6 +1464,7 @@ fn pack_filtered_sampling_args(
         SamplingKernel::TopKTopPSamplingFromProbs => vec![
             any_dltensor_ptr(input),
             any_dltensor_ptr(output),
+            optional_tensor_any(valid),
             optional_tensor_any(indices),
             optional_tensor_any(i32_param),
             // The pinned binding declares top_k_val as double for this fused entry point.
@@ -1370,11 +1525,25 @@ fn dl_u8() -> DLDataType {
 fn validate_sampling_base(
     input: SamplingTensor2DF32Desc,
     output: SamplingTensor1DI32Desc,
+    valid: Option<SamplingTensor1DU8Desc>,
     row_indices: Option<SamplingTensor1DI32Desc>,
     random: SamplingRandomParams,
 ) -> Result<(), FlashInferError> {
     validate_f32_matrix("input", input)?;
     validate_i32_vector("output", output)?;
+    if let Some(valid) = valid {
+        validate_u8_vector("valid", valid)?;
+        if valid.len != output.len {
+            return Err(FlashInferError::invalid_argument(
+                "valid length must equal output length",
+            ));
+        }
+        if valid.device_id != input.device_id {
+            return Err(FlashInferError::invalid_argument(
+                "valid must be on the input CUDA device",
+            ));
+        }
+    }
     if let Some(indices) = row_indices {
         validate_i32_vector("row_indices", indices)?;
         if indices.len != output.len {
@@ -1398,6 +1567,15 @@ fn validate_sampling_base(
         ));
     }
     validate_random_params(random, output.len, input.device_id)?;
+    Ok(())
+}
+
+fn validate_probability_valid_output(params: &SamplingParams) -> Result<(), FlashInferError> {
+    if params.valid.is_none() {
+        return Err(FlashInferError::invalid_argument(
+            "probability sampling requires a valid output tensor",
+        ));
+    }
     Ok(())
 }
 
@@ -1571,6 +1749,10 @@ fn validate_i32_vector(name: &str, desc: SamplingTensor1DI32Desc) -> Result<(), 
 }
 
 fn validate_f32_vector(name: &str, desc: SamplingTensor1DF32Desc) -> Result<(), FlashInferError> {
+    validate_vector_parts(name, desc.ptr, desc.len, desc.stride, desc.device_id)
+}
+
+fn validate_u8_vector(name: &str, desc: SamplingTensor1DU8Desc) -> Result<(), FlashInferError> {
     validate_vector_parts(name, desc.ptr, desc.len, desc.stride, desc.device_id)
 }
 
@@ -1784,6 +1966,7 @@ pub fn sampling_from_probs_cudarc<P, O>(
     stream: &cudarc::driver::CudaStream,
     probs: &P,
     output: &mut O,
+    valid: &mut cudarc::driver::CudaSlice<u8>,
     input_batch: usize,
     vocab_size: usize,
     row_indices: Option<&cudarc::driver::CudaSlice<i32>>,
@@ -1797,6 +1980,7 @@ where
         stream,
         probs,
         output,
+        Some(valid),
         input_batch,
         vocab_size,
         row_indices,
@@ -1824,6 +2008,7 @@ where
         stream,
         logits,
         output,
+        None,
         input_batch,
         vocab_size,
         row_indices,
@@ -1839,6 +2024,7 @@ pub fn top_p_sampling_from_probs_cudarc<P, O>(
     stream: &cudarc::driver::CudaStream,
     probs: &P,
     output: &mut O,
+    valid: &mut cudarc::driver::CudaSlice<u8>,
     input_batch: usize,
     vocab_size: usize,
     row_indices: Option<&cudarc::driver::CudaSlice<i32>>,
@@ -1854,6 +2040,7 @@ where
         stream,
         probs,
         output,
+        Some(valid),
         input_batch,
         vocab_size,
         row_indices,
@@ -1872,6 +2059,7 @@ pub fn top_k_sampling_from_probs_cudarc<P, O>(
     stream: &cudarc::driver::CudaStream,
     probs: &P,
     output: &mut O,
+    valid: &mut cudarc::driver::CudaSlice<u8>,
     input_batch: usize,
     vocab_size: usize,
     row_indices: Option<&cudarc::driver::CudaSlice<i32>>,
@@ -1887,6 +2075,7 @@ where
         stream,
         probs,
         output,
+        Some(valid),
         input_batch,
         vocab_size,
         row_indices,
@@ -1905,6 +2094,7 @@ pub fn min_p_sampling_from_probs_cudarc<P, O>(
     stream: &cudarc::driver::CudaStream,
     probs: &P,
     output: &mut O,
+    valid: &mut cudarc::driver::CudaSlice<u8>,
     input_batch: usize,
     vocab_size: usize,
     row_indices: Option<&cudarc::driver::CudaSlice<i32>>,
@@ -1920,6 +2110,7 @@ where
         stream,
         probs,
         output,
+        Some(valid),
         input_batch,
         vocab_size,
         row_indices,
@@ -1938,6 +2129,7 @@ pub fn top_k_top_p_sampling_from_probs_cudarc<P, O>(
     stream: &cudarc::driver::CudaStream,
     probs: &P,
     output: &mut O,
+    valid: &mut cudarc::driver::CudaSlice<u8>,
     input_batch: usize,
     vocab_size: usize,
     row_indices: Option<&cudarc::driver::CudaSlice<i32>>,
@@ -1955,6 +2147,7 @@ where
         stream,
         probs,
         output,
+        Some(valid),
         input_batch,
         vocab_size,
         row_indices,
@@ -2267,20 +2460,30 @@ where
 
 #[cfg(feature = "cudarc")]
 #[allow(clippy::too_many_arguments)]
-pub fn top_p_renorm_probs_cudarc<P, O>(
+pub fn top_p_renorm_probs_cudarc<P, O, W>(
     stream: &cudarc::driver::CudaStream,
     probs: &P,
     output: &mut O,
+    workspace: &mut W,
     batch_size: usize,
     vocab_size: usize,
     top_p: f64,
     top_p_arr: Option<&cudarc::driver::CudaSlice<f32>>,
+    deterministic: bool,
 ) -> Result<(), FlashInferError>
 where
     P: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtr<f32>,
     O: cudarc::driver::DeviceSlice<f32> + cudarc::driver::DevicePtrMut<f32>,
+    W: cudarc::driver::DeviceSlice<u8> + cudarc::driver::DevicePtrMut<u8>,
 {
     validate_flat_matrix_lengths(probs.len(), output.len(), batch_size, vocab_size)?;
+    let required_workspace = top_p_renorm_workspace_bytes(batch_size, vocab_size, deterministic)?;
+    if workspace.len() < required_workspace {
+        return Err(FlashInferError::invalid_argument(format!(
+            "workspace length ({}) must be at least {required_workspace}",
+            workspace.len()
+        )));
+    }
     if let Some(array) = top_p_arr
         && array.len() != batch_size
     {
@@ -2291,6 +2494,8 @@ where
     }
     let (probs_ptr, _probs_sync) = probs.device_ptr(stream);
     let (output_ptr, _output_sync) = output.device_ptr_mut(stream);
+    let workspace_len = workspace.len();
+    let (workspace_ptr, _workspace_sync) = workspace.device_ptr_mut(stream);
     let (array_ptr, _array_sync) = match top_p_arr {
         Some(array) => {
             let (ptr, sync) = array.device_ptr(stream);
@@ -2309,6 +2514,12 @@ where
             stride: 1,
             device_id: dims.2,
         }),
+        deterministic,
+        workspace: SamplingWorkspaceDesc {
+            ptr: workspace_ptr as usize as *const c_void,
+            len_bytes: workspace_len as i64,
+            device_id: dims.2,
+        },
         stream: stream.cu_stream().cast(),
     })
 }
@@ -2403,6 +2614,7 @@ fn sampling_cudarc_impl<P, O>(
     stream: &cudarc::driver::CudaStream,
     input: &P,
     output: &mut O,
+    valid: Option<&mut cudarc::driver::CudaSlice<u8>>,
     input_batch: usize,
     vocab_size: usize,
     row_indices: Option<&cudarc::driver::CudaSlice<i32>>,
@@ -2427,6 +2639,22 @@ where
         return Err(FlashInferError::invalid_argument(
             "output length must be positive",
         ));
+    }
+    let probability_kernel = !matches!(kernel, SamplingKernel::SamplingFromLogits);
+    match valid.as_ref() {
+        Some(valid) if valid.len() != output.len() => {
+            return Err(FlashInferError::invalid_argument(format!(
+                "valid length ({}) must equal output length ({})",
+                valid.len(),
+                output.len()
+            )));
+        }
+        None if probability_kernel => {
+            return Err(FlashInferError::invalid_argument(
+                "probability sampling requires a valid output buffer",
+            ));
+        }
+        _ => {}
     }
     match row_indices {
         Some(indices) if indices.len() != output.len() => {
@@ -2502,6 +2730,13 @@ where
     let output_len_usize = output.len();
     let (input_ptr, _input_sync) = input.device_ptr(stream);
     let (output_ptr, _output_sync) = output.device_ptr_mut(stream);
+    let (valid_ptr, _valid_sync) = match valid {
+        Some(valid) => {
+            let (ptr, sync) = valid.device_ptr_mut(stream);
+            (Some(ptr), Some(sync))
+        }
+        None => (None, None),
+    };
     let (indices_ptr, _indices_sync) = match row_indices {
         Some(indices) => {
             let (ptr, sync) = indices.device_ptr(stream);
@@ -2604,6 +2839,12 @@ where
     let sampling = SamplingParams {
         input: input_desc,
         output: output_desc,
+        valid: valid_ptr.map(|ptr| SamplingTensor1DU8Desc {
+            ptr: ptr as usize as *const c_void,
+            len: output_len,
+            stride: 1,
+            device_id: dims.2,
+        }),
         row_indices: indices_desc,
         random: random_params,
         stream: stream.cu_stream().cast(),
@@ -3001,13 +3242,16 @@ mod tests {
         let mut output_strides = [1];
         let output = tensor_1d(ptr(), 0, &mut output_shape, &mut output_strides, dl_i32());
         let args = pack_basic_sampling_args(
+            SamplingKernel::SamplingFromLogits,
             &input,
             &output,
             None,
             None,
             None,
+            None,
             SamplingRandomParams::new(7, 11),
-        );
+        )
+        .unwrap();
         let types: Vec<i32> = args.iter().map(|arg| arg.type_index).collect();
         assert_eq!(
             types,
@@ -3043,6 +3287,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             3,
             0.8,
             None,
@@ -3050,11 +3295,11 @@ mod tests {
             SamplingRandomParams::new(1, 2),
         )
         .unwrap();
-        assert_eq!(args.len(), 12);
-        assert_eq!(args[4].type_index, KTVM_FFI_FLOAT);
-        assert_eq!(args[6].type_index, KTVM_FFI_FLOAT);
+        assert_eq!(args.len(), 13);
+        assert_eq!(args[5].type_index, KTVM_FFI_FLOAT);
+        assert_eq!(args[7].type_index, KTVM_FFI_FLOAT);
         // SAFETY: the packer wrote floating-point payloads for these slots.
-        assert_eq!(unsafe { args[4].value.v_float64 }, 3.0);
+        assert_eq!(unsafe { args[5].value.v_float64 }, 3.0);
     }
 
     #[test]

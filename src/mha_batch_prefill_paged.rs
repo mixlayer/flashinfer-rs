@@ -1518,7 +1518,7 @@ unsafe fn mha_batch_prefill_paged_run_with_runtime(
         .map_or_else(any_none, |t| any_dltensor_ptr(t as *const DLTensor));
 
     let mut run_result = any_none();
-    let run_args: [TVMFFIAny; 27] = [
+    let run_args: [TVMFFIAny; 29] = [
         any_dltensor_ptr(&float_workspace_tensor),
         any_dltensor_ptr(&int_workspace_tensor),
         plan.plan_result,
@@ -1541,6 +1541,9 @@ unsafe fn mha_batch_prefill_paged_run_with_runtime(
         prefix_len_any,
         token_pos_any,
         max_item_len_any,
+        // FlashInfer v0.6.12 added optional NVFP4 K/V cache scale tensors.
+        any_none(),
+        any_none(),
         any_f64(params.logits_soft_cap),
         any_f64(params.sm_scale),
         any_f64(1.0 / params.rope_scale),
