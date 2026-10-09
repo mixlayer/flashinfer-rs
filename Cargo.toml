@@ -75,3 +75,7 @@ toml = "0.8.20"
 [dev-dependencies]
 half = "2.4.1"
 tempfile = "3.17.1"
+
+[[example]]
+name = "bench_nvfp4_tactics"
+required-features = ["cudarc"]

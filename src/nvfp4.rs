@@ -4,8 +4,8 @@ use std::ffi::c_void;
 
 use crate::error::FlashInferError;
 use crate::ffi::{
-    DLDataType, DLDevice, DLTensor, KDL_BFLOAT, KDL_CUDA, KDL_FLOAT, KDL_UINT, TVMFFIAny, any_bool,
-    any_dltensor_ptr, any_i64, any_none,
+    DLDataType, DLDevice, DLTensor, KDL_BFLOAT, KDL_CUDA, KDL_FLOAT, KDL_UINT, KTVM_FFI_INT,
+    TVMFFIAny, any_bool, any_dltensor_ptr, any_i64, any_none,
 };
 use crate::runtime::FlashInferRuntime;
 
@@ -288,6 +288,28 @@ pub fn nvfp4_gemm(params: &NvFp4GemmParams) -> Result<(), FlashInferError> {
     let runtime = FlashInferRuntime::global()?;
     // SAFETY: validation establishes the typed FlashInfer ABI contract.
     unsafe { gemm_with_runtime(runtime, params) }
+}
+
+/// Return the number of explicit CUTLASS tactics exposed by the loaded FP4 GEMM module.
+///
+/// This is a candidate count, not a shape-specific validity query or an
+/// autotuning result. Valid tactic indices are `0..count`; `-1` remains the
+/// module's default configuration.
+pub fn nvfp4_gemm_tactic_num() -> Result<i64, FlashInferError> {
+    let runtime = FlashInferRuntime::global()?;
+    let mut result = any_none();
+    // SAFETY: the loaded TVM-FFI function accepts no arguments and writes one
+    // integer result into the caller-owned result slot.
+    unsafe { runtime.call_fp4_gemm_tactic_num(&mut result)? };
+    if result.type_index != KTVM_FFI_INT {
+        return invalid("fp4_gemm_tactic_num returned a non-integer result");
+    }
+    // SAFETY: the type index above identifies the active union field.
+    let count = unsafe { result.value.v_int64 };
+    if count <= 0 {
+        return invalid("fp4_gemm_tactic_num returned a non-positive count");
+    }
+    Ok(count)
 }
 
 /// Quantize flat cudarc buffers representing `[rows,cols]` activations.

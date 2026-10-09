@@ -88,8 +88,8 @@ pub use norm::{
 };
 pub use nvfp4::{
     NvFp4DType, NvFp4GemmParams, NvFp4QuantizeParams, NvFp4ScaleInterleaveParams,
-    NvFp4Tensor1DDesc, NvFp4Tensor2DDesc, nvfp4_gemm, nvfp4_quantize, nvfp4_scale_interleave,
-    swizzled_scale_len,
+    NvFp4Tensor1DDesc, NvFp4Tensor2DDesc, nvfp4_gemm, nvfp4_gemm_tactic_num, nvfp4_quantize,
+    nvfp4_scale_interleave, swizzled_scale_len,
 };
 #[cfg(feature = "cudarc")]
 pub use nvfp4::{nvfp4_gemm_cudarc, nvfp4_quantize_cudarc, nvfp4_scale_interleave_cudarc};

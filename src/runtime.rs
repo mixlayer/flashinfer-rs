@@ -295,6 +295,7 @@ pub struct FlashInferRuntime {
     tvm_ffi_fp4_quantize: TVMFFISafeCallFn,
     tvm_ffi_block_scale_interleave_sm100: TVMFFISafeCallFn,
     tvm_ffi_fp4_gemm: TVMFFISafeCallFn,
+    tvm_ffi_fp4_gemm_tactic_num: TVMFFISafeCallFn,
     sampling_fns: SamplingKernelFns,
     single_prefill_kernel_cache: Mutex<HashMap<String, LoadedKernel>>,
     batch_prefill_kernel_cache: Mutex<HashMap<String, LoadedBatchPrefillKernel>>,
@@ -485,6 +486,20 @@ impl FlashInferRuntime {
     ) -> Result<(), FlashInferError> {
         // SAFETY: symbol signature follows TVMFFISafeCallType.
         let code = unsafe { (self.tvm_ffi_fp4_gemm)(std::ptr::null_mut(), args, num_args, result) };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self.decode_raised_error(code))
+    }
+
+    pub(crate) unsafe fn call_fp4_gemm_tactic_num(
+        &self,
+        result: *mut TVMFFIAny,
+    ) -> Result<(), FlashInferError> {
+        // SAFETY: symbol signature follows TVMFFISafeCallType.
+        let code = unsafe {
+            (self.tvm_ffi_fp4_gemm_tactic_num)(std::ptr::null_mut(), std::ptr::null(), 0, result)
+        };
         if code == 0 {
             return Ok(());
         }
@@ -1603,6 +1618,15 @@ impl FlashInferRuntime {
             )?
         };
 
+        let tvm_ffi_fp4_gemm_tactic_num: TVMFFISafeCallFn = unsafe {
+            resolve_symbol(
+                &fp4_gemm_sm120_lib,
+                &artifacts.fp4_gemm_sm120_so_path,
+                b"__tvm_ffi_fp4_gemm_tactic_num\0",
+                "__tvm_ffi_fp4_gemm_tactic_num",
+            )?
+        };
+
         let sampling_fns = SamplingKernelFns {
             softmax: unsafe {
                 resolve_symbol(
@@ -1758,6 +1782,7 @@ impl FlashInferRuntime {
             tvm_ffi_fp4_quantize,
             tvm_ffi_block_scale_interleave_sm100,
             tvm_ffi_fp4_gemm,
+            tvm_ffi_fp4_gemm_tactic_num,
             sampling_fns,
             single_prefill_kernel_cache: Mutex::new(HashMap::new()),
             batch_prefill_kernel_cache: Mutex::new(HashMap::new()),
