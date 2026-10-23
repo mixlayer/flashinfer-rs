@@ -555,6 +555,30 @@ fn desc2(ptr: u64, rows: i64, cols: i64, dtype: NvFp4DType, device_id: i32) -> N
     }
 }
 
+// Match fp4Quantize.cpp's host ABI, preserving multiplier and PDL semantics.
+fn quantize_args(
+    input: &DLTensor,
+    global_scale: &DLTensor,
+    output: &DLTensor,
+    output_scale: &DLTensor,
+    enable_pdl: bool,
+) -> [TVMFFIAny; 10] {
+    [
+        any_dltensor_ptr(input),
+        any_dltensor_ptr(global_scale),
+        any_dltensor_ptr(output),
+        any_dltensor_ptr(output_scale),
+        any_i64(16),
+        any_bool(false),
+        any_bool(true),
+        any_bool(false),
+        // fp4Quantize.cpp: isGlobalScaleInversed precedes enable_pdl.
+        // Our global_scale contract supplies the quantization multiplier.
+        any_bool(false),
+        any_bool(enable_pdl),
+    ]
+}
+
 unsafe fn quantize_with_runtime(
     runtime: &FlashInferRuntime,
     params: &NvFp4QuantizeParams,
@@ -567,17 +591,13 @@ unsafe fn quantize_with_runtime(
     let global_scale = bind_tensor(global_scale, &mut global_shape, &mut global_strides);
     let output = bind_tensor(output, &mut output_shape, &mut output_strides);
     let output_scale = bind_tensor(output_scale, &mut scale_shape, &mut scale_strides);
-    let args: [TVMFFIAny; 9] = [
-        any_dltensor_ptr(&input),
-        any_dltensor_ptr(&global_scale),
-        any_dltensor_ptr(&output),
-        any_dltensor_ptr(&output_scale),
-        any_i64(16),
-        any_bool(false),
-        any_bool(true),
-        any_bool(false),
-        any_bool(params.enable_pdl),
-    ];
+    let args = quantize_args(
+        &input,
+        &global_scale,
+        &output,
+        &output_scale,
+        params.enable_pdl,
+    );
     unsafe {
         call_on_stream(runtime, params.input.device_id, params.stream, |result| {
             runtime.call_fp4_quantize(args.as_ptr(), args.len() as i32, result)
@@ -726,7 +746,29 @@ fn invalid<T>(message: impl Into<String>) -> Result<T, FlashInferError> {
 
 #[cfg(test)]
 mod tests {
-    use super::swizzled_scale_len;
+    use super::{NvFp4DType, NvFp4Tensor2DDesc, quantize_args, swizzled_scale_len, tensor2d};
+
+    #[test]
+    fn quantize_abi_preserves_global_scale_and_pdl_positions() {
+        let (tensor, _, _) = tensor2d(NvFp4Tensor2DDesc {
+            ptr: std::ptr::null(),
+            rows: 1,
+            cols: 16,
+            dtype: NvFp4DType::BF16,
+            device_id: 0,
+        });
+        for pdl in [false, true] {
+            let args = quantize_args(&tensor, &tensor, &tensor, &tensor, pdl);
+            assert_eq!(args.len(), 10);
+            // These slots are constructed by any_i64/any_bool, so reading the
+            // integer union member is valid and requires no tensor access.
+            unsafe {
+                assert_eq!(args[4].value.v_int64, 16);
+                assert_eq!(args[8].value.v_int64, 0);
+                assert_eq!(args[9].value.v_int64, i64::from(pdl));
+            }
+        }
+    }
 
     #[test]
     fn scale_layout_pads_rows_and_columns() {
