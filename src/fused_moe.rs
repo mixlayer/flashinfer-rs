@@ -713,7 +713,9 @@ unsafe fn fused_moe_with_runtime(
             any_none()
         };
 
-        let mut run_args: [TVMFFIAny; 24] = [
+        // ABI: flashinfer/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
+        // (`run_moe`) and flashinfer/flashinfer/fused_moe/core.py.
+        let mut run_args: [TVMFFIAny; 25] = [
             any_dltensor_ptr(&out_tensor),
             any_dltensor_ptr(&input_tensor),
             any_dltensor_ptr(&token_selected_experts_tensor),
@@ -723,10 +725,11 @@ unsafe fn fused_moe_with_runtime(
             any_dltensor_ptr(&fc2_expert_weights_tensor),
             optional_dltensor_any(fc2_expert_biases_tensor.as_ref()),
             quant_scales_any,
-            any_none(), // input_sf
-            any_none(), // swiglu_alpha
-            any_none(), // swiglu_beta
-            any_none(), // swiglu_limit
+            any_none(),     // input_sf
+            any_none(),     // swiglu_alpha
+            any_none(),     // swiglu_beta
+            any_none(),     // swiglu_limit
+            any_bool(true), // swizzled_input_sf: upstream default; unused with input_sf=None
             any_i64(params.tp_size),
             any_i64(params.tp_rank),
             any_i64(params.ep_size),

@@ -108,6 +108,13 @@ fn gpu_smoke_launch_fused_moe() {
     .expect("launch fused moe");
 
     stream.synchronize().expect("synchronize");
+    let output = stream.clone_dtoh(&out_dev).expect("copy output");
+    assert!(
+        output
+            .iter()
+            .all(|bits| half::f16::from_bits(*bits).is_finite()),
+        "fused moe output must be finite"
+    );
 }
 
 #[test]
