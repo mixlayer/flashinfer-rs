@@ -41,8 +41,10 @@ const FLASHINFER_SAMPLING_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/samp
 const FLASHINFER_TOPK_SO_SUFFIX: &str = "flashinfer_jit_cache/jit_cache/topk/topk.so";
 const FLASHINFER_TRTLLM_COMM_SO_SUFFIX: &str =
     "flashinfer_jit_cache/jit_cache/trtllm_comm/trtllm_comm.so";
-const FLASHINFER_FP4_QUANTIZATION_SM120_SO_SUFFIX: &str =
-    "flashinfer_jit_cache/jit_cache/fp4_quantization_120/fp4_quantization_120.so";
+// Upstream quantization/fp4_quantization.py selects 120f for SM120/SM121 on CUDA >= 12.9.
+// The pinned cu130 wheel supports both; 120 contains SM120a code that cannot run on SM121.
+const FLASHINFER_FP4_QUANTIZATION_SM120F_SO_SUFFIX: &str =
+    "flashinfer_jit_cache/jit_cache/fp4_quantization_120f/fp4_quantization_120f.so";
 const FLASHINFER_FP4_GEMM_SM120_SO_SUFFIX: &str =
     "flashinfer_jit_cache/jit_cache/fp4_gemm_cutlass_sm120/fp4_gemm_cutlass_sm120.so";
 const TVMFFI_SO_MEMBER: &str = "tvm_ffi/lib/libtvm_ffi.so";
@@ -164,7 +166,7 @@ struct ExtractedArtifacts {
     sampling_so_path: PathBuf,
     topk_so_path: PathBuf,
     trtllm_comm_so_path: PathBuf,
-    fp4_quantization_sm120_so_path: PathBuf,
+    fp4_quantization_sm120f_so_path: PathBuf,
     fp4_gemm_sm120_so_path: PathBuf,
     tvmffi_so_path: PathBuf,
 }
@@ -272,7 +274,7 @@ pub struct FlashInferRuntime {
     _sampling_lib: Library,
     _topk_lib: Library,
     _trtllm_comm_lib: Library,
-    _fp4_quantization_sm120_lib: Library,
+    _fp4_quantization_sm120f_lib: Library,
     _fp4_gemm_sm120_lib: Library,
     _tvmffi_get_version: TVMFFIGetVersionFn,
     tvmffi_env_set_stream: TVMFFIEnvSetStreamFn,
@@ -1397,14 +1399,14 @@ impl FlashInferRuntime {
             message: e.to_string(),
         })?;
 
-        let fp4_quantization_sm120_lib = unsafe {
+        let fp4_quantization_sm120f_lib = unsafe {
             Library::open(
-                Some(&artifacts.fp4_quantization_sm120_so_path),
+                Some(&artifacts.fp4_quantization_sm120f_so_path),
                 libc::RTLD_NOW | libc::RTLD_LOCAL,
             )
         }
         .map_err(|e| FlashInferError::LibraryLoad {
-            library: artifacts.fp4_quantization_sm120_so_path.clone(),
+            library: artifacts.fp4_quantization_sm120f_so_path.clone(),
             message: e.to_string(),
         })?;
 
@@ -1593,8 +1595,8 @@ impl FlashInferRuntime {
 
         let tvm_ffi_fp4_quantize: TVMFFISafeCallFn = unsafe {
             resolve_symbol(
-                &fp4_quantization_sm120_lib,
-                &artifacts.fp4_quantization_sm120_so_path,
+                &fp4_quantization_sm120f_lib,
+                &artifacts.fp4_quantization_sm120f_so_path,
                 b"__tvm_ffi_fp4_quantize\0",
                 "__tvm_ffi_fp4_quantize",
             )?
@@ -1602,8 +1604,8 @@ impl FlashInferRuntime {
 
         let tvm_ffi_block_scale_interleave_sm100: TVMFFISafeCallFn = unsafe {
             resolve_symbol(
-                &fp4_quantization_sm120_lib,
-                &artifacts.fp4_quantization_sm120_so_path,
+                &fp4_quantization_sm120f_lib,
+                &artifacts.fp4_quantization_sm120f_so_path,
                 b"__tvm_ffi_block_scale_interleave_sm100\0",
                 "__tvm_ffi_block_scale_interleave_sm100",
             )?
@@ -1759,7 +1761,7 @@ impl FlashInferRuntime {
             _sampling_lib: sampling_lib,
             _topk_lib: topk_lib,
             _trtllm_comm_lib: trtllm_comm_lib,
-            _fp4_quantization_sm120_lib: fp4_quantization_sm120_lib,
+            _fp4_quantization_sm120f_lib: fp4_quantization_sm120f_lib,
             _fp4_gemm_sm120_lib: fp4_gemm_sm120_lib,
             _tvmffi_get_version: tvmffi_get_version,
             tvmffi_env_set_stream,
@@ -2640,14 +2642,15 @@ fn extract_artifacts(
     let fp4_quantization_override = env::var_os(ENV_FP4_QUANTIZATION_SO)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from);
-    let fp4_quantization_sm120_so_path = fp4_quantization_override
+    // Use a distinct filename: the wheel hash is unchanged, so old SM120a extracts may exist.
+    let fp4_quantization_sm120f_so_path = fp4_quantization_override
         .clone()
-        .unwrap_or_else(|| artifact_dir.join("fp4_quantization_sm120.so"));
-    if fp4_quantization_override.is_none() && !fp4_quantization_sm120_so_path.exists() {
+        .unwrap_or_else(|| artifact_dir.join("fp4_quantization_sm120f.so"));
+    if fp4_quantization_override.is_none() && !fp4_quantization_sm120f_so_path.exists() {
         extract_member_from_wheel_by_suffix(
             &materialized_wheels.jit_cache_wheel_path,
-            FLASHINFER_FP4_QUANTIZATION_SM120_SO_SUFFIX,
-            &fp4_quantization_sm120_so_path,
+            FLASHINFER_FP4_QUANTIZATION_SM120F_SO_SUFFIX,
+            &fp4_quantization_sm120f_so_path,
         )?;
     }
 
@@ -2679,7 +2682,7 @@ fn extract_artifacts(
         sampling_so_path,
         topk_so_path,
         trtllm_comm_so_path,
-        fp4_quantization_sm120_so_path,
+        fp4_quantization_sm120f_so_path,
         fp4_gemm_sm120_so_path,
         tvmffi_so_path,
     })

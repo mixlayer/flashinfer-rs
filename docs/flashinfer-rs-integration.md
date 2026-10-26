@@ -95,6 +95,14 @@ Runtime loading order:
 11. Load `batch_decode_with_kv_cache_*` modules on demand with `RTLD_NOW | RTLD_LOCAL`
 12. Load `fused_moe_trtllm_sm100` on demand and install its synchronous cubin callback
 
+## Dense NVFP4 on SM120/SM121
+
+Quantization and scale interleaving use the wheel's
+`fp4_quantization_120f/fp4_quantization_120f.so`, matching upstream selection
+for SM120/SM121 on CUDA >=12.9. The `120` variant contains SM120a-only code
+that cannot run on SM121. Extract it as `fp4_quantization_sm120f.so` so existing
+cached `fp4_quantization_sm120.so` libraries are not reused after upgrading.
+
 ## TensorRT-LLM BF16 All-Reduce Fusion
 
 The all-reduce API binds the fixed 21-argument

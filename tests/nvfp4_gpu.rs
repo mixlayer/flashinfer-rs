@@ -25,7 +25,7 @@ fn scale_index(row: usize, col: usize, total_cols: usize) -> usize {
 }
 
 #[test]
-fn gpu_nvfp4_quantize_interleave_and_gemm() {
+fn gpu_nvfp4_scale_interleave_handles_padding() {
     if !should_run_gpu_tests() {
         eprintln!("skipping GPU test (set FLASHINFER_RS_RUN_GPU_TESTS=1 to enable)");
         return;
@@ -39,23 +39,58 @@ fn gpu_nvfp4_quantize_interleave_and_gemm() {
         return;
     }
 
-    let raw_rows = 3;
-    let raw_cols = 5;
-    let raw_host: Vec<u8> = (0..raw_rows * raw_cols).map(|value| value as u8).collect();
-    let raw_dev = stream.clone_htod(&raw_host).expect("copy raw scales");
-    let interleaved_len = swizzled_scale_len(raw_rows as i64, raw_cols as i64)
-        .expect("interleaved scale length") as usize;
-    let mut interleaved_dev = stream
-        .alloc_zeros::<u8>(interleaved_len)
-        .expect("allocate interleaved scales");
-    nvfp4_scale_interleave_cudarc(
-        stream.as_ref(),
-        &raw_dev,
-        &mut interleaved_dev,
-        raw_rows,
-        raw_cols,
-    )
-    .expect("launch scale interleave");
+    // Exercise partial tiles and both the 128-row and 4-column tile boundaries.
+    for (raw_rows, raw_cols) in [(3_usize, 5_usize), (129, 7)] {
+        let raw_host: Vec<u8> = (0..raw_rows * raw_cols).map(|value| value as u8).collect();
+        let raw_dev = stream.clone_htod(&raw_host).expect("copy raw scales");
+        let interleaved_len = swizzled_scale_len(raw_rows as i64, raw_cols as i64)
+            .expect("interleaved scale length") as usize;
+        let mut interleaved_dev = stream
+            .clone_htod(&vec![0xFF_u8; interleaved_len])
+            .expect("allocate interleaved scales");
+        nvfp4_scale_interleave_cudarc(
+            stream.as_ref(),
+            &raw_dev,
+            &mut interleaved_dev,
+            raw_rows,
+            raw_cols,
+        )
+        .expect("launch scale interleave");
+
+        let interleaved = stream
+            .clone_dtoh(&interleaved_dev)
+            .expect("copy interleaved scales");
+        for row in 0..raw_rows.div_ceil(128) * 128 {
+            for col in 0..raw_cols.div_ceil(4) * 4 {
+                let expected = if row < raw_rows && col < raw_cols {
+                    raw_host[row * raw_cols + col]
+                } else {
+                    0
+                };
+                assert_eq!(
+                    interleaved[scale_index(row, col, raw_cols)],
+                    expected,
+                    "shape [{raw_rows},{raw_cols}], scale [{row},{col}]"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn gpu_nvfp4_quantize_and_gemm_correctness() {
+    if !should_run_gpu_tests() {
+        eprintln!("skipping GPU test (set FLASHINFER_RS_RUN_GPU_TESTS=1 to enable)");
+        return;
+    }
+
+    let ctx = CudaContext::new(0).expect("create CUDA context");
+    let stream = ctx.new_stream().expect("create CUDA stream");
+    let (major, minor) = ctx.compute_capability().expect("read compute capability");
+    if major * 10 + minor < 120 {
+        eprintln!("skipping NVFP4 smoke test on compute capability {major}.{minor}");
+        return;
+    }
 
     let m = 2;
     let n = 128;
@@ -146,18 +181,6 @@ fn gpu_nvfp4_quantize_interleave_and_gemm() {
     .expect("launch NVFP4 GEMM");
 
     stream.synchronize().expect("synchronize CUDA stream");
-    let interleaved = stream
-        .clone_dtoh(&interleaved_dev)
-        .expect("copy interleaved scales");
-    for row in 0..raw_rows {
-        for col in 0..raw_cols {
-            assert_eq!(
-                interleaved[scale_index(row, col, raw_cols)],
-                raw_host[row * raw_cols + col]
-            );
-        }
-    }
-
     let output_host = stream.clone_dtoh(&output).expect("copy GEMM output");
     let mut max_error = 0.0_f32;
     for row in 0..m {
