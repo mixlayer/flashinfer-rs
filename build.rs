@@ -2,10 +2,10 @@
 //!
 //! High-level flow:
 //! 1. Read pinned wheel metadata from `Cargo.toml`, keyed by CUDA variant
-//!    (`cu130`/`cu131`) and architecture (`x86_64`/`aarch64`).
-//! 2. Detect build-host CUDA toolkit version (supports CUDA 13.0 and 13.1) and
+//!    (`cu130`) and architecture (`x86_64`/`aarch64`).
+//! 2. Detect build-host CUDA toolkit version (accepts CUDA 13.0 through 13.4) and
 //!    detect Cargo target architecture.
-//! 3. Select matching FlashInfer and Apache TVM-FFI wheel entries.
+//! 3. Select FlashInfer and Apache TVM-FFI entries from the shared cu130 family.
 //! 4. Generate `OUT_DIR/embedded_wheels.rs` with pinned filename/url/sha256
 //!    constants consumed by runtime initialization.
 //!
@@ -91,7 +91,6 @@ struct PinnedWheelsMetadata {
 #[derive(Debug, Deserialize)]
 struct CudaWheelMetadata {
     cu130: ArchWheelMetadata,
-    cu131: ArchWheelMetadata,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,14 +109,12 @@ struct WheelMetadata {
 #[derive(Clone, Copy, Debug)]
 enum CudaTag {
     Cu130,
-    Cu131,
 }
 
 impl CudaTag {
     fn metadata_key(self) -> &'static str {
         match self {
             Self::Cu130 => "cu130",
-            Self::Cu131 => "cu131",
         }
     }
 }
@@ -145,7 +142,6 @@ fn validate_cuda_wheel_metadata(
     wheels: &CudaWheelMetadata,
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_arch_wheel_metadata(&format!("{name}.cu130"), &wheels.cu130)?;
-    validate_arch_wheel_metadata(&format!("{name}.cu131"), &wheels.cu131)?;
     Ok(())
 }
 
@@ -197,7 +193,6 @@ fn select_wheel_metadata<'a>(
 ) -> Result<&'a WheelMetadata, Box<dyn std::error::Error>> {
     let by_arch = match cuda_tag {
         CudaTag::Cu130 => &wheels.cu130,
-        CudaTag::Cu131 => &wheels.cu131,
     };
 
     match target_arch {
@@ -217,7 +212,7 @@ fn detect_build_host_cuda_tag() -> Result<CudaTag, Box<dyn std::error::Error>> {
             return Ok(tag);
         }
         return Err(format!(
-            "unsupported CUDA version `{version}` detected via `{source}`; supported build-host versions: 13.0, 13.1"
+            "unsupported CUDA version `{version}` detected via `{source}`; supported build-host versions: 13.0 through 13.4"
         )
         .into());
     }
@@ -227,7 +222,7 @@ fn detect_build_host_cuda_tag() -> Result<CudaTag, Box<dyn std::error::Error>> {
             return Ok(tag);
         }
         return Err(format!(
-            "unsupported CUDA version `{version}` detected from `nvcc --version`; supported build-host versions: 13.0, 13.1"
+            "unsupported CUDA version `{version}` detected from `nvcc --version`; supported build-host versions: 13.0 through 13.4"
         )
         .into());
     }
@@ -347,14 +342,11 @@ fn extract_version_after_marker(text: &str, marker: &str) -> Option<String> {
 fn cuda_tag_from_version(version: &str) -> Option<CudaTag> {
     let mut components = version.split('.');
     let major = components.next()?.parse::<u32>().ok()?;
-    let minor = components
-        .next()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(0);
+    let minor = components.next()?.parse::<u32>().ok()?;
 
     match (major, minor) {
-        (13, 0) => Some(CudaTag::Cu130),
-        (13, 1) => Some(CudaTag::Cu131),
+        // Keep toolkit acceptance separate from the pinned wheel's build version.
+        (13, 0..=4) => Some(CudaTag::Cu130),
         _ => None,
     }
 }
@@ -387,4 +379,52 @@ pub(crate) const PINNED_APACHE_TVM_FFI_WHEEL_SHA256: &str = {tvmffi_sha};\n",
 
 fn rust_str_literal(value: &str) -> String {
     format!("{value:?}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_13_0_through_13_4_select_pinned_cu130_wheels() {
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(MANIFEST_FILE);
+        let pinned = parse_pinned_wheels(&manifest_path).expect("parse pinned wheels");
+
+        for version in ["13.0", "13.0.3", "13.1.1", "13.2.0", "13.3.0", "13.4.99"] {
+            let tag = cuda_tag_from_version(version).expect("accepted CUDA version");
+            assert_eq!(tag.metadata_key(), "cu130", "CUDA {version}");
+            for arch in ["x86_64", "aarch64"] {
+                let wheel = select_wheel_metadata(
+                    "flashinfer_jit_cache",
+                    &pinned.flashinfer_jit_cache,
+                    tag,
+                    arch,
+                )
+                .expect("select FlashInfer wheel");
+                assert_eq!(
+                    wheel.filename,
+                    format!(
+                        "flashinfer_jit_cache-0.6.12+cu130-cp39-abi3-manylinux_2_28_{arch}.whl"
+                    ),
+                );
+                select_wheel_metadata("apache_tvm_ffi", &pinned.apache_tvm_ffi, tag, arch)
+                    .expect("select TVM-FFI wheel");
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_wheel_selection_rejects_unsupported_and_malformed_versions() {
+        for version in [
+            "12.9.1",
+            "13.5.0",
+            "14.0.0",
+            "",
+            "13",
+            "13.invalid",
+            "invalid",
+        ] {
+            assert!(cuda_tag_from_version(version).is_none(), "CUDA {version}");
+        }
+    }
 }

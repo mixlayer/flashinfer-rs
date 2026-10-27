@@ -44,7 +44,10 @@ FlashInfer prebuilt JIT cache wheels:
 - Nightly CUDA 13.0 index: https://flashinfer.ai/whl/nightly/cu130/
 - Nightly wheel list: https://flashinfer.ai/whl/nightly/cu130/flashinfer-jit-cache/
 
-This crate supports pinned wheel selection for CUDA 13.0 (`cu130`) and CUDA 13.1 (`cu131`) metadata keys. At build time, the CUDA version is auto-detected from the build host.
+At build time, this crate auto-detects and accepts CUDA 13.0 through 13.4. All
+accepted versions select the same pinned `cu130` wheel family. The optional
+`cudarc` wrappers require version 0.19.10 or later within 0.19.x, which provides
+bindings through CUDA 13.4.
 
 Also see FlashInfer installation docs:
 
@@ -56,16 +59,12 @@ This crate now pins wheels at build time via `Cargo.toml` metadata:
 
 - `[package.metadata.flashinfer_rs.pinned_wheels.flashinfer_jit_cache.cu130.x86_64]`
 - `[package.metadata.flashinfer_rs.pinned_wheels.flashinfer_jit_cache.cu130.aarch64]`
-- `[package.metadata.flashinfer_rs.pinned_wheels.flashinfer_jit_cache.cu131.x86_64]`
-- `[package.metadata.flashinfer_rs.pinned_wheels.flashinfer_jit_cache.cu131.aarch64]`
 - `[package.metadata.flashinfer_rs.pinned_wheels.apache_tvm_ffi.cu130.x86_64]`
 - `[package.metadata.flashinfer_rs.pinned_wheels.apache_tvm_ffi.cu130.aarch64]`
-- `[package.metadata.flashinfer_rs.pinned_wheels.apache_tvm_ffi.cu131.x86_64]`
-- `[package.metadata.flashinfer_rs.pinned_wheels.apache_tvm_ffi.cu131.aarch64]`
 
 Build flow:
 
-1. `build.rs` detects build-host CUDA version (13.0 or 13.1) and target architecture (`x86_64` or `aarch64`) to select pinned wheel entries.
+1. `build.rs` checks that the detected build-host CUDA version is 13.0 through 13.4, then selects the `cu130` wheel entries for the target architecture (`x86_64` or `aarch64`).
 2. `build.rs` emits selected pinned wheel metadata (filename, URL, SHA256) into generated constants.
 
 Runtime flow:
@@ -79,8 +78,8 @@ Runtime flow:
    - `~/.cache/flashinfer-rs/<artifact-hash>/`
 7. First inference may still extract/load a shape-specific module from the local wheel, but should not download wheels after a successful prefetch.
 
-The FlashInfer JIT-cache matrix is pinned to `0.6.12+cu130` for both CUDA
-13.0 and CUDA 13.1 metadata keys. Sampling uses the 0.6.12 optional
+The FlashInfer JIT-cache matrix is pinned to `0.6.12+cu130` for all accepted CUDA
+versions. Sampling uses the 0.6.12 optional
 device-resident U64 seed/offset tensor ABI, with scalar values retained as
 fallbacks.
 
