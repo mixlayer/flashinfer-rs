@@ -3153,7 +3153,11 @@ fn extract_member_from_wheel_by_suffix(
                 source: e,
             })?
             .name()
-            .to_string();
+            .map_err(|e| FlashInferError::WheelRead {
+                wheel: wheel_path.to_path_buf(),
+                source: e,
+            })?
+            .into_owned();
         if entry_name.ends_with(member_suffix) {
             found = Some(entry_name);
             break;
@@ -3314,6 +3318,29 @@ mod tests {
 
     fn cached_wheel_path(wheels_dir: &Path, wheel: PinnedWheelMetadata<'_>) -> PathBuf {
         wheels_dir.join(format!("{}-{}", wheel.sha256_hex, wheel.filename))
+    }
+
+    #[test]
+    fn extract_deflated_wheel_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let wheel_path = dir.path().join("test.whl");
+        let mut wheel = zip::ZipWriter::new(File::create(&wheel_path).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        wheel
+            .start_file("package/kernels/test.so", options)
+            .unwrap();
+        wheel.write_all(b"test kernel").unwrap();
+        wheel.finish().unwrap();
+
+        let suffix_output = dir.path().join("suffix/test.so");
+        extract_member_from_wheel_by_suffix(&wheel_path, "/test.so", &suffix_output).unwrap();
+        assert_eq!(fs::read(suffix_output).unwrap(), b"test kernel");
+
+        let exact_output = dir.path().join("exact/test.so");
+        extract_member_from_wheel_exact(&wheel_path, "package/kernels/test.so", &exact_output)
+            .unwrap();
+        assert_eq!(fs::read(exact_output).unwrap(), b"test kernel");
     }
 
     #[test]
