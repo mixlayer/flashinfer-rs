@@ -20,7 +20,7 @@ No Python runtime is required for calling `gemma_rmsnorm` once the `.so` files a
 
 Build/runtime model in this crate:
 
-1. `build.rs` selects pinned wheel entries from `Cargo.toml` by build-host CUDA version (`cu130`/`cu131`) and target architecture (`x86_64` or `aarch64`).
+1. `build.rs` accepts build-host CUDA versions 13.0 through 13.4 and selects the shared `cu130` wheel entries from `Cargo.toml` by target architecture (`x86_64` or `aarch64`).
 2. `build.rs` emits selected wheel metadata (filename, URL, SHA256) as generated constants.
 3. `prefetch_pinned_wheels` is the supported build/bootstrap entry point for materializing the selected FlashInfer JIT-cache and TVM-FFI wheels without initializing CUDA or loading shared libraries.
 4. Wheel lookup order is primary, seed, network. The writable primary cache is `~/.cache/flashinfer-rs/wheels/` or `FLASHINFER_RS_CACHE_DIR/wheels/`; the optional read-only seed cache is `FLASHINFER_RS_SEED_CACHE_DIR/wheels/`.
@@ -77,8 +77,9 @@ This wrapper handles argument decoding, validation, stream lookup, and dispatch 
 ## Dependency/artifact matrix
 Pinned v1 artifacts:
 
-- `flashinfer_jit_cache 0.6.12+cu130` pins for both `cu130` and `cu131` metadata keys (`x86_64` and `aarch64`)
-- `apache_tvm_ffi 0.1.7` pins for both `cu130` and `cu131` metadata keys (`x86_64` and `aarch64`)
+- `flashinfer_jit_cache 0.6.12+cu130` pins under the shared `cu130` metadata key (`x86_64` and `aarch64`)
+- `apache_tvm_ffi 0.1.7` pins under the same `cu130` metadata key (`x86_64` and `aarch64`)
+- Optional `cudarc >=0.19.10, <0.20.0`, with bindings through CUDA 13.4
 
 Runtime loading order:
 

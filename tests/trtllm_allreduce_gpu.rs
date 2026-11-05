@@ -324,7 +324,7 @@ fn read_handles(path: &Path) -> [sys::CUipcMemHandle; 3] {
     let mut handles = [sys::CUipcMemHandle_st { reserved: [0; 64] }; 3];
     for (handle, chunk) in handles.iter_mut().zip(bytes.chunks_exact(64)) {
         for (destination, source) in handle.reserved.iter_mut().zip(chunk) {
-            *destination = *source as i8;
+            *destination = *source as std::ffi::c_char;
         }
     }
     handles
